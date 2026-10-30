@@ -1,5 +1,5 @@
 /**
- * Expert allowlist helpers for analysis tools.
+ * Allowlist helpers for analysis tools.
  * @module dsh-analyze/policy
  */
 
@@ -12,6 +12,9 @@ export const ANALYSIS_TOOL_NAMES = [
   'dataset_rm',
   'stats_describe',
   'transform_agg',
+  'dataset_values',
+  'dataset_sample',
+  'dataset_join',
 ] as const
 
 export type AnalysisToolName = (typeof ANALYSIS_TOOL_NAMES)[number]
@@ -21,13 +24,13 @@ export function isAnalysisToolName(name: string): name is AnalysisToolName {
 }
 
 /**
- * Analysis tools to register on an agent scope for one expert.
+ * Analysis tools to register on an agent scope.
  * - deny-all → none
  * - explicit `analysisTools` wins (any mode except deny-all)
  * - allowlist → intersection with toolAllowlist
  * - unconfigured without analysisTools → none (safe default)
  */
-export function analysisToolsForExpert(input: {
+export function analysisToolsForScopedAllow(input: {
   mode: 'unconfigured' | 'deny-all' | 'allowlist'
   toolAllowlist: readonly string[]
   analysisTools?: readonly string[]
@@ -41,3 +44,6 @@ export function analysisToolsForExpert(input: {
   const allow = new Set(input.toolAllowlist)
   return ANALYSIS_TOOL_NAMES.filter(n => allow.has(n))
 }
+
+/** Back-compat alias for hosts that still import the old name. */
+export const analysisToolsForExpert = analysisToolsForScopedAllow

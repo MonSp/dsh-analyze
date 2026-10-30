@@ -43,7 +43,7 @@ export function tmpDir(workspaceRoot: string): string {
  */
 export function ensureSessionWorkspaceRoot(profileDir: string, sessionId: string): string {
   const sid = sessionId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128) || 'anon'
-  const root = join(profileDir, 'inv-analysis', 'sessions', sid)
+  const root = join(profileDir, 'dsh-analyze-sessions', sid)
   if (!existsSync(root)) {
     mkdirSync(root, { recursive: true })
   }

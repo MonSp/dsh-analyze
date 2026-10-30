@@ -68,7 +68,21 @@ crate 为纯标准库实现，可离线构建。
 | `dataset_export` | 全表导出为 outputs/ 下 CSV |
 | `dataset_rm` | 永久删除 dataset |
 | `stats_describe` | 空值、min/max/mean/std/分位数 |
-| `transform_agg` | 过滤 / 投影 / 分组聚合 |
+| `transform_agg` | 过滤 / 派生列 / 投影 / 分组聚合（含时间桶） |
+| `dataset_values` | 单列取值分布（`nunique`、`top`） |
+| `dataset_sample` | 确定性随机或分层抽样（≤ 20 行） |
+| `dataset_join` | 等值连接 → 新 dataset（只返回 id 与计数） |
+
+CLI 子命令与工具同名（`values` / `sample` / `join` 等）。
+冻结 JSON 契约见 [docs/interface.md](docs/interface.md)。
+
+### `transform_agg` 扩展（v0.1.2）
+
+- **`mutate`**：白名单表达式派生列（标识符、数字、`+ - * /`、括号）。
+  禁止函数调用；非法表达式 → `analysis/invalid-args`。
+- **时间 `groupBy`**：`{"dateColumn":"created_at","period":"day|week|month"}`
+  → 列名 `created_at_day` 等。无法解析的非空值进入 `null` 桶并计入
+  `parseFailCount`（不会静默丢弃）。
 
 ## 限额与数据根
 
@@ -83,6 +97,7 @@ crate 为纯标准库实现，可离线构建。
 | `DSH_ANALYZE_MAX_ROWS` | 5,000,000 | ingest 行上限 |
 | `DSH_ANALYZE_MAX_INGEST_BYTES` | 256 MiB | ingest 字节上限 |
 | `DSH_ANALYZE_DEFAULT_ROW_LIMIT` | 1000 | agg 默认行限 |
+| `DSH_ANALYZE_DEFAULT_SAMPLE_SEED` | 42 | 未指定 seed 时的抽样种子 |
 
 兼容期仍可读旧名 `INV_ANALYSIS_*`（新名优先）。
 

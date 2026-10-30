@@ -1,6 +1,6 @@
 /**
  * Host-agnostic attach path: probe CLI + register selected analysis tools
- * on any agent-scope tools runtime. No expert-runtime / routing dependency —
+ * on any agent-scope tools runtime. No product-specific routing dependency —
  * a bare plugin host can call this with an empty profile.
  * @module dsh-analyze/register
  */

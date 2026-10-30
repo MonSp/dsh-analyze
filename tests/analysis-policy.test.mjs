@@ -2,26 +2,26 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   ANALYSIS_TOOL_NAMES,
-  analysisToolsForExpert,
+  analysisToolsForScopedAllow,
   isAnalysisToolName,
 } from '../packages/dsh-analyze/dist/policy.js'
 
-test('analysisToolsForExpert: unconfigured → none', () => {
+test('analysisToolsForScopedAllow: unconfigured → none', () => {
   assert.deepEqual(
-    analysisToolsForExpert({ mode: 'unconfigured', toolAllowlist: [...ANALYSIS_TOOL_NAMES] }),
+    analysisToolsForScopedAllow({ mode: 'unconfigured', toolAllowlist: [...ANALYSIS_TOOL_NAMES] }),
     [],
   )
 })
 
-test('analysisToolsForExpert: deny-all → none', () => {
+test('analysisToolsForScopedAllow: deny-all → none', () => {
   assert.deepEqual(
-    analysisToolsForExpert({ mode: 'deny-all', toolAllowlist: ['dataset_ingest'] }),
+    analysisToolsForScopedAllow({ mode: 'deny-all', toolAllowlist: ['dataset_ingest'] }),
     [],
   )
 })
 
-test('analysisToolsForExpert: allowlist filters intersection', () => {
-  const names = analysisToolsForExpert({
+test('analysisToolsForScopedAllow: allowlist filters intersection', () => {
+  const names = analysisToolsForScopedAllow({
     mode: 'allowlist',
     toolAllowlist: ['dataset_ingest', 'stats_describe', 'bash', 'unknown_tool'],
   })
@@ -34,8 +34,8 @@ test('isAnalysisToolName', () => {
   assert.equal(isAnalysisToolName('bash'), false)
 })
 
-test('analysisToolsForExpert: explicit analysisTools works under unconfigured', () => {
-  const names = analysisToolsForExpert({
+test('analysisToolsForScopedAllow: explicit analysisTools works under unconfigured', () => {
+  const names = analysisToolsForScopedAllow({
     mode: 'unconfigured',
     toolAllowlist: [],
     analysisTools: ['dataset_ingest', 'stats_describe', 'not-a-tool'],
@@ -43,9 +43,9 @@ test('analysisToolsForExpert: explicit analysisTools works under unconfigured', 
   assert.deepEqual(names, ['dataset_ingest', 'stats_describe'])
 })
 
-test('analysisToolsForExpert: deny-all ignores analysisTools', () => {
+test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   assert.deepEqual(
-    analysisToolsForExpert({
+    analysisToolsForScopedAllow({
       mode: 'deny-all',
       toolAllowlist: [],
       analysisTools: ['dataset_ingest'],
@@ -54,7 +54,7 @@ test('analysisToolsForExpert: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the frozen v0.1 surface', () => {
+test('ANALYSIS_TOOL_NAMES is the frozen v0.1.2 surface', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -64,5 +64,14 @@ test('ANALYSIS_TOOL_NAMES is the frozen v0.1 surface', () => {
     'dataset_rm',
     'stats_describe',
     'transform_agg',
+    'dataset_values',
+    'dataset_sample',
+    'dataset_join',
   ])
+})
+
+test('new v0.1.2 tools are recognized by isAnalysisToolName', () => {
+  assert.equal(isAnalysisToolName('dataset_values'), true)
+  assert.equal(isAnalysisToolName('dataset_sample'), true)
+  assert.equal(isAnalysisToolName('dataset_join'), true)
 })

@@ -27,7 +27,6 @@ When the host supplies a profile root, ingest refuses any resolved path under
 these first segments:
 
 ```text
-***REMOVED***
 .bootstrap-token/
 profiles/
 .credentials.yaml
