@@ -1,0 +1,22 @@
+# node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# rust
+target/
+**/*.rs.bk
+
+# env / os
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# test artifacts
+.tmp/
+*.log
+
+# editors
+.idea/
+.vscode/

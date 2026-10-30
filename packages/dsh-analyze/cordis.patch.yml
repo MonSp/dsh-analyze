@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-analyze
+      name: 'dsh-analyze'
