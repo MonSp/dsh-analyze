@@ -15,6 +15,9 @@ export const ANALYSIS_TOOL_NAMES = [
   'dataset_values',
   'dataset_sample',
   'dataset_join',
+  'dataset_profile',
+  'dataset_dedup',
+  'dataset_outliers',
 ] as const
 
 export type AnalysisToolName = (typeof ANALYSIS_TOOL_NAMES)[number]
