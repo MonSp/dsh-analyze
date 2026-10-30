@@ -11,8 +11,8 @@ use std::process::ExitCode;
 
 use cli::fail;
 
-const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\"";
-const VERSION: &str = "0.1.2";
+const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\"";
+const VERSION: &str = "0.1.3";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -72,6 +72,9 @@ fn run(args: &[String]) -> Result<String, u8> {
         "sample" => commands::cmd_sample(&workspace, rest),
         "join" => commands::cmd_join(&workspace, rest),
         "agg" => commands::cmd_agg(&workspace, rest),
+        "profile" => commands::cmd_profile(&workspace, rest),
+        "dedup" => commands::cmd_dedup(&workspace, rest),
+        "outliers" => commands::cmd_outliers(&workspace, rest),
         "list" => commands::cmd_list(&workspace),
         "export" => commands::cmd_export(&workspace, rest),
         "rm" => commands::cmd_rm(&workspace, rest),
