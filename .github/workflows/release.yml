@@ -19,10 +19,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+          # Pure-std Rust cross-compiles between Apple targets on the arm64 runner.
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: ubuntu-latest
