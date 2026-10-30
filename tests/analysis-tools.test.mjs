@@ -29,6 +29,7 @@ function makeWorkspace() {
 
 /** Resolve a spawnable node binary (MiMo-embedded node cannot be spawned standalone). */
 function nodeBin() {
+  const isNode = (p) => /(^|[\\/])node(\.exe)?$/i.test(p)
   const candidates = [
     process.env.INV_TEST_NODE,
     process.env.npm_node_execpath,
@@ -36,15 +37,18 @@ function nodeBin() {
     process.env['LOCALAPPDATA'] && join(process.env['LOCALAPPDATA'], 'Programs', 'nodejs', 'node.exe'),
     // portable unpack used by CI smoke on this machine
     process.env['LOCALAPPDATA'] && join(process.env['LOCALAPPDATA'], 'node-portable', 'node-v22.14.0-win-x64', 'node.exe'),
+    // POSIX runners expose plain `node` on PATH
+    '/usr/local/bin/node',
+    '/usr/bin/node',
+    // last resort: the process running the tests (embedded runtimes may not spawn)
+    process.execPath,
   ].filter(Boolean)
   for (const c of candidates) {
     try {
-      if (existsSync(c) && /node\.exe$/i.test(c)) return c
+      if (existsSync(c) && isNode(c)) return c
     } catch { /* ignore */ }
   }
-  // process.execPath only when it really is node
-  if (/node\.exe$/i.test(process.execPath)) return process.execPath
-  throw new Error('no spawnable node.exe for mock CLI tests (set INV_TEST_NODE)')
+  throw new Error('no spawnable node binary for mock CLI tests (set INV_TEST_NODE)')
 }
 
 function makeDefs(ws) {
