@@ -1,6 +1,9 @@
 mod agg;
 mod dataset;
+mod expr;
+mod time;
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,9 +11,12 @@ use std::process::ExitCode;
 
 use dataset::{
     analysis_dir, datasets_dir, ensure_within_workspace, json_string, load_dataset, new_dataset_id,
-    outputs_dir, parse_csv_path, parse_jsonl_path, save_meta, write_table_parquet_placeholder, Meta,
-    Value,
+    outputs_dir, parse_csv_path, parse_jsonl_path, save_meta, write_table_parquet_placeholder,
+    Column, Meta, Table, Value,
 };
+
+const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\"";
+const VERSION: &str = "0.1.2";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -62,10 +68,9 @@ fn run(args: &[String]) -> Result<String, u8> {
     let rest = &args[i + 1..];
 
     if cmd == "version" || cmd == "--version" {
-        return Ok(
-            "{\"ok\":true,\"version\":\"0.1.0\",\"capabilities\":[\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\"]}"
-                .into(),
-        );
+        return Ok(format!(
+            "{{\"ok\":true,\"version\":\"{VERSION}\",\"capabilities\":[{CAPABILITIES}]}}"
+        ));
     }
 
     let Some(workspace) = workspace else {
@@ -81,6 +86,9 @@ fn run(args: &[String]) -> Result<String, u8> {
         "head" => cmd_head(&workspace, rest),
         "schema" => cmd_schema(&workspace, rest),
         "describe" => cmd_describe(&workspace, rest),
+        "values" => cmd_values(&workspace, rest),
+        "sample" => cmd_sample(&workspace, rest),
+        "join" => cmd_join(&workspace, rest),
         "agg" => cmd_agg(&workspace, rest),
         "list" => cmd_list(&workspace),
         "export" => cmd_export(&workspace, rest),
@@ -374,10 +382,11 @@ fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         eprintln!("{e}");
         2u8
     })?;
-    let result = agg::run_agg(&table, &spec, default_limit, 5000).map_err(|e| {
+    let outcome = agg::run_agg(&table, &spec, default_limit, 5000).map_err(|e| {
         eprintln!("{e}");
         2u8
     })?;
+    let result = outcome.table;
 
     let mut out_dataset_id = String::new();
     if let Some(out_label) = out {
@@ -425,8 +434,14 @@ fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         String::new()
     };
 
+    let parse_field = if outcome.parse_fail_count > 0 {
+        format!(",\"parseFailCount\":{}", outcome.parse_fail_count)
+    } else {
+        String::new()
+    };
+
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"outDatasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"truncated\":{}}}",
+        "{{\"ok\":true,\"datasetId\":{},\"outDatasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"truncated\":{}{parse_field}}}",
         json_string(&id),
         if out_dataset_id.is_empty() {
             "null".into()
@@ -437,6 +452,398 @@ fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         cols.iter().map(|c| json_string(c)).collect::<Vec<_>>().join(","),
         rows_json,
         if truncated { "true" } else { "false" }
+    ))
+}
+
+fn cmd_values(workspace: &Path, args: &[String]) -> Result<String, u8> {
+    let id = match flag_value(args, "--dataset-id") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --dataset-id required"),
+    };
+    let column = match flag_value(args, "--column") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --column required"),
+    };
+    let limit: usize = flag_value(args, "--limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let (meta, table) = load_dataset(workspace, &id).map_err(|e| {
+        eprintln!("{e}");
+        if e.contains("unknown") {
+            5u8
+        } else {
+            2u8
+        }
+    })?;
+    let Some(ci) = table.columns.iter().position(|c| c.name == column) else {
+        return fail(2, &format!("analysis/invalid-args: unknown column {column}"));
+    };
+    let dtype = table.columns[ci].dtype.clone();
+    let mut null_count = 0usize;
+    let mut counts: HashMap<Value, usize> = HashMap::new();
+    for row in &table.rows {
+        let v = row.get(ci).cloned().unwrap_or(Value::Null);
+        if matches!(v, Value::Null) {
+            null_count += 1;
+        } else {
+            *counts.entry(v).or_insert(0) += 1;
+        }
+    }
+    let nunique = counts.len();
+    let non_null = (meta.row_count.max(table.rows.len())).saturating_sub(null_count).max(1);
+    let mut top: Vec<(Value, usize)> = counts.into_iter().collect();
+    top.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_json().cmp(&b.0.to_json()))
+    });
+    top.truncate(limit);
+    let top_json = top
+        .iter()
+        .map(|(v, c)| {
+            format!(
+                "{{\"value\":{},\"count\":{},\"ratio\":{}}}",
+                v.to_json(),
+                c,
+                format!("{:.6}", (*c as f64) / (non_null as f64))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "{{\"ok\":true,\"datasetId\":{},\"column\":{},\"dtype\":{},\"rowCount\":{},\"nullCount\":{},\"nunique\":{},\"limit\":{},\"top\":[{}]}}",
+        json_string(&id),
+        json_string(&column),
+        json_string(&dtype),
+        meta.row_count.max(table.rows.len()),
+        null_count,
+        nunique,
+        limit,
+        top_json
+    ))
+}
+
+/// SplitMix64 deterministic PRNG for sampling.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+fn cmd_sample(workspace: &Path, args: &[String]) -> Result<String, u8> {
+    let id = match flag_value(args, "--dataset-id") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --dataset-id required"),
+    };
+    let n: usize = flag_value(args, "--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .clamp(1, 20);
+    let default_seed: u64 = env_u64("DSH_ANALYZE_DEFAULT_SAMPLE_SEED", "INV_ANALYSIS_DEFAULT_SAMPLE_SEED", 42);
+    let seed: u64 = flag_value(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_seed);
+    let stratify = flag_value(args, "--stratify-by").map(|s| s.to_string());
+    let (meta, table) = load_dataset(workspace, &id).map_err(|e| {
+        eprintln!("{e}");
+        if e.contains("unknown") {
+            5u8
+        } else {
+            2u8
+        }
+    })?;
+    let pop = table.rows.len();
+    let indices: Vec<usize> = if let Some(col_name) = &stratify {
+        let Some(si) = table.columns.iter().position(|c| &c.name == col_name) else {
+            return fail(2, &format!("analysis/invalid-args: unknown column {col_name}"));
+        };
+        stratified_indices(&table, si, n, seed)
+    } else {
+        random_indices(pop, n, seed)
+    };
+    let cols: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let rows_json = indices
+        .iter()
+        .map(|&i| {
+            format!(
+                "[{}]",
+                table.rows[i]
+                    .iter()
+                    .map(|v| v.to_json())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let method = if stratify.is_some() { "stratified" } else { "random" };
+    let stratify_json = stratify
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".into());
+    Ok(format!(
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"sampling\":{{\"method\":\"{method}\",\"n\":{},\"seed\":{seed},\"stratifyBy\":{stratify_json},\"population\":{pop}}}}}",
+        json_string(&id),
+        meta.row_count.max(pop),
+        cols.iter().map(|c| json_string(c)).collect::<Vec<_>>().join(","),
+        rows_json,
+        indices.len()
+    ))
+}
+
+fn random_indices(pop: usize, n: usize, seed: u64) -> Vec<usize> {
+    if n >= pop {
+        return (0..pop).collect();
+    }
+    // Fisher-Yates partial shuffle
+    let mut idx: Vec<usize> = (0..pop).collect();
+    let mut rng = Rng::new(seed);
+    for i in 0..n {
+        let j = i + rng.below(pop - i);
+        idx.swap(i, j);
+    }
+    idx.truncate(n);
+    idx.sort_unstable();
+    idx
+}
+
+fn stratified_indices(table: &Table, strata_col: usize, n: usize, seed: u64) -> Vec<usize> {
+    let pop = table.rows.len();
+    if n >= pop {
+        return (0..pop).collect();
+    }
+    let mut groups: HashMap<Value, Vec<usize>> = HashMap::new();
+    for (i, row) in table.rows.iter().enumerate() {
+        let key = row.get(strata_col).cloned().unwrap_or(Value::Null);
+        groups.entry(key).or_default().push(i);
+    }
+    // largest-remainder allocation
+    let mut quotas: Vec<(Vec<usize>, usize, f64)> = groups
+        .into_values()
+        .map(|members| {
+            let len = members.len();
+            let share = (len as f64) * (n as f64) / (pop as f64);
+            let floor = share.floor() as usize;
+            (members, floor.min(len), share)
+        })
+        .collect();
+    let mut assigned: usize = quotas.iter().map(|q| q.1).sum();
+    // sort by fractional remainder desc for remainder distribution
+    quotas.sort_by(|a, b| {
+        let fa = a.2 - a.1 as f64;
+        let fb = b.2 - b.1 as f64;
+        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for q in quotas.iter_mut() {
+        if assigned >= n {
+            break;
+        }
+        if q.1 < q.0.len() {
+            q.1 += 1;
+            assigned += 1;
+        }
+    }
+    // sample within each group with a stable derived seed
+    let mut out = Vec::with_capacity(n);
+    let mut group_seed = seed;
+    for (members, take, _) in quotas {
+        group_seed = group_seed
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(members.len() as u64);
+        let picked = random_indices(members.len(), take, group_seed);
+        for p in picked {
+            out.push(members[p]);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn cmd_join(workspace: &Path, args: &[String]) -> Result<String, u8> {
+    let left_id = match flag_value(args, "--left") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --left required"),
+    };
+    let right_id = match flag_value(args, "--right") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --right required"),
+    };
+    let on_raw = match flag_value(args, "--on") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --on required"),
+    };
+    let on: Vec<String> = on_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if on.is_empty() {
+        return fail(2, "analysis/invalid-args: --on must list at least one column");
+    }
+    let how = flag_value(args, "--how").map(|s| s.to_string()).unwrap_or_else(|| "inner".into());
+    if how != "inner" && how != "left" {
+        return fail(2, "analysis/invalid-args: --how must be inner|left");
+    }
+    let label = flag_value(args, "--out").map(|s| s.to_string());
+    let max_rows: usize =
+        env_u64("DSH_ANALYZE_MAX_ROWS", "INV_ANALYSIS_MAX_ROWS", 5_000_000) as usize;
+
+    let (left_meta, left) = load_dataset(workspace, &left_id).map_err(|e| {
+        eprintln!("{e}");
+        if e.contains("unknown") {
+            5u8
+        } else {
+            2u8
+        }
+    })?;
+    let (_right_meta, right) = load_dataset(workspace, &right_id).map_err(|e| {
+        eprintln!("{e}");
+        if e.contains("unknown") {
+            5u8
+        } else {
+            2u8
+        }
+    })?;
+    let _ = left_meta;
+
+    let mut left_key_idx = Vec::with_capacity(on.len());
+    let mut right_key_idx = Vec::with_capacity(on.len());
+    for col in &on {
+        let li = left.columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+            eprintln!("analysis/invalid-args: unknown column {col} on left");
+            2u8
+        })?;
+        let ri = right
+            .columns
+            .iter()
+            .position(|c| &c.name == col)
+            .ok_or_else(|| {
+                eprintln!("analysis/invalid-args: unknown column {col} on right");
+                2u8
+            })?;
+        left_key_idx.push(li);
+        right_key_idx.push(ri);
+    }
+
+    // Column layout: left cols + right non-key cols (collision → _r)
+    let mut out_cols: Vec<Column> = left.columns.clone();
+    let mut names: Vec<String> = out_cols.iter().map(|c| c.name.clone()).collect();
+    let mut right_payload: Vec<usize> = Vec::new();
+    for (i, c) in right.columns.iter().enumerate() {
+        if right_key_idx.contains(&i) {
+            continue;
+        }
+        let mut name = c.name.clone();
+        while names.contains(&name) {
+            name = format!("{name}_r");
+        }
+        names.push(name.clone());
+        out_cols.push(Column {
+            name,
+            dtype: c.dtype.clone(),
+        });
+        right_payload.push(i);
+    }
+
+    // Hash right by key
+    let mut right_map: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+    for (ri, row) in right.rows.iter().enumerate() {
+        let key: Vec<Value> = right_key_idx
+            .iter()
+            .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null))
+            .collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        right_map.entry(key).or_default().push(ri);
+    }
+
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    for lrow in &left.rows {
+        let key: Vec<Value> = left_key_idx
+            .iter()
+            .map(|&ci| lrow.get(ci).cloned().unwrap_or(Value::Null))
+            .collect();
+        let matched = if key.iter().any(|v| matches!(v, Value::Null)) {
+            None
+        } else {
+            right_map.get(&key)
+        };
+        match matched {
+            Some(ris) => {
+                for &ri in ris {
+                    let mut row = lrow.clone();
+                    for &ci in &right_payload {
+                        row.push(right.rows[ri].get(ci).cloned().unwrap_or(Value::Null));
+                    }
+                    out_rows.push(row);
+                    if out_rows.len() > max_rows {
+                        return fail(3, "analysis/limit: join result too large");
+                    }
+                }
+            }
+            None if how == "left" => {
+                let mut row = lrow.clone();
+                for _ in &right_payload {
+                    row.push(Value::Null);
+                }
+                out_rows.push(row);
+                if out_rows.len() > max_rows {
+                    return fail(3, "analysis/limit: join result too large");
+                }
+            }
+            None => {}
+        }
+    }
+
+    let new_id = new_dataset_id();
+    let result = Table {
+        columns: out_cols,
+        rows: out_rows,
+    };
+    let (bytes, _) = write_table_parquet_placeholder(workspace, &new_id, &result).map_err(|e| {
+        eprintln!("{e}");
+        1u8
+    })?;
+    let _ = bytes;
+    let meta = Meta {
+        dataset_id: new_id.clone(),
+        row_count: result.rows.len(),
+        columns: result.columns.clone(),
+        source_kind: "join".into(),
+        source_path: format!("join:{left_id}+{right_id}"),
+        label,
+        produced_by: "join".into(),
+        parent_dataset_id: Some(left_id.clone()),
+    };
+    save_meta(workspace, &meta).map_err(|e| {
+        eprintln!("{e}");
+        1u8
+    })?;
+    Ok(format!(
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"leftDatasetId\":{},\"rightDatasetId\":{},\"how\":{}}}",
+        json_string(&new_id),
+        result.rows.len(),
+        result.columns.len(),
+        meta.columns_json(),
+        json_string(&left_id),
+        json_string(&right_id),
+        json_string(&how)
     ))
 }
 

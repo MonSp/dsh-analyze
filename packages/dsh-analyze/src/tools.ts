@@ -4,7 +4,7 @@
  */
 
 import type { AnalysisLimits } from './limits.js'
-import { DEFAULT_ANALYSIS_LIMITS, clampHeadN } from './limits.js'
+import { DEFAULT_ANALYSIS_LIMITS, clampHeadN, clampSampleN, clampValuesLimit } from './limits.js'
 import { AnalyzeCliError, runAnalyzeCli } from './cli.js'
 import {
   AnalysisPathError,
@@ -51,7 +51,6 @@ async function withWorkspaceCliLock<T>(key: string, fn: () => Promise<T>): Promi
 
 /** Profile-relative prefixes that must never be ingested as data sources. */
 const SENSITIVE_PROFILE_PREFIXES = [
-***REMOVED***
   '.bootstrap-token',
   'profiles',
   '.credentials.yaml',
@@ -99,6 +98,32 @@ function failMessage(e: unknown): never {
   throw err
 }
 
+/** Whitelist arithmetic expression: identifiers, numbers, + - * /, parens, unary minus. */
+export function validateMutateExpr(expr: unknown): string {
+  if (typeof expr !== 'string' || !expr.trim() || expr.length > 512) {
+    const err = new Error('analysis/invalid-args: mutate expr must be non-empty string ≤512') as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  // Reject anything outside the grammar before spawn (defense in depth; CLI re-checks).
+  if (!/^[A-Za-z0-9_\s+\-*/().]+$/.test(expr)) {
+    const err = new Error('analysis/invalid-args: mutate expr has illegal characters') as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  if (/[A-Za-z_]\w*\s*\(/.test(expr)) {
+    const err = new Error('analysis/invalid-args: function calls are not allowed in mutate expr') as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  if (!/[A-Za-z_]/.test(expr) && !/\d/.test(expr)) {
+    const err = new Error('analysis/invalid-args: mutate expr is empty of operands') as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  return expr
+}
+
 /** Validate agg spec string before CLI. */
 export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
   if (typeof spec !== 'string' || !spec.trim()) {
@@ -141,6 +166,45 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
         err.code = 'analysis/invalid-args'
         throw err
       }
+    }
+  }
+  if (Array.isArray(obj.mutate)) {
+    const asNames = new Set<string>()
+    for (const m of obj.mutate as Array<Record<string, unknown>>) {
+      if (!m || typeof m !== 'object' || typeof m.as !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(m.as)) {
+        const err = new Error('analysis/invalid-args: invalid mutate name') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      if (asNames.has(m.as)) {
+        const err = new Error(`analysis/invalid-args: duplicate mutate name ${m.as}`) as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      asNames.add(m.as)
+      validateMutateExpr(m.expr)
+    }
+  }
+  if (Array.isArray(obj.groupBy)) {
+    for (const g of obj.groupBy as unknown[]) {
+      if (typeof g === 'string') continue
+      if (g && typeof g === 'object' && !Array.isArray(g)) {
+        const go = g as Record<string, unknown>
+        if (typeof go.dateColumn !== 'string' || typeof go.period !== 'string') {
+          const err = new Error('analysis/invalid-args: groupBy object needs dateColumn and period') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (!['day', 'week', 'month'].includes(go.period)) {
+          const err = new Error('analysis/invalid-args: period must be day|week|month') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        continue
+      }
+      const err = new Error('analysis/invalid-args: groupBy entry must be string or object') as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
     }
   }
   if (Array.isArray(obj.aggs)) {
@@ -585,6 +649,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       name: 'transform_agg',
       description:
         'Filter / project / group-by / aggregate a dataset. ' +
+        'spec may include optional mutate derived columns and time-period groupBy objects. ' +
         'Returns at most `limit` rows (default 1000). ' +
         'Set outLabel to persist a new datasetId for further steps.',
       parameters: {
@@ -594,9 +659,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           spec: {
             type: 'string',
             description:
-              'JSON string: { select?, filter?, groupBy?, aggs?, orderBy?, limit? }. ' +
+              'JSON string: { select?, filter?, mutate?, groupBy?, aggs?, orderBy?, limit? }. ' +
               'filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
-              'agg fns: count/sum/mean/min/max/median/std.',
+              'agg fns: count/sum/mean/min/max/median/std. ' +
+              'mutate: [{as,expr}] whitelist arithmetic only (no functions). ' +
+              'groupBy entries: column name or {dateColumn,period:day|week|month}.',
           },
           outLabel: {
             type: 'string',
@@ -642,6 +709,237 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         validateDatasetId(a.datasetId)
         const spec = validateAggSpec(a.spec, limits)
         const cliArgs = ['agg', '--dataset-id', a.datasetId, '--spec', spec]
+        if (a.outLabel) cliArgs.push('--out', a.outLabel)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_values: {
+      name: 'dataset_values',
+      description:
+        'Top value distribution for one column: nunique, nullCount, top values with counts/ratios. ' +
+        'Use to understand categorical / low-cardinality columns without dumping rows.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          column: { type: 'string', description: 'Column name (required).' },
+          limit: { type: 'number', description: '1–100, default 20. Length of top list only.' },
+        },
+        required: ['datasetId', 'column'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            column: { type: 'string' },
+            nunique: { type: 'number' },
+            nullCount: { type: 'number' },
+            top: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  value: {},
+                  count: { type: 'number' },
+                  ratio: { type: 'number' },
+                },
+              },
+            },
+          },
+          required: ['datasetId', 'column', 'nunique', 'nullCount', 'top'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            column: string
+            nunique: number
+            nullCount: number
+            top: Array<{ value: unknown; count: number; ratio: number }>
+          }
+          const lines = (v.top ?? []).map(
+            t => `  ${JSON.stringify(t.value)} × ${t.count} (${(t.ratio * 100).toFixed(1)}%)`,
+          )
+          return textRender(
+            `values ${v.column} in ${v.datasetId}\n` +
+              `nunique=${v.nunique} nullCount=${v.nullCount}\n` +
+              (lines.join('\n') || '  (no non-null values)'),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { datasetId: string; column: string; limit?: number }
+        validateDatasetId(a.datasetId)
+        if (typeof a.column !== 'string' || !a.column.trim()) {
+          const err = new Error('analysis/invalid-args: column required') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const limit = clampValuesLimit(a.limit, limits)
+        const result = await run(
+          ['values', '--dataset-id', a.datasetId, '--column', a.column, '--limit', String(limit)],
+          exec?.signal,
+        )
+        return result.data
+      },
+    },
+
+    dataset_sample: {
+      name: 'dataset_sample',
+      description:
+        'Deterministic random (or stratified) sample of up to 20 rows. ' +
+        'Same datasetId + n + seed always yields the same rows. Prefer over dataset_head when you need a spread, not the first rows.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          n: { type: 'number', description: '1–20, default 10' },
+          seed: { type: 'number', description: 'Unsigned integer seed; default 42 for reproducibility.' },
+          stratifyBy: { type: 'string', description: 'Optional column for proportional strata sampling.' },
+        },
+        required: ['datasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            columns: { type: 'array', items: { type: 'string' } },
+            rows: { type: 'array', items: { type: 'array' } },
+            sampling: {
+              type: 'object',
+              properties: {
+                method: { type: 'string' },
+                n: { type: 'number' },
+                seed: { type: 'number' },
+                stratifyBy: { type: ['string', 'null'] },
+                population: { type: 'number' },
+              },
+            },
+          },
+          required: ['datasetId', 'columns', 'rows', 'sampling'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            columns: string[]
+            rows: unknown[][]
+            sampling?: { method?: string; n?: number; seed?: number; population?: number }
+          }
+          return textRender(
+            `sample of ${v.datasetId} (${v.rows?.length ?? 0} rows, ` +
+              `${v.sampling?.method ?? 'random'} seed=${v.sampling?.seed ?? '?'} pop=${v.sampling?.population ?? '?'} )\n` +
+              JSON.stringify({ columns: v.columns, rows: v.rows }, null, 2),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { datasetId: string; n?: number; seed?: number; stratifyBy?: string }
+        validateDatasetId(a.datasetId)
+        const n = clampSampleN(a.n, limits)
+        const cliArgs = ['sample', '--dataset-id', a.datasetId, '--n', String(n)]
+        if (a.seed !== undefined && a.seed !== null) {
+          if (!Number.isFinite(a.seed) || a.seed < 0 || !Number.isInteger(a.seed)) {
+            const err = new Error('analysis/invalid-args: seed must be a non-negative integer') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--seed', String(a.seed))
+        }
+        if (a.stratifyBy) cliArgs.push('--stratify-by', a.stratifyBy)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_join: {
+      name: 'dataset_join',
+      description:
+        'Equi-join two datasets on shared key column(s). Always writes a new datasetId ' +
+        '(producedBy=join). Returns only the new id + row/column counts — never full rows. ' +
+        'how: inner (default) or left. Null keys never match.',
+      parameters: {
+        type: 'object',
+        properties: {
+          leftDatasetId: { type: 'string' },
+          rightDatasetId: { type: 'string' },
+          on: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Non-empty list of column names present on both sides.',
+          },
+          how: { type: 'string', enum: ['inner', 'left'], description: 'Default inner.' },
+          outLabel: { type: 'string', description: 'Optional label stored on the new dataset.' },
+        },
+        required: ['leftDatasetId', 'rightDatasetId', 'on'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            columnCount: { type: 'number' },
+            leftDatasetId: { type: 'string' },
+            rightDatasetId: { type: 'string' },
+            how: { type: 'string' },
+          },
+          required: ['datasetId', 'rowCount', 'columnCount'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            columnCount: number
+            how?: string
+          }
+          return textRender(
+            `join → ${v.datasetId}: ${v.rowCount} rows × ${v.columnCount} cols (how=${v.how ?? 'inner'}). ` +
+              'Inspect with dataset_head / stats_describe / transform_agg.',
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          leftDatasetId: string
+          rightDatasetId: string
+          on: string[]
+          how?: string
+          outLabel?: string
+        }
+        validateDatasetId(a.leftDatasetId)
+        validateDatasetId(a.rightDatasetId)
+        if (!Array.isArray(a.on) || a.on.length === 0 || a.on.length > limits.maxJoinOnColumns) {
+          const err = new Error(`analysis/invalid-args: on must be 1..${limits.maxJoinOnColumns} column names`) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (a.on.some(c => typeof c !== 'string' || !c.trim())) {
+          const err = new Error('analysis/invalid-args: on entries must be non-empty strings') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const how = a.how ?? 'inner'
+        if (how !== 'inner' && how !== 'left') {
+          const err = new Error('analysis/invalid-args: how must be inner|left') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const cliArgs = [
+          'join',
+          '--left', a.leftDatasetId,
+          '--right', a.rightDatasetId,
+          '--on', a.on.join(','),
+          '--how', how,
+        ]
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
         const result = await run(cliArgs, exec?.signal)
         return result.data
