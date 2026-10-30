@@ -1,6 +1,6 @@
 ---
 feature: main-rs-module-split
-status: designed
+status: delivered
 updated: 2026-10-30
 source: refactor/main-rs-modules
 ---
@@ -8,6 +8,20 @@ source: refactor/main-rs-modules
 # Split main.rs into CLI modules
 
 ## Report
+
+**What was built** — Pure structural refactor of `dsh-analyze`: 917-line
+`main.rs` reduced to process entry + dispatch (~72 lines). Shared helpers
+(`fail`/`flag_value`/`env_u64`) live in `cli.rs`. All `cmd_*` handlers moved
+into `commands/` (`ingest`/`inspect`/`sample`/`join`/`agg`/`manage`). Engine
+modules (`agg`/`dataset`/`expr`/`time`) untouched. No CLI protocol, JSON,
+exit-code, or env-var change.
+
+**Verification** — `cargo test -p dsh-analyze --release`: 9 passed.
+`node --test` analysis-tools + analysis-policy (after `tsc` build): 30 passed.
+CLI smoke: version → ingest → head → values → sample → join → agg →
+describe → schema → list → export → rm all `ok:true`. Independent review of
+`a0ad8af..dc7b227`: no CRITICAL findings; moved bodies token-equivalent to
+base (rustfmt rewraps + `crate::` path qualify only).
 
 ## [S1] Problem
 
@@ -70,8 +84,8 @@ crates/dsh-analyze/src/
 
 ## Tasks
 
-- [ ] T1: Create `cli` + `commands` skeleton and move helpers — acceptance: project compiles; `fail`/`flag_value`/`env_u64` live in `cli` (covers: S2.1–S2.2)
-- [ ] T2: Move all `cmd_*` implementations into `commands/*` — acceptance: `main.rs` is entry+dispatch only; no duplicate command bodies (covers: S2.1–S2.3)
-- [ ] T3: Verify behavior — acceptance: `cargo test -p dsh-analyze --release` passes; node analysis tests pass or are PRE-EXISTING fail (covers: S2.3)
+- [x] T1: Create `cli` + `commands` skeleton and move helpers — acceptance: project compiles; `fail`/`flag_value`/`env_u64` live in `cli` (covers: S2.1–S2.2)
+- [x] T2: Move all `cmd_*` implementations into `commands/*` — acceptance: `main.rs` is entry+dispatch only; no duplicate command bodies (covers: S2.1–S2.3)
+- [x] T3: Verify behavior — acceptance: `cargo test -p dsh-analyze --release` passes; node analysis tests pass or are PRE-EXISTING fail (covers: S2.3)
 
 ## Journey log
