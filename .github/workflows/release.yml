@@ -97,6 +97,9 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1; runners ship older.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
       - name: Build plugin
         working-directory: packages/dsh-analyze
         run: |
@@ -115,6 +118,6 @@ jobs:
       - name: Publish to npm
         working-directory: packages/dsh-analyze
         env:
-          # Empty when using OIDC trusted publishing; set secrets.NPM_TOKEN for token auth.
+          # Optional fallback: secrets.NPM_TOKEN. Empty → OIDC trusted publishing.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
