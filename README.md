@@ -16,6 +16,36 @@ no audit trail               stats_describe  → column stats
                              (full table stays on disk)
 ```
 
+## Why DSH needs a local compute engine
+
+[DSH](https://github.com/deepseek-ai/deepseek-harness) runs agents that
+reason through **tool calls**, not notebooks. Real analysis sessions often
+start from a workspace file (exports, logs, CSV dumps) that is far larger
+than the context window — and the agent still needs schema, distributions,
+filters, joins, and aggregates to answer the user.
+
+Without a dedicated engine, hosts usually fall into one of three traps:
+
+| Trap | What happens |
+|---|---|
+| **Paste / cat into context** | Multi-MB tables blow the window, truncate mid-answer, and burn tokens on data the model never needs in full. |
+| **Unbounded shell + Python** | `pandas` in the agent shell works until it does not: no row/byte caps, no path sandbox, no stable JSON contract, hard to audit or harden. |
+| **Full SQL / warehouse** | Right for live multi-tenant data; wrong for “here is a local file in this session workspace” with zero network. |
+
+dsh-analyze is the missing middle layer for DSH sessions:
+
+1. **On-disk dataset store** — ingest once, keep the table under
+   `<workspace>/.dsh-analyze/`, address it as a `datasetId`.
+2. **Small JSON tools** — head / describe / values / sample / agg / join
+   return tiny structured results (samples ≤ 20 rows; agg limits apply).
+3. **Hard, explicit limits** — byte/row caps, path confinement, whitelist
+   expressions (no arbitrary code), fail-soft plugin registration.
+4. **Offline by design** — pure-std Rust binary; no cloud, no drivers.
+
+The model explores like an analyst (schema → sample → stats → grouped
+aggregates → join) while the full table never has to live in context, and
+every step is a bounded tool call the host can log and constrain.
+
 ## What it is (and is not)
 
 | Is | Is not |
