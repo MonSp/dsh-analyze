@@ -81,3 +81,40 @@ jobs:
             dist/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  publish-npm:
+    name: Publish npm
+    needs: build
+    runs-on: ubuntu-latest
+    # id-token: write → npm Trusted Publishing (OIDC). Optional NPM_TOKEN secret
+    # is used automatically when set (granular token with publish + bypass 2FA).
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Build plugin
+        working-directory: packages/dsh-analyze
+        run: |
+          npm install
+          npm run build
+      - name: Tag must match package.json version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./packages/dsh-analyze/package.json').version")
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag v$TAG does not match packages/dsh-analyze version $PKG" >&2
+            exit 1
+          fi
+      - name: Publish to npm
+        working-directory: packages/dsh-analyze
+        env:
+          # Empty when using OIDC trusted publishing; set secrets.NPM_TOKEN for token auth.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
