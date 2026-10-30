@@ -41,7 +41,8 @@ jobs:
           set -euo pipefail
           BIN_EXT=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then BIN_EXT=".exe"; fi
-          SRC="crates/dsh-analyze/target/${{ matrix.target }}/release/dsh-analyze${BIN_EXT}"
+          # cargo workspace target dir sits at the repo root
+          SRC="target/${{ matrix.target }}/release/dsh-analyze${BIN_EXT}"
           STAGE="dsh-analyze-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp "$SRC" "$STAGE/dsh-analyze${BIN_EXT}"

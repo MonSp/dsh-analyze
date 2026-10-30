@@ -24,7 +24,7 @@ jobs:
       - name: version probe
         shell: bash
         run: |
-          BIN=crates/dsh-analyze/target/release/dsh-analyze
+          BIN=target/release/dsh-analyze
           if [ -x "${BIN}.exe" ]; then BIN="${BIN}.exe"; fi
           "$BIN" version
       - name: cargo tree must stay offline
@@ -32,11 +32,11 @@ jobs:
       - name: reject network crates
         shell: bash
         run: |
-          if grep -Eiq 'reqwest|hyper|tokio-net|std::net|native-tls|rustls' cargo-tree.txt; then
+          if grep -Eiq 'reqwest|hyper|tokio|native-tls|rustls' cargo-tree.txt; then
             echo "network-related crate detected in cargo tree" >&2
             exit 1
           fi
-        # std is fine; this gate is a tripwire for accidental deps.
+        # crate is zero-dep today; this gate trips on accidental additions.
 
   plugin:
     name: Plugin (node ${{ matrix.node }})
