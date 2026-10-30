@@ -358,6 +358,8 @@ fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
             2u8
         })?
     };
+    // Windows tools may write a UTF-8 BOM; trim() does not strip U+FEFF.
+    let spec_text = spec_text.strip_prefix('\u{feff}').unwrap_or(&spec_text);
     let out = flag_value(args, "--out").map(|s| s.to_string());
     let default_limit: usize = env_u64("DSH_ANALYZE_DEFAULT_ROW_LIMIT", "INV_ANALYSIS_DEFAULT_ROW_LIMIT", 1000) as usize;
     let (_meta, table) = load_dataset(workspace, &id).map_err(|e| {

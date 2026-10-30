@@ -382,7 +382,7 @@ fn read_json_string(chars: &[char], start: usize) -> Result<(String, usize), Str
 }
 
 fn read_json_scalar(chars: &[char], start: usize) -> Result<(Value, usize), String> {
-    let mut i = start;
+    let i = start;
     if i >= chars.len() {
         return Err("analysis/cli-failed: expected value".into());
     }
