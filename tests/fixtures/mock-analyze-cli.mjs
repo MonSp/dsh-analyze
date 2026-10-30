@@ -138,8 +138,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.0-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm'],
+      version: '0.1.2-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join'],
     }))
     return
   }
@@ -275,25 +275,143 @@ async function main() {
         }
       })
     }
+
+    // Working table after filter + mutate
+    let workHeaders = [...table.headers]
+    let workRows = keep.map(i => [...table.rows[i]])
+    const evalExpr = (expr, row, colIndex) => {
+      // tiny whitelist evaluator for mock tests
+      if (!/^[A-Za-z0-9_\s+\-*/().]+$/.test(expr)) fail(2, 'analysis/invalid-args: illegal mutate expr')
+      if (/[A-Za-z_]\w*\s*\(/.test(expr)) fail(2, 'analysis/invalid-args: function calls not allowed')
+      const tokens = expr.match(/[A-Za-z_]\w*|\d+\.?\d*|[+\-*/()]/g) || []
+      let pos = 0
+      const peek = () => tokens[pos]
+      const next = () => tokens[pos++]
+      const primary = () => {
+        const t = next()
+        if (t === undefined) fail(2, 'analysis/invalid-args: bad expr')
+        if (t === '(') {
+          const v = add()
+          if (next() !== ')') fail(2, 'analysis/invalid-args: expected )')
+          return v
+        }
+        if (/^\d/.test(t)) return Number(t)
+        if (/^[A-Za-z_]/.test(t)) {
+          const ci = colIndex[t]
+          if (ci === undefined) fail(2, `analysis/invalid-args: unknown column in expr: ${t}`)
+          return row[ci]
+        }
+        if (t === '-') return -primary()
+        fail(2, `analysis/invalid-args: bad token ${t}`)
+      }
+      const mul = () => {
+        let v = primary()
+        while (peek() === '*' || peek() === '/') {
+          const op = next()
+          const r = primary()
+          const a = Number(v), b = Number(r)
+          if (!Number.isFinite(a) || !Number.isFinite(b)) return null
+          v = op === '*' ? a * b : (b === 0 ? null : a / b)
+        }
+        return v
+      }
+      const add = () => {
+        let v = mul()
+        while (peek() === '+' || peek() === '-') {
+          const op = next()
+          const r = mul()
+          const a = Number(v), b = Number(r)
+          if (!Number.isFinite(a) || !Number.isFinite(b)) return null
+          v = op === '+' ? a + b : a - b
+        }
+        return v
+      }
+      return add()
+    }
+    if (Array.isArray(spec.mutate)) {
+      for (const m of spec.mutate) {
+        if (!m || typeof m.as !== 'string' || typeof m.expr !== 'string') {
+          fail(2, 'analysis/invalid-args: mutate needs as+expr')
+        }
+        if (workHeaders.includes(m.as)) fail(2, `analysis/invalid-args: mutate column collides: ${m.as}`)
+        const colIndex = Object.fromEntries(workHeaders.map((h, i) => [h, i]))
+        for (const row of workRows) {
+          row.push(evalExpr(m.expr, row, colIndex))
+        }
+        workHeaders.push(m.as)
+      }
+    }
+    const work = { headers: workHeaders, rows: workRows }
+    const widx = name => {
+      const i = work.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+      return i
+    }
+
     const limit = Math.min(Number(spec.limit || 1000), 5000)
     const groupBy = spec.groupBy || []
     const aggs = spec.aggs || []
+    let parseFailCount = 0
     let outHeaders, outRows
     if (!groupBy.length && !aggs.length) {
-      const select = spec.select || table.headers
-      const idxs = select.map(idx)
+      const select = spec.select || work.headers
+      const idxs = select.map(widx)
       outHeaders = select
-      outRows = keep.slice(0, limit).map(i => idxs.map(ci => table.rows[i][ci]))
+      outRows = work.rows.slice(0, limit).map(r => idxs.map(ci => r[ci]))
     } else {
-      const gIdx = groupBy.map(idx)
+      const gKeys = groupBy.map(g => {
+        if (typeof g === 'string') return { kind: 'col', name: g, ci: widx(g) }
+        if (g && g.dateColumn && g.period) {
+          if (!['day', 'week', 'month'].includes(g.period)) fail(2, `analysis/invalid-args: bad period ${g.period}`)
+          return { kind: 'time', name: `${g.dateColumn}_${g.period}`, ci: widx(g.dateColumn), period: g.period }
+        }
+        fail(2, 'analysis/invalid-args: bad groupBy entry')
+      })
+      const parseTs = (s, period) => {
+        const t = String(s).trim()
+        const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?(?:Z|z|[+-]\d{2}:?\d{2})?$/)
+        if (!m) return null
+        let y = +m[1], mo = +m[2], d = +m[3]
+        if (m[4] !== undefined) {
+          // apply crude offset if present (UTC default)
+          const off = t.match(/([+-])(\d{2}):?(\d{2})$/)
+          if (off) {
+            let mins = (+m[4]) * 60 + (+m[5]) + (off[1] === '-' ? -1 : 1) * ((+off[2]) * 60 + (+off[3]))
+            // shift day only for simplicity
+            const dayDelta = Math.floor(mins / 1440)
+            // normalize via Date UTC
+            const dt = new Date(Date.UTC(y, mo - 1, d, +m[4], +m[5]))
+            // subtract offset minutes to get UTC
+            dt.setUTCMinutes(dt.getUTCMinutes() - (off[1] === '-' ? -1 : 1) * ((+off[2]) * 60 + (+off[3])))
+            y = dt.getUTCFullYear(); mo = dt.getUTCMonth() + 1; d = dt.getUTCDate()
+            void dayDelta
+          }
+        }
+        if (period === 'month') return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}`
+        const dt = new Date(Date.UTC(y, mo - 1, d))
+        if (period === 'day') {
+          return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`
+        }
+        // week: Monday
+        const dow = (dt.getUTCDay() + 6) % 7
+        dt.setUTCDate(dt.getUTCDate() - dow)
+        return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`
+      }
       const groups = new Map()
-      for (const i of keep) {
-        const key = gIdx.map(ci => table.rows[i][ci])
+      for (const row of work.rows) {
+        const key = gKeys.map(g => {
+          if (g.kind === 'col') return row[g.ci]
+          const cell = row[g.ci]
+          if (cell === null || cell === undefined || cell === '') return null
+          const b = parseTs(cell, g.period)
+          if (b === null) { parseFailCount++; return null }
+          return b
+        })
         const k = JSON.stringify(key)
         if (!groups.has(k)) groups.set(k, { key, members: [] })
-        groups.get(k).members.push(i)
+        groups.get(k).members.push(row)
       }
-      outHeaders = [...groupBy, ...aggs.map((a, ai) => a.as || (a.column ? `${a.column}_${a.fn}` : a.fn))]
+      outHeaders = [...gKeys.map(g => g.name), ...aggs.map(a => a.as || (a.column ? `${a.column}_${a.fn}` : a.fn))]
       outRows = []
       for (const g of groups.values()) {
         const row = [...g.key]
@@ -302,8 +420,8 @@ async function main() {
             row.push(g.members.length)
             continue
           }
-          const ci = idx(a.column)
-          const nums = g.members.map(i => table.rows[i][ci]).filter(v => typeof v === 'number')
+          const ci = widx(a.column)
+          const nums = g.members.map(r => r[ci]).filter(v => typeof v === 'number')
           let v = null
           if (a.fn === 'sum') v = nums.reduce((x, y) => x + y, 0)
           else if (a.fn === 'mean') v = nums.length ? nums.reduce((x, y) => x + y, 0) / nums.length : null
@@ -362,6 +480,199 @@ async function main() {
       columns: outHeaders,
       rows: includeRows ? outRows : [],
       truncated,
+      ...(parseFailCount > 0 ? { parseFailCount } : {}),
+    }))
+    return
+  }
+
+  if (cmd === 'values') {
+    const id = getFlag(rest, '--dataset-id')
+    const column = getFlag(rest, '--column')
+    const limit = Math.min(100, Math.max(1, Number(getFlag(rest, '--limit') || 20)))
+    if (!column) fail(2, 'analysis/invalid-args: --column required')
+    const { meta, table } = loadDataset(ws, id)
+    const ci = table.headers.indexOf(column)
+    if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${column}`)
+    let nullCount = 0
+    const counts = new Map()
+    for (const row of table.rows) {
+      const v = row[ci]
+      if (v === null || v === undefined) nullCount++
+      else counts.set(v, (counts.get(v) || 0) + 1)
+    }
+    const nonNull = Math.max(1, table.rows.length - nullCount)
+    const top = [...counts.entries()]
+      .map(([value, count]) => ({ value, count, ratio: count / nonNull }))
+      .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)))
+      .slice(0, limit)
+    console.log(json({
+      ok: true,
+      datasetId: id,
+      column,
+      dtype: meta.columns.find(x => x.name === column)?.dtype ?? 'utf8',
+      rowCount: meta.rowCount,
+      nullCount,
+      nunique: counts.size,
+      limit,
+      top,
+    }))
+    return
+  }
+
+  if (cmd === 'sample') {
+    const id = getFlag(rest, '--dataset-id')
+    const n = Math.min(20, Math.max(1, Number(getFlag(rest, '--n') || 10)))
+    const seed = Number(getFlag(rest, '--seed') ?? 42)
+    const stratifyBy = getFlag(rest, '--stratify-by')
+    const { meta, table } = loadDataset(ws, id)
+    const pop = table.rows.length
+    // SplitMix64
+    const nextU64 = (state) => {
+      state.s = (state.s + 0x9e3779b97f4a7c15n) & 0xffffffffffffffffn
+      let z = state.s
+      z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & 0xffffffffffffffffn
+      z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & 0xffffffffffffffffn
+      return z ^ (z >> 31n)
+    }
+    const sampleFrom = (indices, take, seedNum) => {
+      if (take >= indices.length) return [...indices]
+      const idx = [...indices]
+      const state = { s: BigInt(seedNum) & 0xffffffffffffffffn }
+      for (let i = 0; i < take; i++) {
+        const r = nextU64(state) % BigInt(idx.length - i)
+        const j = i + Number(r)
+        ;[idx[i], idx[j]] = [idx[j], idx[i]]
+      }
+      return idx.slice(0, take).sort((a, b) => a - b)
+    }
+    let indices
+    let method = 'random'
+    if (stratifyBy) {
+      method = 'stratified'
+      const si = table.headers.indexOf(stratifyBy)
+      if (si < 0) fail(2, `analysis/invalid-args: unknown column ${stratifyBy}`)
+      const groups = new Map()
+      table.rows.forEach((row, i) => {
+        const k = row[si] === null || row[si] === undefined ? '__null__' : String(row[si])
+        if (!groups.has(k)) groups.set(k, [])
+        groups.get(k).push(i)
+      })
+      indices = []
+      let gs = seed
+      for (const members of groups.values()) {
+        const take = Math.min(members.length, Math.floor((members.length * n) / Math.max(1, pop)))
+        gs = (gs * 0x9e3779b97f4a7c15 + members.length) >>> 0
+        for (const p of sampleFrom(members, take, gs)) indices.push(p)
+      }
+      // top up if under-allocated
+      if (indices.length < Math.min(n, pop)) {
+        const chosen = new Set(indices)
+        for (let i = 0; i < pop && indices.length < Math.min(n, pop); i++) {
+          if (!chosen.has(i)) { indices.push(i); chosen.add(i) }
+        }
+      }
+      indices.sort((a, b) => a - b)
+      if (n >= pop) indices = Array.from({ length: pop }, (_, i) => i)
+    } else {
+      indices = sampleFrom(Array.from({ length: pop }, (_, i) => i), n, seed)
+    }
+    const rows = indices.map(i => table.rows[i])
+    console.log(json({
+      ok: true,
+      datasetId: id,
+      rowCount: meta.rowCount,
+      columns: table.headers,
+      rows,
+      sampling: {
+        method,
+        n: indices.length,
+        seed,
+        stratifyBy: stratifyBy ?? null,
+        population: pop,
+      },
+    }))
+    return
+  }
+
+  if (cmd === 'join') {
+    const leftId = getFlag(rest, '--left')
+    const rightId = getFlag(rest, '--right')
+    const onRaw = getFlag(rest, '--on')
+    const how = getFlag(rest, '--how') || 'inner'
+    const outLabel = getFlag(rest, '--out')
+    if (!leftId || !rightId || !onRaw) fail(2, 'analysis/invalid-args: --left --right --on required')
+    if (how !== 'inner' && how !== 'left') fail(2, 'analysis/invalid-args: --how must be inner|left')
+    const on = onRaw.split(',').map(s => s.trim()).filter(Boolean)
+    if (!on.length) fail(2, 'analysis/invalid-args: --on must list at least one column')
+    const left = loadDataset(ws, leftId)
+    const right = loadDataset(ws, rightId)
+    const maxRows = Number(process.env.DSH_ANALYZE_MAX_ROWS || 5000000)
+    const lKey = on.map(c => {
+      const i = left.table.headers.indexOf(c)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${c} on left`)
+      return i
+    })
+    const rKey = on.map(c => {
+      const i = right.table.headers.indexOf(c)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${c} on right`)
+      return i
+    })
+    const outHeaders = [...left.table.headers]
+    const names = new Set(outHeaders)
+    const rightPayload = []
+    right.table.headers.forEach((h, i) => {
+      if (rKey.includes(i)) return
+      let name = h
+      while (names.has(name)) name = name + '_r'
+      names.add(name)
+      outHeaders.push(name)
+      rightPayload.push(i)
+    })
+    const keyOf = (row, idxs) => idxs.map(i => row[i] === undefined ? null : row[i])
+    const rightMap = new Map()
+    right.table.rows.forEach((row, ri) => {
+      const k = JSON.stringify(keyOf(row, rKey))
+      if (k.includes('null')) return
+      if (!rightMap.has(k)) rightMap.set(k, [])
+      rightMap.get(k).push(ri)
+    })
+    const outRows = []
+    for (const lrow of left.table.rows) {
+      const k = keyOf(lrow, lKey)
+      if (k.some(v => v === null)) {
+        if (how === 'left') outRows.push([...lrow, ...rightPayload.map(() => null)])
+        continue
+      }
+      const matches = rightMap.get(JSON.stringify(k)) || []
+      if (matches.length === 0) {
+        if (how === 'left') outRows.push([...lrow, ...rightPayload.map(() => null)])
+        continue
+      }
+      for (const ri of matches) {
+        outRows.push([...lrow, ...rightPayload.map(ci => right.table.rows[ri][ci] ?? null)])
+        if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')
+      }
+    }
+    const newIdVal = newId()
+    writeDataset(ws, newIdVal, { headers: outHeaders, rows: outRows }, {
+      sourceKind: 'join',
+      sourcePath: `join:${leftId}+${rightId}`,
+      label: outLabel,
+      producedBy: 'join',
+      parentDatasetId: leftId,
+    })
+    console.log(json({
+      ok: true,
+      datasetId: newIdVal,
+      rowCount: outRows.length,
+      columnCount: outHeaders.length,
+      columns: outHeaders.map((name, idx) => ({
+        name,
+        dtype: inferDtype(outRows.map(r => r[idx])),
+      })),
+      leftDatasetId: leftId,
+      rightDatasetId: rightId,
+      how,
     }))
     return
   }
