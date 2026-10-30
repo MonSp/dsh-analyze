@@ -20,3 +20,6 @@ Thumbs.db
 # editors
 .idea/
 .vscode/
+
+# local compose specs (never publish)
+docs/compose/
