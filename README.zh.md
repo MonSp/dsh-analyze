@@ -100,9 +100,19 @@ crate 为纯标准库实现，可离线构建。
 | `dataset_values` | 单列取值分布（`nunique`、`top`） |
 | `dataset_sample` | 确定性随机或分层抽样（≤ 20 行） |
 | `dataset_join` | 等值连接 → 新 dataset（只返回 id 与计数） |
+| `dataset_profile` | 质量画像：空值率、nunique、类型稳定性、疑似主键 |
+| `dataset_dedup` | 精确或键控重复检测（计数 + 样例组） |
+| `dataset_outliers` | IQR / z-score / MAD 异常值；可选写出异常 dataset |
 
-CLI 子命令与工具同名（`values` / `sample` / `join` 等）。
+CLI 子命令与工具同名（`values` / `sample` / `join` / `profile` 等）。
 冻结 JSON 契约见 [docs/interface.md](docs/interface.md)。
+
+### 质量工具（v0.1.3）
+
+- **`dataset_profile`**：一次调用回答「这张表能不能算」。
+- **`dataset_dedup`**：不传 `keyColumns` 为整行精确去重；传键做导出式碰撞检查。
+- **`dataset_outliers`**：`method: iqr|zscore|mad`；`outLabel` 写出新 dataset，绝不整表回传异常行。
+- **`stats_describe`**：数值列额外返回 `q01` / `q10` / `q90` / `q99`。
 
 ### `transform_agg` 扩展（v0.1.2）
 

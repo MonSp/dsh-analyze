@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.2)
+# dsh-analyze interface specification (v0.1.3)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.2` |
+| Version | `0.1.3` |
 
 ## 2. Invocation
 
@@ -57,12 +57,12 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.2","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join"]}
+{"ok":true,"version":"0.1.3","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers"]}
 ```
 
-Capability tokens for this version: the eight v0.1 tokens plus `values`,
-`sample`, `join`. Mutate and time-period grouping ship inside `agg` and do
-not add a separate capability token.
+Capability tokens: the v0.1.2 set plus `profile`, `dedup`, `outliers`.
+Mutate, time-period grouping, and extended `describe` quantiles ship inside
+existing commands and do not add separate capability tokens.
 
 ### `ingest`
 
@@ -96,8 +96,12 @@ Flags: `--dataset-id` (required)
 Flags: `--dataset-id` (required), `--columns a,b,c` (optional subset)
 
 ```json
-{"ok":true,"datasetId":"ds_…","stats":[{"name":"…","dtype":"…","nullCount":0,"min":0,"max":0,"mean":0,"std":0,"q25":0,"q50":0,"q75":0}]}
+{"ok":true,"datasetId":"ds_…","stats":[{"name":"…","dtype":"…","nullCount":0,"min":0,"max":0,"mean":0,"std":0,"q25":0,"q50":0,"q75":0,"q01":0,"q10":0,"q90":0,"q99":0}]}
 ```
+
+- Numeric columns always include `q01`/`q10`/`q90`/`q99` (same nearest-rank
+  estimator as `q25`/`q50`/`q75`). Non-numeric columns set all quantile fields
+  to `null` (additive fields; existing hosts may ignore them).
 
 ### `values`
 
@@ -244,6 +248,54 @@ Flags: `--left <id>` (required), `--right <id>` (required), `--on a,b` (required
 - New meta: `producedBy: "join"`, `parentDatasetId` = left dataset id, `label` = `--out` when provided, `sourceKind: "join"`.
 - Missing `--on` column on either side → `analysis/invalid-args`.
 
+### `profile`
+
+Dataset quality profile (v0.1.3). Summary only — never full columns.
+
+Flags: `--dataset-id` (required), `--high-cardinality-threshold <n>` (optional, default 200, integer ≥ 1)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…","nullCount":0,"nullRate":0.0,"nunique":0,"uniqueRate":0.0,"highCardinality":false,"typeStability":"int|string|float|bool|mixed|mixed_numeric|empty","numericCount":0,"numericShare":0.0,"boolCount":0,"sampleValues":[]}],"suspectKeys":[{"columns":["…"],"reason":"unique_non_null","nullCount":0,"nunique":0}],"warnings":[{"code":"high_cardinality","column":"…","nunique":0,"threshold":200}]}
+```
+
+- `nunique` counts distinct non-null cells (same rule as `values`).
+- `typeStability` is runtime observation of non-null cell kinds; may disagree with stored schema `dtype`.
+- `sampleValues`: up to 3 distinct non-null values, first-seen order.
+- `suspectKeys`: single-column `unique_non_null` candidates (max 10); composite keys deferred.
+- `warnings` codes: `empty_table`, `high_cardinality`, `all_null`, `mostly_null`, `mixed_types`, `warnings_truncated` (cap 50).
+
+### `dedup`
+
+Exact whole-row or keyed duplicate detection. Samples only — never the full duplicate set.
+
+Flags: `--dataset-id` (required), `--key-columns a,b` (optional, 1–16 shared columns), `--sample-limit <n>` (1–20, default 5)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"mode":"exact","keyColumns":null,"duplicateRowCount":0,"duplicateRowRate":0.0,"distinctRowCount":0,"duplicateRowCountGroups":0,"maxMultiplicity":1,"samples":[{"key":null,"count":2,"rows":[[…],[…]]}],"samplesTruncated":false}
+```
+
+Keyed mode uses `"mode":"keyed"`, `"keyColumns":["…"]`, and replaces `distinctRowCount` / `duplicateRowCountGroups` with `distinctKeyCount` / `duplicateKeyCount`.
+
+- Exact mode: fingerprint is the whole row; `samples[].key` is `null`.
+- Keyed mode: fingerprint is the key columns in `--key-columns` order; `samples[].key` is that key cell array.
+- `samples` ordered by group `count` desc, then first-seen row index asc; each sample group keeps at most 3 earliest rows.
+- Row cells in samples are full source rows (all columns).
+
+### `outliers`
+
+Numeric outlier detection. Samples only; optional `--out` writes a new dataset.
+
+Flags: `--dataset-id` (required), `--columns a,b` (required, 1–32 numeric-capable), `--method iqr|zscore|mad` (default `iqr`), `--k <f>` (finite > 0; default 1.5 for iqr else 3.0), `--sample-limit <n>` (1–20, default 10), `--out <label>` (optional)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"method":"iqr","k":1.5,"outDatasetId":null,"columns":[{"name":"…","dtype":"…","numericCount":0,"nullCount":0,"lowerBound":0,"upperBound":0,"outlierCount":0,"outlierRate":0.0,"degenerateIqr":false,"degenerateStd":false,"degenerateMad":false,"samples":[{"rowIndex":0,"value":0,"row":[…]}]}]}
+```
+
+- Methods: `iqr` bounds `Q1-k·IQR` / `Q3+k·IQR`; `zscore` uses sample std; `mad` uses `1.4826·MAD` around Q50.
+- Degenerate cases (`IQR==0`, `std==0`, `MAD==0`) report the matching `degenerate*` flag and no outliers.
+- Only cells where `as_f64()` succeeds count as numeric; nulls/non-numeric are excluded from bounds.
+- `--out`: persists rows that are outliers in **any** listed column (`producedBy: "outliers"`, `sourceKind: "outliers"`). Response never returns full outlier rows; use `head`/`agg` on `outDatasetId`. Limit → exit 3, nothing written.
+
 ### `list`
 
 ```json
@@ -275,13 +327,17 @@ The DSH plugin registers the same operations as tools:
 
 `dataset_ingest` · `dataset_head` · `dataset_schema` · `dataset_list` ·
 `dataset_export` · `dataset_rm` · `stats_describe` · `transform_agg` ·
-`dataset_values` · `dataset_sample` · `dataset_join`
+`dataset_values` · `dataset_sample` · `dataset_join` ·
+`dataset_profile` · `dataset_dedup` · `dataset_outliers`
 
 | Tool | CLI | Notes |
 |---|---|---|
 | `dataset_values` | `values` | requires `column`; `limit` 1–100 default 20 |
 | `dataset_sample` | `sample` | `n` 1–20 default 10; optional `seed`, `stratifyBy` |
 | `dataset_join` | `join` | writes new dataset; returns ids + counts only |
+| `dataset_profile` | `profile` | optional `highCardinalityThreshold` (default 200) |
+| `dataset_dedup` | `dedup` | optional `keyColumns` (1–16); `sampleLimit` 1–20 default 5 |
+| `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel` |
 
 `transform_agg` `spec` string gains optional `mutate` and time-period
 `groupBy` objects (see §4 `agg`). Tool-layer `validateAggSpec` must reject
@@ -311,5 +367,7 @@ profile root is known. The deny list is a defensive path guard only; see
 - Arbitrary code execution
 - Write-side SQL or mutating external systems
 - Parquet (planned behind a feature flag; still exit 4 in this version)
-- Related matrices, outlier detection, diff, duplicate detection
+- Correlation matrices, crosstab, diff, anti/semi-join, window functions
 - UDF / JS / Python expressions
+
+(Duplicate detection and outlier detection shipped in v0.1.3 via `dedup` / `outliers`.)

@@ -103,9 +103,19 @@ The crate is pure-std and builds offline.
 | `dataset_values` | Top value distribution for one column (`nunique`, `top`) |
 | `dataset_sample` | Deterministic random or stratified sample (≤ 20 rows) |
 | `dataset_join` | Equi-join two datasets → new on-disk dataset (ids + counts only) |
+| `dataset_profile` | Quality profile: nulls, nunique, type stability, suspect keys |
+| `dataset_dedup` | Exact or keyed duplicate detection (counts + sample groups) |
+| `dataset_outliers` | IQR / z-score / MAD outliers; optional write of outlier dataset |
 
-CLI mirrors the same names as subcommands (`values`, `sample`, `join`, …).
+CLI mirrors the same names as subcommands (`values`, `sample`, `join`, `profile`, …).
 See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
+
+### Quality tools (v0.1.3)
+
+- **`dataset_profile`**: one-call “can I use this table?” summary.
+- **`dataset_dedup`**: omit `keyColumns` for whole-row exact dupes; pass keys for export-style collisions.
+- **`dataset_outliers`**: `method: iqr|zscore|mad`; `outLabel` writes a new dataset — never dumps full outlier lists.
+- **`stats_describe`**: also returns `q01` / `q10` / `q90` / `q99` on numeric columns.
 
 ### `transform_agg` extras (v0.1.2)
 
