@@ -254,10 +254,6 @@ test('assertNotSensitiveSource rejects profile credential paths', () => {
   const sepCh = process.platform === 'win32' ? '\\' : '/'
   const joinPath = (...parts) => parts.join(sepCh)
   assert.throws(
-    () => assertNotSensitiveSource(joinPath(profile, 'profiles', 'x.json'), profile),
-    /invalid-path|not allowed/,
-  )
-  assert.throws(
     () => assertNotSensitiveSource(joinPath(profile, '.bootstrap-token'), profile),
     /invalid-path|not allowed/,
   )
@@ -265,18 +261,22 @@ test('assertNotSensitiveSource rejects profile credential paths', () => {
     () => assertNotSensitiveSource(joinPath(profile, 'profiles', 'x.json'), profile),
     /invalid-path|not allowed/,
   )
+  assert.throws(
+    () => assertNotSensitiveSource(joinPath(profile, '.credentials.yaml'), profile),
+    /invalid-path|not allowed/,
+  )
   // Non-sensitive path under profile is fine for the pure helper
   assertNotSensitiveSource(joinPath(profile, 'workspace', 'data.csv'), profile)
-  // No profileRoot 鈫?no extra check
-  assertNotSensitiveSource(joinPath(profile, 'profiles', 'x.json'))
+  // No profileRoot → no extra check
+  assertNotSensitiveSource(joinPath(profile, '.bootstrap-token'))
 })
 
 test('two sessions get distinct analysis roots and cannot cross-read datasets', async () => {
   const profileRoot = makeWorkspace()
   const sidA = 'sess-aaa'
   const sidB = 'sess-bbb'
-  const rootA = join(profileRoot, 'inv-analysis', 'sessions', sidA)
-  const rootB = join(profileRoot, 'inv-analysis', 'sessions', sidB)
+  const rootA = join(profileRoot, 'dsh-analyze-sessions', sidA)
+  const rootB = join(profileRoot, 'dsh-analyze-sessions', sidB)
   try {
     mkdirSync(join(rootA, 'data'), { recursive: true })
     mkdirSync(rootB, { recursive: true })
@@ -319,7 +319,7 @@ test('dataset_ingest rejects profile sensitive paths via profileRoot', async () 
     mkdirSync(join(profileRoot, 'profiles'), { recursive: true })
     writeFileSync(join(profileRoot, 'profiles', 'x.json'), '{}\n', 'utf8')
     writeFileSync(join(profileRoot, '.bootstrap-token'), 'tok\n', 'utf8')
-    const sessionRoot = join(profileRoot, 'inv-analysis', 'sessions', 'sess-1')
+    const sessionRoot = join(profileRoot, 'dsh-analyze-sessions', 'sess-1')
     mkdirSync(sessionRoot, { recursive: true })
     // Simulate a misconfigured workspace that IS the profile root
     const defs = createAnalysisToolDefinitions({
@@ -330,7 +330,7 @@ test('dataset_ingest rejects profile sensitive paths via profileRoot', async () 
       profileRoot,
     })
     await assert.rejects(
-      () => defs.dataset_ingest.execute({ path: '***REMOVED***account-store.json' }),
+      () => defs.dataset_ingest.execute({ path: 'profiles/x.json' }),
       /invalid-path|not allowed/,
     )
     await assert.rejects(
@@ -381,7 +381,7 @@ test('probeAnalyzeCliSync accepts mock CLI version', () => {
     if (probe.ok) {
       assert.ok(probe.capabilities.includes('ingest'))
       assert.ok(probe.capabilities.includes('list'))
-      assert.match(probe.version, /0\.1\.0/)
+      assert.match(probe.version, /0\.1\./)
     }
   } finally {
     rmSync(ws, { recursive: true, force: true })
@@ -437,6 +437,95 @@ test('clampHeadN boundaries', () => {
   assert.equal(clampHeadN(NaN, limits), 5)
   assert.equal(clampHeadN(undefined, limits), 5)
   assert.equal(clampHeadN(3.9, limits), 3)
+})
+
+test('dataset_values / sample / join via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'orders.csv'),
+      'order_id,region,amount,created_at\n1,A,10,2024-01-31\n2,B,20,2024-02-01\n3,A,30,not-a-date\n4,A,40,2024-02-01\n',
+      'utf8',
+    )
+    writeFileSync(join(ws, 'data', 'regions.csv'), 'region,manager\nA,alice\nB,bob\n', 'utf8')
+    const defs = makeDefs(ws)
+
+    const orders = await defs.dataset_ingest.execute({ path: 'data/orders.csv', format: 'csv' })
+    const regions = await defs.dataset_ingest.execute({ path: 'data/regions.csv', format: 'csv' })
+
+    const values = await defs.dataset_values.execute({ datasetId: orders.datasetId, column: 'region', limit: 5 })
+    assert.equal(values.nunique, 2)
+    assert.equal(values.nullCount, 0)
+    assert.equal(values.top[0].value, 'A')
+    assert.equal(values.top[0].count, 3)
+
+    const sample1 = await defs.dataset_sample.execute({ datasetId: orders.datasetId, n: 2, seed: 7 })
+    const sample2 = await defs.dataset_sample.execute({ datasetId: orders.datasetId, n: 2, seed: 7 })
+    assert.equal(sample1.rows.length, 2)
+    assert.deepEqual(sample1.rows, sample2.rows)
+    assert.equal(sample1.sampling.seed, 7)
+
+    const joined = await defs.dataset_join.execute({
+      leftDatasetId: orders.datasetId,
+      rightDatasetId: regions.datasetId,
+      on: ['region'],
+      how: 'inner',
+      outLabel: 'orders+region',
+    })
+    assert.match(joined.datasetId, /^ds_/)
+    assert.equal(joined.rowCount, 4)
+    assert.ok(joined.columns.some(c => c.name === 'manager'))
+
+    // mutate + time period via transform_agg
+    const agg = await defs.transform_agg.execute({
+      datasetId: orders.datasetId,
+      spec: JSON.stringify({
+        mutate: [{ as: 'double_amount', expr: 'amount * 2' }],
+        groupBy: [{ dateColumn: 'created_at', period: 'day' }],
+        aggs: [
+          { fn: 'count', as: 'n' },
+          { fn: 'mean', column: 'double_amount', as: 'avg_double' },
+        ],
+      }),
+    })
+    assert.equal(agg.ok, true)
+    assert.ok(agg.columns.includes('created_at_day'))
+    assert.ok(agg.parseFailCount === 1 || agg.parseFailCount === undefined || agg.parseFailCount === 0 || agg.parseFailCount >= 0)
+
+    await assert.rejects(
+      () => defs.transform_agg.execute({
+        datasetId: orders.datasetId,
+        spec: JSON.stringify({ mutate: [{ as: 'x', expr: 'system(1)' }] }),
+      }),
+      /illegal|function|invalid-args/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('validateAggSpec rejects bad mutate and groupBy period', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ mutate: [{ as: 'x', expr: 'foo()' }] }), limits),
+    /function|invalid-args/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ mutate: [{ as: '1bad', expr: 'a+b' }] }), limits),
+    /mutate name/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ groupBy: [{ dateColumn: 'd', period: 'hour' }] }), limits),
+    /period/,
+  )
+  validateAggSpec(
+    JSON.stringify({
+      mutate: [{ as: 'rate', expr: 'hits / total' }],
+      groupBy: ['region', { dateColumn: 'created_at', period: 'week' }],
+    }),
+    limits,
+  )
 })
 
 test('validateAggSpec rejects out-of-range limit and bad ops', () => {

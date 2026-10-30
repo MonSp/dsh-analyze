@@ -69,7 +69,22 @@ The crate is pure-std and builds offline.
 | `dataset_export` | Write full table to CSV under outputs/ |
 | `dataset_rm` | Permanently remove a dataset |
 | `stats_describe` | Null counts, min/max/mean/std/quartiles |
-| `transform_agg` | Filter / project / group-by / aggregate |
+| `transform_agg` | Filter / mutate / project / group-by / aggregate (incl. time buckets) |
+| `dataset_values` | Top value distribution for one column (`nunique`, `top`) |
+| `dataset_sample` | Deterministic random or stratified sample (≤ 20 rows) |
+| `dataset_join` | Equi-join two datasets → new on-disk dataset (ids + counts only) |
+
+CLI mirrors the same names as subcommands (`values`, `sample`, `join`, …).
+See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
+
+### `transform_agg` extras (v0.1.2)
+
+- **`mutate`**: derived columns with a whitelist expression
+  (`[A-Za-z_][A-Za-z0-9_]*`, numbers, `+ - * /`, parentheses).
+  No function calls. Invalid expr → `analysis/invalid-args`.
+- **Time `groupBy`**: `{"dateColumn":"created_at","period":"day|week|month"}`
+  → column `created_at_day` etc. Unparseable non-null values go to the
+  `null` bucket and increment `parseFailCount` (never silently dropped).
 
 ## Limits & data root
 
@@ -84,6 +99,7 @@ The crate is pure-std and builds offline.
 | `DSH_ANALYZE_MAX_ROWS` | 5,000,000 | Ingest row cap |
 | `DSH_ANALYZE_MAX_INGEST_BYTES` | 256 MiB | Ingest byte cap |
 | `DSH_ANALYZE_DEFAULT_ROW_LIMIT` | 1000 | Agg default row limit |
+| `DSH_ANALYZE_DEFAULT_SAMPLE_SEED` | 42 | Sample seed when omitted |
 
 Legacy `INV_ANALYSIS_*` names are still accepted (new name wins).
 
