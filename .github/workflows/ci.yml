@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  cli:
+    name: CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        run: cargo test --workspace
+        working-directory: .
+      - name: cargo build (release)
+        run: cargo build --release -p dsh-analyze
+      - name: version probe
+        shell: bash
+        run: |
+          BIN=crates/dsh-analyze/target/release/dsh-analyze
+          if [ -x "${BIN}.exe" ]; then BIN="${BIN}.exe"; fi
+          "$BIN" version
+      - name: cargo tree must stay offline
+        run: cargo tree -p dsh-analyze | tee cargo-tree.txt
+      - name: reject network crates
+        shell: bash
+        run: |
+          if grep -Eiq 'reqwest|hyper|tokio-net|std::net|native-tls|rustls' cargo-tree.txt; then
+            echo "network-related crate detected in cargo tree" >&2
+            exit 1
+          fi
+        # std is fine; this gate is a tripwire for accidental deps.
+
+  plugin:
+    name: Plugin (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Build plugin
+        working-directory: packages/dsh-analyze
+        run: |
+          npm install
+          npm run build
+      - name: node --check dist
+        run: |
+          node --check packages/dsh-analyze/dist/index.js
+          node --check packages/dsh-analyze/dist/cli.js
+          node --check packages/dsh-analyze/dist/tools.js
+      - name: node --test
+        env:
+          INV_TEST_NODE: ${{ env.NODE }}
+        run: |
+          export INV_TEST_NODE="$(command -v node)"
+          node --test tests/analysis-policy.test.mjs tests/analysis-tools.test.mjs

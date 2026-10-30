@@ -1,0 +1,44 @@
+{
+  "name": "dsh-analyze",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local dataset analysis tools for DSH — ingest once, keep large tables on disk, call small JSON tools",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dsh-plugins/dsh-analyze.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "data-analysis",
+    "dataset"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test ../tests/analysis-policy.test.mjs ../tests/analysis-tools.test.mjs"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

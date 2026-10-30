@@ -1,0 +1,14 @@
+[package]
+name = "dsh-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dsh-analyze CLI: ingest/head/schema/describe/agg/list/export/rm for session datasets"
+
+[[bin]]
+name = "dsh-analyze"
+path = "src/main.rs"
+
+[dependencies]
+# T0 keeps a pure-std implementation so the crate builds offline.
+# T1 may add polars/parquet behind a feature flag.
