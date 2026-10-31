@@ -1,6 +1,6 @@
 {
   "name": "dsh-analyze",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Local dataset analysis tools for DSH — ingest once, keep large tables on disk, call small JSON tools",
   "license": "MIT",

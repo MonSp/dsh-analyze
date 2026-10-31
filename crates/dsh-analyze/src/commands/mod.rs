@@ -6,6 +6,7 @@ mod manage;
 mod quality;
 mod relation;
 mod sample;
+mod series;
 
 use std::path::Path;
 
@@ -19,6 +20,7 @@ pub(crate) use manage::{cmd_export, cmd_list, cmd_rm};
 pub(crate) use quality::{cmd_dedup, cmd_outliers, cmd_profile};
 pub(crate) use relation::{cmd_corr, cmd_crosstab};
 pub(crate) use sample::cmd_sample;
+pub(crate) use series::cmd_series;
 
 /// Load a dataset or exit with the shared CLI error code (unknown id → 5).
 pub(crate) fn load_or_fail(workspace: &Path, id: &str) -> Result<(Meta, Table), u8> {

@@ -105,6 +105,7 @@ crate 为纯标准库实现，可离线构建。
 | `dataset_outliers` | IQR / z-score / MAD 异常值；可选写出异常 dataset |
 | `dataset_corr` | 数值列两两相关（Pearson/Spearman，按 \|r\| 取 top pairs） |
 | `dataset_crosstab` | 两列列联表：top 类别、矩阵、边际、top cells |
+| `dataset_series` | 时序变换（lag/lead/diff/pct_change/rolling）→ 新 dataset |
 
 CLI 子命令与工具同名（`values` / `sample` / `join` / `profile` 等）。
 冻结 JSON 契约见 [docs/interface.md](docs/interface.md)。
@@ -121,6 +122,11 @@ CLI 子命令与工具同名（`values` / `sample` / `join` / `profile` 等）�
 - **`dataset_corr`**：2–16 个数值列；`method: pearson|spearman`；pairs 按 \|r\| 排序（上限 50）。
 - **`dataset_crosstab`**：`rows` × `cols` 频次表，仅回 top 类别与 top cells。
 - **`dataset_join`**：`how` 新增 `anti` \| `semi`（仅保留左表列；null 键永不匹配）。
+
+### 时序工具（v0.1.5）
+
+- **`dataset_series`**：单列 `orderBy`（null 排最后）；一次调用可做 `lag` / `lead` / `diff` / `pct_change` / `rolling`（mean|sum|min|max）。
+- **必写新 dataset**；响应只有 id 与 schema——用 `dataset_head` / `stats_describe` 继续查看。
 
 ### `transform_agg` 扩展（v0.1.2）
 

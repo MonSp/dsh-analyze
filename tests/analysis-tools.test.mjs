@@ -995,3 +995,125 @@ test('dataset_crosstab drop-null false + pipe categories stay distinct', async (
     rmSync(ws, { recursive: true, force: true })
   }
 })
+
+test('dataset_series multi-op lag/diff/rolling via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 's.csv'), 't,v\n1,10\n2,20\n3,30\n4,50\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/s.csv' })
+    const res = await defs.dataset_series.execute({
+      datasetId: ing.datasetId,
+      orderBy: 't',
+      ops: [
+        { fn: 'lag', column: 'v', periods: 1, as: 'v_lag' },
+        { fn: 'diff', column: 'v', periods: 1, as: 'v_diff' },
+        { fn: 'rolling', column: 'v', window: 2, agg: 'mean', as: 'v_ma2' },
+      ],
+    })
+    assert.match(res.datasetId, /^ds_/)
+    assert.equal(res.rowCount, 4)
+    assert.equal(res.columnCount, 5)
+    assert.equal(res.sourceDatasetId, ing.datasetId)
+    assert.equal(res.orderBy, 't')
+    assert.equal(res.opCount, 3)
+    assert.ok(res.columns.some(c => c.name === 'v_ma2'))
+    const head = await defs.dataset_head.execute({ datasetId: res.datasetId, n: 20 })
+    assert.deepEqual(head.rows, [
+      [1, 10, null, null, null],
+      [2, 20, 10, 10, 15],
+      [3, 30, 20, 10, 25],
+      [4, 50, 30, 20, 40],
+    ])
+    const rendered = defs.dataset_series.output.render({}, res)
+    const renderedText = Array.isArray(rendered)
+      ? rendered.map(p => p?.text ?? '').join('')
+      : String(rendered)
+    assert.match(renderedText, /series →/)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_series rejects empty ops / bad as / unknown fn / missing window', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 's.csv'), 't,v\n1,10\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/s.csv' })
+    await assert.rejects(
+      () => defs.dataset_series.execute({ datasetId: ing.datasetId, orderBy: 't', ops: [] }),
+      /ops must be/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_series.execute({
+          datasetId: ing.datasetId,
+          orderBy: 't',
+          ops: [{ fn: 'lag', column: 'v', as: '1bad' }],
+        }),
+      /as must match/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_series.execute({
+          datasetId: ing.datasetId,
+          orderBy: 't',
+          ops: [{ fn: 'nope', column: 'v', as: 'x' }],
+        }),
+      /fn must be/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_series.execute({
+          datasetId: ing.datasetId,
+          orderBy: 't',
+          ops: [{ fn: 'rolling', column: 'v', as: 'x' }],
+        }),
+      /window must be/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_series.execute({
+          datasetId: ing.datasetId,
+          orderBy: 't',
+          ops: [
+            { fn: 'lag', column: 'v', as: 'a' },
+            { fn: 'lead', column: 'v', as: 'a' },
+          ],
+        }),
+      /duplicate as/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_series order-by nulls last + pct_change zero prev', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 's.csv'), 't,v\n2,20\n,99\n1,10\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/s.csv' })
+    const res = await defs.dataset_series.execute({
+      datasetId: ing.datasetId,
+      orderBy: 't',
+      ops: [
+        { fn: 'lag', column: 'v', as: 'v_lag' },
+        { fn: 'pct_change', column: 'v', as: 'pct' },
+      ],
+    })
+    const head = await defs.dataset_head.execute({ datasetId: res.datasetId, n: 20 })
+    // t sorted: 1,2,null
+    assert.deepEqual(head.rows, [
+      [1, 10, null, null],
+      [2, 20, 10, 1],
+      [null, 99, 20, 3.95],
+    ])
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
