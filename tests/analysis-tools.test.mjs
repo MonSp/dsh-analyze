@@ -749,3 +749,120 @@ test('dataset_dedup / outliers reject invalid sampleLimit before spawn', async (
     rmSync(ws, { recursive: true, force: true })
   }
 })
+
+test('dataset_corr pearson happy path + rejects bad method', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'c.csv'), 'x,y\n1,2\n2,4\n3,5\n4,4\n5,5\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/c.csv' })
+    const res = await defs.dataset_corr.execute({
+      datasetId: ing.datasetId,
+      columns: ['x', 'y'],
+      method: 'pearson',
+    })
+    assert.equal(res.ok, true)
+    assert.equal(res.method, 'pearson')
+    assert.equal(res.pairs.length, 1)
+    assert.equal(res.pairs[0].n, 5)
+    assert.ok(Math.abs(res.pairs[0].r - 6 / Math.sqrt(60)) < 1e-9)
+    assert.equal(res.pairs[0].degenerate, false)
+    const rendered = defs.dataset_corr.output.render({}, res)
+    assert.match(rendered[0].text, /r=/)
+
+    await assert.rejects(
+      () => defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x', 'y'], method: 'nope' }),
+      /pearson\|spearman/,
+    )
+    await assert.rejects(
+      () => defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x'] }),
+      /2\.\.16/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_crosstab matrix + top=1 truncated + rejects same column', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'x.csv'), 'r,c\na,1\na,1\na,2\nb,2\nc,3\nc,3\nc,1\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/x.csv' })
+    const res = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'r',
+      cols: 'c',
+    })
+    assert.equal(res.grandTotal, 7)
+    assert.equal(res.cellCount, 7)
+    assert.deepEqual(res.matrix, [[2, 1, 0], [1, 0, 2], [0, 1, 0]])
+    const top1 = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'r',
+      cols: 'c',
+      top: 1,
+    })
+    assert.equal(top1.truncated, true)
+    assert.deepEqual(top1.rowCategories, ['a'])
+
+    await assert.rejects(
+      () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'r', cols: 'r' }),
+      /different columns/,
+    )
+    await assert.rejects(
+      () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'r', cols: 'c', top: 0 }),
+      /top must be integer/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_join how anti|semi left-only columns', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'l.csv'), 'k,vl\n1,L1\n2,L2\n3,L3\n,Lnull\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r.csv'), 'k,vr\n1,R1\n1,R1b\n2,R2\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/l.csv' })
+    const right = await defs.dataset_ingest.execute({ path: 'data/r.csv' })
+
+    const semi = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'semi',
+    })
+    assert.equal(semi.how, 'semi')
+    assert.equal(semi.rowCount, 2)
+    assert.equal(semi.columnCount, 2)
+    assert.ok(semi.columns.every(c => c.name === 'k' || c.name === 'vl'))
+
+    const anti = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'anti',
+    })
+    assert.equal(anti.how, 'anti')
+    assert.equal(anti.rowCount, 2)
+    assert.equal(anti.columnCount, 2)
+
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: left.datasetId,
+          rightDatasetId: right.datasetId,
+          on: ['k'],
+          how: 'outer',
+        }),
+      /inner\|left\|anti\|semi/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})

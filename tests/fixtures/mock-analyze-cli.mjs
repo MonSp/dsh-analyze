@@ -154,8 +154,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.3-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers'],
+      version: '0.1.4-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab'],
     }))
     return
   }
@@ -619,7 +619,10 @@ async function main() {
     const how = getFlag(rest, '--how') || 'inner'
     const outLabel = getFlag(rest, '--out')
     if (!leftId || !rightId || !onRaw) fail(2, 'analysis/invalid-args: --left --right --on required')
-    if (how !== 'inner' && how !== 'left') fail(2, 'analysis/invalid-args: --how must be inner|left')
+    if (how !== 'inner' && how !== 'left' && how !== 'anti' && how !== 'semi') {
+      fail(2, 'analysis/invalid-args: --how must be inner|left|anti|semi')
+    }
+    const leftOnly = how === 'anti' || how === 'semi'
     const on = onRaw.split(',').map(s => s.trim()).filter(Boolean)
     if (!on.length) fail(2, 'analysis/invalid-args: --on must list at least one column')
     const left = loadDataset(ws, leftId)
@@ -638,14 +641,16 @@ async function main() {
     const outHeaders = [...left.table.headers]
     const names = new Set(outHeaders)
     const rightPayload = []
-    right.table.headers.forEach((h, i) => {
-      if (rKey.includes(i)) return
-      let name = h
-      while (names.has(name)) name = name + '_r'
-      names.add(name)
-      outHeaders.push(name)
-      rightPayload.push(i)
-    })
+    if (!leftOnly) {
+      right.table.headers.forEach((h, i) => {
+        if (rKey.includes(i)) return
+        let name = h
+        while (names.has(name)) name = name + '_r'
+        names.add(name)
+        outHeaders.push(name)
+        rightPayload.push(i)
+      })
+    }
     const keyOf = (row, idxs) => idxs.map(i => row[i] === undefined ? null : row[i])
     const rightMap = new Map()
     right.table.rows.forEach((row, ri) => {
@@ -659,13 +664,23 @@ async function main() {
       const k = keyOf(lrow, lKey)
       if (k.some(v => v === null)) {
         if (how === 'left') outRows.push([...lrow, ...rightPayload.map(() => null)])
+        else if (how === 'anti') outRows.push([...lrow])
+        if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')
         continue
       }
       const matches = rightMap.get(JSON.stringify(k)) || []
       if (matches.length === 0) {
         if (how === 'left') outRows.push([...lrow, ...rightPayload.map(() => null)])
+        else if (how === 'anti') outRows.push([...lrow])
+        if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')
         continue
       }
+      if (how === 'semi') {
+        outRows.push([...lrow])
+        if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')
+        continue
+      }
+      if (how === 'anti') continue
       for (const ri of matches) {
         outRows.push([...lrow, ...rightPayload.map(ci => right.table.rows[ri][ci] ?? null)])
         if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')
@@ -1075,6 +1090,281 @@ async function main() {
     }
     if (outLabel !== undefined) payload.outRowCount = outRowCount
     console.log(json(payload))
+    return
+  }
+
+  if (cmd === 'corr') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    const columnsRaw = getFlag(rest, '--columns')
+    if (!columnsRaw) fail(2, 'analysis/invalid-args: --columns required')
+    const columns = columnsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    if (columns.length < 2 || columns.length > 16) fail(2, 'analysis/invalid-args: --columns must list 2..16 columns')
+    const method = getFlag(rest, '--method') || 'pearson'
+    if (method !== 'pearson' && method !== 'spearman') fail(2, 'analysis/invalid-args: --method must be pearson|spearman')
+    const pairwise = getFlag(rest, '--pairwise') || 'complete'
+    if (pairwise !== 'complete' && pairwise !== 'omit') fail(2, 'analysis/invalid-args: --pairwise must be complete|omit')
+    let minNumeric = 2
+    const minRaw = getFlag(rest, '--min-numeric')
+    if (minRaw !== undefined) {
+      minNumeric = Number(minRaw)
+      if (!Number.isInteger(minNumeric) || minNumeric < 2) fail(2, 'analysis/invalid-args: --min-numeric must be integer >= 2')
+    }
+    const { meta, table } = loadDataset(ws, id)
+    const colIdx = columns.map(name => {
+      const i = table.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+      return i
+    })
+    const maps = colIdx.map((ci, idx) => {
+      const m = new Map()
+      table.rows.forEach((row, ri) => {
+        const cell = row[ci]
+        if (cell === null || cell === undefined) return
+        let n = null
+        if (typeof cell === 'number') n = cell
+        else if (typeof cell === 'string' && cell.trim() !== '' && Number.isFinite(Number(cell))) n = Number(cell)
+        if (n !== null && Number.isFinite(n)) m.set(ri, n)
+      })
+      if (m.size === 0) fail(2, `analysis/invalid-args: column ${columns[idx]} is not numeric-capable`)
+      return m
+    })
+    const listwise = pairwise === 'omit'
+      ? (() => {
+          let mask = null
+          for (const m of maps) {
+            const set = new Set(m.keys())
+            if (!mask) mask = set
+            else {
+              const next = new Set()
+              for (const k of mask) if (set.has(k)) next.add(k)
+              mask = next
+            }
+          }
+          return mask
+        })()
+      : null
+
+    function midRanks(values) {
+      const n = values.length
+      const idx = [...Array(n).keys()].sort((a, b) => values[a] - values[b])
+      const ranks = new Array(n)
+      let i = 0
+      while (i < n) {
+        let j = i
+        while (j + 1 < n && values[idx[j + 1]] === values[idx[i]]) j++
+        const avg = ((i + 1) + (j + 1)) / 2
+        for (let k = i; k <= j; k++) ranks[idx[k]] = avg
+        i = j + 1
+      }
+      return ranks
+    }
+    function pearson(xs, ys) {
+      const n = xs.length
+      if (n < 2) return { r: null, degenerate: false }
+      const mx = xs.reduce((a, b) => a + b, 0) / n
+      const my = ys.reduce((a, b) => a + b, 0) / n
+      let sxx = 0, syy = 0, sxy = 0
+      for (let i = 0; i < n; i++) {
+        const dx = xs[i] - mx
+        const dy = ys[i] - my
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+      }
+      if (sxx === 0 || syy === 0) return { r: null, degenerate: true }
+      const denom = Math.sqrt(sxx * syy)
+      if (!denom || !Number.isFinite(denom)) return { r: null, degenerate: true }
+      const r = sxy / denom
+      if (!Number.isFinite(r)) return { r: null, degenerate: true }
+      return { r: Math.max(-1, Math.min(1, r)), degenerate: false }
+    }
+    const pairs = []
+    const totalPairs = columns.length * (columns.length - 1) / 2
+    for (let i = 0; i < columns.length; i++) {
+      for (let j = i + 1; j < columns.length; j++) {
+        let xs = [], ys = []
+        if (listwise) {
+          const rows = [...listwise].sort((a, b) => a - b)
+          for (const ri of rows) {
+            if (maps[i].has(ri) && maps[j].has(ri)) {
+              xs.push(maps[i].get(ri))
+              ys.push(maps[j].get(ri))
+            }
+          }
+        } else {
+          const smaller = maps[i].size <= maps[j].size ? maps[i] : maps[j]
+          for (const ri of [...smaller.keys()].sort((a, b) => a - b)) {
+            if (maps[i].has(ri) && maps[j].has(ri)) {
+              xs.push(maps[i].get(ri))
+              ys.push(maps[j].get(ri))
+            }
+          }
+        }
+        const n = xs.length
+        let r, degenerate
+        if (n < minNumeric) {
+          r = null
+          degenerate = false
+        } else if (method === 'spearman') {
+          const out = pearson(midRanks(xs), midRanks(ys))
+          r = out.r
+          degenerate = out.degenerate
+        } else {
+          const out = pearson(xs, ys)
+          r = out.r
+          degenerate = out.degenerate
+        }
+        pairs.push({ columns: [columns[i], columns[j]], n, r, degenerate })
+      }
+    }
+    pairs.sort((a, b) => {
+      const ar = a.r === null ? -1 : Math.abs(a.r)
+      const br = b.r === null ? -1 : Math.abs(b.r)
+      if (ar !== br) return br - ar
+      if (a.n !== b.n) return b.n - a.n
+      return 0
+    })
+    const truncated = pairs.length > 50
+    pairs.length = Math.min(pairs.length, 50)
+    console.log(json({
+      ok: true,
+      datasetId: id,
+      rowCount: meta.rowCount,
+      method,
+      pairwise,
+      minNumeric,
+      columns,
+      pairCount: totalPairs,
+      pairs,
+      truncated,
+    }))
+    return
+  }
+
+  if (cmd === 'crosstab') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    const rowsName = (getFlag(rest, '--rows') || '').trim()
+    const colsName = (getFlag(rest, '--cols') || '').trim()
+    if (!rowsName) fail(2, 'analysis/invalid-args: --rows required')
+    if (!colsName) fail(2, 'analysis/invalid-args: --cols required')
+    if (rowsName === colsName) fail(2, 'analysis/invalid-args: --rows and --cols must be different columns')
+    let top = 20
+    const topRaw = getFlag(rest, '--top')
+    if (topRaw !== undefined) {
+      top = Number(topRaw)
+      if (!Number.isInteger(top) || top < 1 || top > 50) fail(2, 'analysis/invalid-args: --top must be integer 1..=50')
+    }
+    let minCount = 1
+    const minRaw = getFlag(rest, '--min-count')
+    if (minRaw !== undefined) {
+      minCount = Number(minRaw)
+      if (!Number.isInteger(minCount) || minCount < 1) fail(2, 'analysis/invalid-args: --min-count must be integer >= 1')
+    }
+    const dropNullRaw = getFlag(rest, '--drop-null')
+    let dropNull = true
+    if (dropNullRaw !== undefined) {
+      if (dropNullRaw === 'true') dropNull = true
+      else if (dropNullRaw === 'false') dropNull = false
+      else fail(2, 'analysis/invalid-args: --drop-null must be true|false')
+    }
+    const { meta, table } = loadDataset(ws, id)
+    const ri = table.headers.indexOf(rowsName)
+    const ci = table.headers.indexOf(colsName)
+    if (ri < 0) fail(2, `analysis/invalid-args: unknown column ${rowsName}`)
+    if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${colsName}`)
+    const cellCounts = new Map()
+    const rowMarg = new Map()
+    const colMarg = new Map()
+    const rowFirst = new Map()
+    const colFirst = new Map()
+    let nullRowCount = 0
+    let seq = 0
+    const keyOf = (v) => {
+      if (v === null || v === undefined) return dropNull ? null : '__null__'
+      return JSON.stringify(v)
+    }
+    for (const row of table.rows) {
+      const rv = row[ri]
+      const cv = row[ci]
+      if (dropNull && (rv === null || rv === undefined || cv === null || cv === undefined)) {
+        nullRowCount++
+        continue
+      }
+      const rk = keyOf(rv)
+      const ck = keyOf(cv)
+      const ck2 = rk === null || ck === null ? null : `${rk}|${ck}`
+      if (ck2 === null) continue
+      cellCounts.set(ck2, (cellCounts.get(ck2) || 0) + 1)
+      rowMarg.set(rk, (rowMarg.get(rk) || 0) + 1)
+      colMarg.set(ck, (colMarg.get(ck) || 0) + 1)
+      if (!rowFirst.has(rk)) rowFirst.set(rk, seq)
+      if (!colFirst.has(ck)) colFirst.set(ck, seq)
+      seq++
+    }
+    const sortCates = (marg, first) => {
+      const keys = [...marg.keys()]
+      keys.sort((a, b) => {
+        const d = (marg.get(b) || 0) - (marg.get(a) || 0)
+        if (d !== 0) return d
+        return (first.get(a) ?? Infinity) - (first.get(b) ?? Infinity)
+      })
+      return keys
+    }
+    let rowCates = sortCates(rowMarg, rowFirst)
+    let colCates = sortCates(colMarg, colFirst)
+    const distinctRows = rowCates.length
+    const distinctCols = colCates.length
+    rowCates = rowCates.slice(0, top)
+    colCates = colCates.slice(0, top)
+    let truncated = distinctRows > top || distinctCols > top
+    const matrix = rowCates.map(() => colCates.map(() => 0))
+    let cellCount = 0
+    for (const [ck, n] of cellCounts) {
+      const [rk, ckv] = ck.split('|')
+      const i = rowCates.findIndex(x => x === rk)
+      const j = colCates.findIndex(x => x === ckv)
+      if (i < 0 || j < 0) {
+        truncated = true
+        continue
+      }
+      matrix[i][j] += n
+      cellCount += n
+    }
+    const rowTotals = matrix.map(row => row.reduce((a, b) => a + b, 0))
+    const colTotals = colCates.map((_, j) => matrix.reduce((a, row) => a + row[j], 0))
+    const grandTotal = rowTotals.reduce((a, b) => a + b, 0)
+    const decode = (k) => {
+      if (k === '__null__') return '__null__'
+      return JSON.parse(k)
+    }
+    const topCells = []
+    for (let i = 0; i < matrix.length; i++) {
+      for (let j = 0; j < matrix[i].length; j++) {
+        const n = matrix[i][j]
+        if (n >= minCount && n > 0) topCells.push({ row: decode(rowCates[i]), col: decode(colCates[j]), count: n })
+      }
+    }
+    topCells.sort((a, b) => b.count - a.count)
+    topCells.length = Math.min(topCells.length, 50)
+    console.log(json({
+      ok: true,
+      datasetId: id,
+      rowCount: meta.rowCount,
+      rowColumn: rowsName,
+      colColumn: colsName,
+      rowCategories: rowCates.map(decode),
+      colCategories: colCates.map(decode),
+      matrix,
+      rowTotals,
+      colTotals,
+      grandTotal,
+      cellCount,
+      truncated,
+      nullRowCount,
+      topCells,
+    }))
     return
   }
 
