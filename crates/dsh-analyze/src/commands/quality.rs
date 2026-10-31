@@ -4,38 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cli::{env_u64, fail, flag_value};
+use crate::commands::{json_f64, load_or_fail, parse_column_list};
 use crate::dataset::{
-    json_string, load_dataset, new_dataset_id, save_meta, write_table_parquet_placeholder, Meta,
-    Table, Value,
+    json_string, new_dataset_id, save_meta, write_table_parquet_placeholder, Meta, Table, Value,
 };
-
-fn load_or_fail(workspace: &Path, id: &str) -> Result<(crate::dataset::Meta, Table), u8> {
-    load_dataset(workspace, id).map_err(|e| {
-        eprintln!("{e}");
-        if e.contains("unknown") {
-            5u8
-        } else {
-            2u8
-        }
-    })
-}
-
-fn parse_column_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn json_f64(v: f64) -> String {
-    if v.is_finite() {
-        // Match existing style: short decimal for rates; values as plain floats.
-        let s = format!("{v}");
-        s
-    } else {
-        "null".into()
-    }
-}
 
 fn json_rate(num: usize, den: usize) -> String {
     let r = (num as f64) / (den.max(1) as f64);

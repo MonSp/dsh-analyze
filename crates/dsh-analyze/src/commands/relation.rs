@@ -4,33 +4,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::cli::{fail, flag_value};
-use crate::dataset::{json_string, load_dataset, Value};
-
-fn load_or_fail(workspace: &Path, id: &str) -> Result<(crate::dataset::Meta, crate::dataset::Table), u8> {
-    load_dataset(workspace, id).map_err(|e| {
-        eprintln!("{e}");
-        if e.contains("unknown") {
-            5u8
-        } else {
-            2u8
-        }
-    })
-}
-
-fn parse_column_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn json_f64(v: f64) -> String {
-    if v.is_finite() {
-        format!("{v}")
-    } else {
-        "null".into()
-    }
-}
+use crate::commands::{json_f64, load_or_fail, parse_column_list};
+use crate::dataset::{json_string, Value};
 
 /// JSON label for a crosstab category. Null prints as the contract token
 /// `__null__`; a data string `"__null__"` stays a distinct map key and the
