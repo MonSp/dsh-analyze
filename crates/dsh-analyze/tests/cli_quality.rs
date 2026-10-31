@@ -3,18 +3,24 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dsh-analyze"))
 }
 
+/// Unique per call within this process. pid+nanos alone can collide when
+/// parallel tests start in the same tick (seen on macOS CI runners).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn temp_workspace() -> PathBuf {
+    let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "dsh-analyze-quality-{}-{nanos}",
+        "dsh-analyze-quality-{}-{n}-{nanos}",
         std::process::id()
     ));
     fs::create_dir_all(dir.join("data")).unwrap();
