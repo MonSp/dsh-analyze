@@ -122,6 +122,22 @@ function getFlag(args, name) {
   return i >= 0 ? args[i + 1] : undefined
 }
 
+function parseSampleLimit(raw, defaultN) {
+  if (raw === undefined) return defaultN
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    fail(2, 'analysis/invalid-args: --sample-limit must be integer 1..=20')
+  }
+  return Math.min(n, 20)
+}
+
+function envU64(key, legacyKey, fallback) {
+  const v = process.env[key] ?? process.env[legacyKey]
+  if (v === undefined || v === '') return fallback
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback
+}
+
 async function main() {
   const argv = process.argv.slice(2)
   let i = 0
@@ -138,8 +154,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.2-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join'],
+      version: '0.1.3-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers'],
     }))
     return
   }
@@ -220,6 +236,7 @@ async function main() {
         else if (typeof v === 'number') nums.push(v)
       }
       let min = null, max = null, mean = null, std = null, q25 = null, q50 = null, q75 = null
+      let q01 = null, q10 = null, q90 = null, q99 = null
       if (nums.length) {
         const s = [...nums].sort((a, b) => a - b)
         min = s[0]
@@ -231,12 +248,13 @@ async function main() {
         }
         const pct = p => s[Math.min(s.length - 1, Math.round((s.length - 1) * p))]
         q25 = pct(0.25); q50 = pct(0.5); q75 = pct(0.75)
+        q01 = pct(0.01); q10 = pct(0.10); q90 = pct(0.90); q99 = pct(0.99)
       }
       stats.push({
         name,
         dtype: meta.columns.find(x => x.name === name)?.dtype ?? 'utf8',
         nullCount: nulls,
-        min, max, mean, std, q25, q50, q75,
+        min, max, mean, std, q25, q50, q75, q01, q10, q90, q99,
       })
     }
     console.log(json({ ok: true, datasetId: id, stats }))
@@ -728,6 +746,335 @@ async function main() {
     unlinkSync(metaPath)
     try { unlinkSync(join(datasets, `${id}.csv`)) } catch {}
     console.log(json({ ok: true, datasetId: id, removed: true }))
+    return
+  }
+
+  if (cmd === 'profile') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    const hcRaw = getFlag(rest, '--high-cardinality-threshold')
+    let hc = 200
+    if (hcRaw !== undefined) {
+      hc = Number(hcRaw)
+      if (!Number.isInteger(hc) || hc < 1) fail(2, 'analysis/invalid-args: --high-cardinality-threshold must be integer >= 1')
+    }
+    const { meta, table } = loadDataset(ws, id)
+    const rowCount = table.rows.length
+    const columns = []
+    const warnings = []
+    if (rowCount === 0) warnings.push({ code: 'empty_table' })
+    for (let c = 0; c < table.headers.length; c++) {
+      const name = table.headers[c]
+      const dtype = meta.columns.find(x => x.name === name)?.dtype ?? 'utf8'
+      let nulls = 0
+      let numericCount = 0
+      let boolCount = 0
+      const seen = new Set()
+      const samples = []
+      let hasBool = false, hasI64 = false, hasF64 = false, hasStr = false
+      let hasNumStr = false, hasNonNumStr = false
+      for (const row of table.rows) {
+        const v = row[c]
+        if (v === null || v === undefined) { nulls++; continue }
+        seen.add(JSON.stringify(v))
+        if (samples.length < 3 && !samples.some(s => JSON.stringify(s) === JSON.stringify(v))) samples.push(v)
+        if (typeof v === 'boolean') { boolCount++; hasBool = true }
+        else if (typeof v === 'number') {
+          numericCount++
+          if (Number.isInteger(v)) hasI64 = true; else hasF64 = true
+        } else {
+          hasStr = true
+          if (v.trim() !== '' && Number.isFinite(Number(v.trim()))) { numericCount++; hasNumStr = true }
+          else hasNonNumStr = true
+        }
+      }
+      const nonNull = rowCount - nulls
+      const nunique = seen.size
+      const highCardinality = nunique > hc
+      let typeStability = 'empty'
+      if (nonNull > 0) {
+        if (hasStr && !hasBool && !hasI64 && !hasF64) typeStability = 'string'
+        else if (hasBool && !hasStr && !hasI64 && !hasF64) typeStability = 'bool'
+        else if ((hasI64 || hasF64 || hasNumStr) && (hasBool || hasNonNumStr)) typeStability = 'mixed_numeric'
+        else if (hasBool && hasStr) typeStability = 'mixed'
+        else if (hasI64 && !hasF64 && !hasStr) typeStability = 'int'
+        else if (hasF64 || (hasI64 && hasStr)) typeStability = 'float'
+        else typeStability = 'mixed'
+      }
+      const nullRate = rowCount > 0 ? nulls / rowCount : 0
+      const uniqueRate = nonNull > 0 ? nunique / nonNull : 0
+      const numericShare = rowCount > 0 ? numericCount / rowCount : 0
+      columns.push({
+        name,
+        dtype,
+        nullCount: nulls,
+        nullRate: Number(nullRate.toFixed(6)),
+        nunique,
+        uniqueRate: Number(uniqueRate.toFixed(6)),
+        highCardinality,
+        typeStability,
+        numericCount,
+        numericShare: Number(numericShare.toFixed(6)),
+        boolCount,
+        sampleValues: samples,
+      })
+      if (rowCount > 0 && nulls === rowCount) warnings.push({ code: 'all_null', column: name })
+      else if (nullRate >= 0.5) warnings.push({ code: 'mostly_null', column: name })
+      if (highCardinality) warnings.push({ code: 'high_cardinality', column: name, nunique, threshold: hc })
+      if (typeStability === 'mixed' || typeStability === 'mixed_numeric') warnings.push({ code: 'mixed_types', column: name })
+    }
+    const suspectKeys = []
+    for (let c = 0; c < table.headers.length && suspectKeys.length < 10; c++) {
+      const name = table.headers[c]
+      let nulls = 0
+      const seen = new Set()
+      for (const row of table.rows) {
+        const v = row[c]
+        if (v === null || v === undefined) nulls++
+        else seen.add(JSON.stringify(v))
+      }
+      if (rowCount > 0 && nulls === 0 && seen.size === rowCount) {
+        suspectKeys.push({ columns: [name], reason: 'unique_non_null', nullCount: 0, nunique: rowCount })
+      }
+    }
+    let warnOut = warnings
+    if (warnOut.length > 50) {
+      const total = warnOut.length
+      warnOut = warnOut.slice(0, 49)
+      warnOut.push({ code: 'warnings_truncated', emitted: 50, total })
+    }
+    console.log(json({ ok: true, datasetId: id, rowCount, columnCount: table.headers.length, columns, suspectKeys, warnings: warnOut }))
+    return
+  }
+
+  if (cmd === 'dedup') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    const keyRaw = getFlag(rest, '--key-columns')
+    const sampleLimit = parseSampleLimit(getFlag(rest, '--sample-limit'), 5)
+    const { meta, table } = loadDataset(ws, id)
+    const rowCount = table.rows.length
+    let keyIdx = []
+    if (keyRaw !== undefined) {
+      keyIdx = keyRaw.split(',').map(s => s.trim()).filter(Boolean)
+      if (!keyIdx.length) fail(2, 'analysis/invalid-args: --key-columns must list at least one column')
+      if (keyIdx.length > 16) fail(2, 'analysis/invalid-args: --key-columns supports at most 16 columns')
+      const uniq = new Set()
+      keyIdx = keyIdx.map(name => {
+        if (uniq.has(name)) fail(2, `analysis/invalid-args: duplicate key column ${name}`)
+        uniq.add(name)
+        const i = table.headers.indexOf(name)
+        if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+        return i
+      })
+    }
+    const groups = new Map()
+    for (let ri = 0; ri < table.rows.length; ri++) {
+      const row = table.rows[ri]
+      // Map keys must be primitives; always stringify the key payload.
+      const key = keyIdx.length
+        ? JSON.stringify(keyIdx.map(ci => row[ci] ?? null))
+        : JSON.stringify(row.map(c => (c === undefined ? null : c)))
+      let g = groups.get(key)
+      if (!g) {
+        g = {
+          count: 0,
+          first: ri,
+          keyVals: keyIdx.length ? keyIdx.map(ci => row[ci] ?? null) : null,
+          samples: [],
+        }
+        groups.set(key, g)
+      }
+      g.count++
+      if (g.samples.length < 3) g.samples.push(ri)
+    }
+    const distinct = groups.size
+    const duplicateRowCount = Math.max(0, rowCount - distinct)
+    let maxMultiplicity = 1
+    let duplicateKeyCount = 0
+    const dupGroups = []
+    for (const g of groups.values()) {
+      if (g.count > maxMultiplicity) maxMultiplicity = g.count
+      if (g.count >= 2) {
+        duplicateKeyCount++
+        dupGroups.push(g)
+      }
+    }
+    dupGroups.sort((a, b) => b.count - a.count || a.first - b.first)
+    const totalDupGroups = dupGroups.length
+    const samples = dupGroups.slice(0, sampleLimit).map(g => ({
+      key: g.keyVals,
+      count: g.count,
+      rows: g.samples.map(ri => table.rows[ri].map(c => (c === undefined ? null : c))),
+    }))
+    const samplesTruncated = totalDupGroups > sampleLimit
+    if (!keyIdx.length) {
+      console.log(json({
+        ok: true,
+        datasetId: id,
+        rowCount,
+        mode: 'exact',
+        keyColumns: null,
+        duplicateRowCount,
+        duplicateRowRate: Number((duplicateRowCount / Math.max(rowCount, 1)).toFixed(6)),
+        distinctRowCount: distinct,
+        duplicateRowCountGroups: totalDupGroups,
+        maxMultiplicity,
+        samples,
+        samplesTruncated,
+      }))
+    } else {
+      console.log(json({
+        ok: true,
+        datasetId: id,
+        rowCount,
+        mode: 'keyed',
+        keyColumns: keyRaw.split(',').map(s => s.trim()).filter(Boolean),
+        duplicateRowCount,
+        duplicateRowRate: Number((duplicateRowCount / Math.max(rowCount, 1)).toFixed(6)),
+        distinctKeyCount: distinct,
+        duplicateKeyCount,
+        maxMultiplicity,
+        samples,
+        samplesTruncated,
+      }))
+    }
+    return
+  }
+
+  if (cmd === 'outliers') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    const columnsRaw = getFlag(rest, '--columns')
+    if (!columnsRaw) fail(2, 'analysis/invalid-args: --columns required')
+    const columnNames = columnsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    if (!columnNames.length) fail(2, 'analysis/invalid-args: --columns must list at least one column')
+    if (columnNames.length > 32) fail(2, 'analysis/invalid-args: --columns supports at most 32 columns')
+    const method = getFlag(rest, '--method') || 'iqr'
+    if (!['iqr', 'zscore', 'mad'].includes(method)) fail(2, 'analysis/invalid-args: --method must be iqr|zscore|mad')
+    const defaultK = method === 'iqr' ? 1.5 : 3.0
+    let k = defaultK
+    const kRaw = getFlag(rest, '--k')
+    if (kRaw !== undefined) {
+      k = Number(kRaw)
+      if (!Number.isFinite(k) || k <= 0) fail(2, 'analysis/invalid-args: --k must be a finite number > 0')
+    }
+    const sampleLimit = parseSampleLimit(getFlag(rest, '--sample-limit'), 10)
+    const outLabel = getFlag(rest, '--out')
+    const { meta, table } = loadDataset(ws, id)
+    const rowCount = table.rows.length
+    const colResults = []
+    const anyOutlier = new Set()
+    for (const name of columnNames) {
+      const ci = table.headers.indexOf(name)
+      if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+      const dtype = meta.columns.find(x => x.name === name)?.dtype ?? 'utf8'
+      let nullCount = 0
+      const series = []
+      for (let ri = 0; ri < table.rows.length; ri++) {
+        const v = table.rows[ri][ci]
+        if (v === null || v === undefined) nullCount++
+        else if (typeof v === 'number' && Number.isFinite(v)) series.push({ ri, n: v })
+      }
+      const numericCount = series.length
+      const nums = series.map(x => x.n).sort((a, b) => a - b)
+      const pct = (arr, p) => {
+        if (!arr.length) return NaN
+        if (arr.length === 1) return arr[0]
+        return arr[Math.min(arr.length - 1, Math.round((arr.length - 1) * p))]
+      }
+      let lower = null, upper = null
+      let outlierFlags = []
+      let degenerateIqr = false, degenerateStd = false, degenerateMad = false
+      if (numericCount >= 2) {
+        if (method === 'iqr') {
+          const q1 = pct(nums, 0.25)
+          const q3 = pct(nums, 0.75)
+          const iqr = q3 - q1
+          if (iqr === 0) {
+            degenerateIqr = true
+            lower = q1; upper = q3
+          } else {
+            lower = q1 - k * iqr
+            upper = q3 + k * iqr
+            outlierFlags = series.filter(x => x.n < lower || x.n > upper)
+          }
+        } else if (method === 'zscore') {
+          const mean = nums.reduce((a, b) => a + b, 0) / nums.length
+          const std = Math.sqrt(nums.reduce((a, b) => a + (b - mean) ** 2, 0) / (nums.length - 1))
+          if (!std || !Number.isFinite(std)) {
+            degenerateStd = true
+            lower = mean; upper = mean
+          } else {
+            lower = mean - k * std
+            upper = mean + k * std
+            outlierFlags = series.filter(x => Math.abs(x.n - mean) / std > k)
+          }
+        } else {
+          const med = pct(nums, 0.5)
+          const devs = nums.map(x => Math.abs(x - med)).sort((a, b) => a - b)
+          const mad = pct(devs, 0.5)
+          const scale = 1.4826 * mad
+          if (!mad || !scale || !Number.isFinite(scale)) {
+            degenerateMad = true
+            lower = med; upper = med
+          } else {
+            lower = med - k * scale
+            upper = med + k * scale
+            outlierFlags = series.filter(x => Math.abs(x.n - med) / scale > k)
+          }
+        }
+      }
+      outlierFlags.sort((a, b) => a.ri - b.ri)
+      for (const f of outlierFlags) anyOutlier.add(f.ri)
+      const samples = outlierFlags.slice(0, sampleLimit).map(f => ({
+        rowIndex: f.ri,
+        value: f.n,
+        row: table.rows[f.ri].map(c => (c === undefined ? null : c)),
+      }))
+      colResults.push({
+        name,
+        dtype,
+        numericCount,
+        nullCount,
+        lowerBound: lower === null || !Number.isFinite(lower) ? null : lower,
+        upperBound: upper === null || !Number.isFinite(upper) ? null : upper,
+        outlierCount: outlierFlags.length,
+        outlierRate: Number((outlierFlags.length / Math.max(numericCount, 1)).toFixed(6)),
+        degenerateIqr,
+        degenerateStd,
+        degenerateMad,
+        samples,
+      })
+    }
+    let outDatasetId = null
+    let outRowCount
+    if (outLabel !== undefined) {
+      const outId = newId()
+      const outRows = [...anyOutlier].sort((a, b) => a - b).map(ri => table.rows[ri])
+      const maxRows = envU64('DSH_ANALYZE_MAX_ROWS', 'INV_ANALYSIS_MAX_ROWS', 5_000_000)
+      if (outRows.length > maxRows) fail(3, 'analysis/limit: outlier dataset too large')
+      writeDataset(ws, outId, { headers: table.headers, rows: outRows }, {
+        sourceKind: 'outliers',
+        sourcePath: `outliers:${id}`,
+        label: outLabel,
+        producedBy: 'outliers',
+        parentDatasetId: id,
+      })
+      outDatasetId = outId
+      outRowCount = outRows.length
+    }
+    const payload = {
+      ok: true,
+      datasetId: id,
+      rowCount,
+      method,
+      k,
+      outDatasetId,
+      columns: colResults,
+    }
+    if (outLabel !== undefined) payload.outRowCount = outRowCount
+    console.log(json(payload))
     return
   }
 

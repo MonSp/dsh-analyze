@@ -589,3 +589,163 @@ test('BOM-prefixed CSV header stays clean via mock', async () => {
     rmSync(ws, { recursive: true, force: true })
   }
 })
+
+test('dataset_profile quality summary via mock', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'prof.csv'),
+      'phone,amount,note\n13800000001,10.5,a\n13800000001,20,b\n,30,\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ingest = await defs.dataset_ingest.execute({ path: 'data/prof.csv', format: 'csv' })
+    const profile = await defs.dataset_profile.execute({ datasetId: ingest.datasetId })
+    assert.equal(profile.rowCount, 3)
+    assert.equal(profile.columns.length, 3)
+    const phone = profile.columns.find(c => c.name === 'phone')
+    assert.equal(phone.nullCount, 1)
+    assert.equal(phone.nunique, 1)
+    const note = profile.columns.find(c => c.name === 'note')
+    assert.equal(note.typeStability, 'string')
+    assert.ok(Array.isArray(profile.warnings))
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_dedup exact and keyed via mock', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'dup.csv'),
+      'phone,amount\n13800000001,10\n13800000001,10\n13800000002,20\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ingest = await defs.dataset_ingest.execute({ path: 'data/dup.csv', format: 'csv' })
+    const exact = await defs.dataset_dedup.execute({ datasetId: ingest.datasetId })
+    assert.equal(exact.mode, 'exact')
+    assert.equal(exact.duplicateRowCount, 1)
+    assert.equal(exact.distinctRowCount, 2)
+    const keyed = await defs.dataset_dedup.execute({
+      datasetId: ingest.datasetId,
+      keyColumns: ['phone'],
+    })
+    assert.equal(keyed.mode, 'keyed')
+    assert.equal(keyed.duplicateKeyCount, 1)
+    assert.ok(keyed.samples.length >= 1)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_outliers iqr flags extreme and --out writes dataset', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'out.csv'),
+      'amount\n1\n2\n3\n4\n100\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ingest = await defs.dataset_ingest.execute({ path: 'data/out.csv', format: 'csv' })
+    const res = await defs.dataset_outliers.execute({
+      datasetId: ingest.datasetId,
+      columns: ['amount'],
+      method: 'iqr',
+    })
+    assert.equal(res.method, 'iqr')
+    const col = res.columns[0]
+    assert.ok(col.outlierCount >= 1)
+    assert.equal(col.samples[0].value, 100)
+    assert.equal(res.outDatasetId, null)
+
+    const withOut = await defs.dataset_outliers.execute({
+      datasetId: ingest.datasetId,
+      columns: ['amount'],
+      method: 'iqr',
+      outLabel: 'extreme',
+    })
+    assert.ok(withOut.outDatasetId)
+    assert.equal(typeof withOut.outDatasetId, 'string')
+    assert.match(withOut.outDatasetId, /^ds_/)
+    assert.equal(withOut.outRowCount, 1)
+    const head = await defs.dataset_head.execute({ datasetId: withOut.outDatasetId, n: 5 })
+    assert.equal(head.rowCount, 1)
+    assert.equal(head.rows[0][0], 100)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('stats_describe returns extended quantiles via mock', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'q.csv'),
+      'amount,label\n1,a\n2,b\n3,c\n4,d\n5,e\n100,f\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ingest = await defs.dataset_ingest.execute({ path: 'data/q.csv', format: 'csv' })
+    const desc = await defs.stats_describe.execute({ datasetId: ingest.datasetId })
+    const amount = desc.stats.find(s => s.name === 'amount')
+    assert.ok(amount.q01 !== undefined)
+    assert.ok(amount.q90 !== undefined)
+    assert.ok(amount.q99 !== undefined)
+    const label = desc.stats.find(s => s.name === 'label')
+    assert.equal(label.q01, null)
+    assert.equal(label.q99, null)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_outliers rejects bad method before spawn', async () => {
+  const ws = makeWorkspace()
+  try {
+    const defs = makeDefs(ws)
+    await assert.rejects(
+      () =>
+        defs.dataset_outliers.execute({
+          datasetId: 'ds_0123456789ab',
+          columns: ['a'],
+          method: 'nope',
+        }),
+      /iqr\|zscore\|mad/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_dedup / outliers reject invalid sampleLimit before spawn', async () => {
+  const ws = makeWorkspace()
+  try {
+    const defs = makeDefs(ws)
+    await assert.rejects(
+      () => defs.dataset_dedup.execute({ datasetId: 'ds_0123456789ab', sampleLimit: 0 }),
+      /sampleLimit must be integer/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_outliers.execute({
+          datasetId: 'ds_0123456789ab',
+          columns: ['a'],
+          sampleLimit: 0,
+        }),
+      /sampleLimit must be integer/,
+    )
+    await assert.rejects(
+      () => defs.dataset_dedup.execute({ datasetId: 'ds_0123456789ab', sampleLimit: 1.5 }),
+      /sampleLimit must be integer/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})

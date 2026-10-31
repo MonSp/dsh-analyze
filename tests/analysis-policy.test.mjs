@@ -54,7 +54,7 @@ test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the frozen v0.1.2 surface', () => {
+test('ANALYSIS_TOOL_NAMES is the frozen v0.1.3 surface', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -67,11 +67,26 @@ test('ANALYSIS_TOOL_NAMES is the frozen v0.1.2 surface', () => {
     'dataset_values',
     'dataset_sample',
     'dataset_join',
+    'dataset_profile',
+    'dataset_dedup',
+    'dataset_outliers',
   ])
 })
 
-test('new v0.1.2 tools are recognized by isAnalysisToolName', () => {
+test('v0.1.3 quality tools are recognized by isAnalysisToolName', () => {
   assert.equal(isAnalysisToolName('dataset_values'), true)
   assert.equal(isAnalysisToolName('dataset_sample'), true)
   assert.equal(isAnalysisToolName('dataset_join'), true)
+  assert.equal(isAnalysisToolName('dataset_profile'), true)
+  assert.equal(isAnalysisToolName('dataset_dedup'), true)
+  assert.equal(isAnalysisToolName('dataset_outliers'), true)
+})
+
+test('analysisToolsForScopedAllow can enable quality tools only', () => {
+  const names = analysisToolsForScopedAllow({
+    mode: 'unconfigured',
+    toolAllowlist: [],
+    analysisTools: ['dataset_profile', 'dataset_dedup', 'dataset_outliers'],
+  })
+  assert.deepEqual(names, ['dataset_profile', 'dataset_dedup', 'dataset_outliers'])
 })

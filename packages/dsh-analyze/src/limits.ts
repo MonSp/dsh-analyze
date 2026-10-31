@@ -15,6 +15,8 @@ export interface AnalysisLimits {
   maxAggLimit: number
   maxValuesLimit: number
   maxJoinOnColumns: number
+  maxKeyColumns: number
+  maxOutlierColumns: number
 }
 
 export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
@@ -29,6 +31,8 @@ export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
   maxAggLimit: 5000,
   maxValuesLimit: 100,
   maxJoinOnColumns: 8,
+  maxKeyColumns: 16,
+  maxOutlierColumns: 32,
 }
 
 export function clampHeadN(n: unknown, limits: AnalysisLimits): number {

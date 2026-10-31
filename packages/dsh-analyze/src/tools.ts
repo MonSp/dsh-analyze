@@ -98,6 +98,20 @@ function failMessage(e: unknown): never {
   throw err
 }
 
+/** Strict integer 1..=max for quality-tool sample limits (invalid → invalid-args). */
+export function validateSampleLimit(n: unknown, def: number, max: number): number {
+  if (n === undefined || n === null) return def
+  const raw = typeof n === 'number' ? n : Number(n)
+  if (!Number.isInteger(raw) || raw < 1 || raw > max) {
+    const err = new Error(
+      `analysis/invalid-args: sampleLimit must be integer 1..${max}`,
+    ) as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  return raw
+}
+
 /** Whitelist arithmetic expression: identifiers, numbers, + - * /, parens, unary minus. */
 export function validateMutateExpr(expr: unknown): string {
   if (typeof expr !== 'string' || !expr.trim() || expr.length > 512) {
@@ -940,6 +954,285 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           '--on', a.on.join(','),
           '--how', how,
         ]
+        if (a.outLabel) cliArgs.push('--out', a.outLabel)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_profile: {
+      name: 'dataset_profile',
+      description:
+        'Quality profile of a dataset: per-column null rate, nunique, type stability, ' +
+        'high-cardinality flags, suspect primary keys, and coarse warnings. ' +
+        'Summary only — never full columns. Use at the start of analysis to judge whether a table is usable.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          highCardinalityThreshold: {
+            type: 'number',
+            description: 'nunique above this marks highCardinality (default 200).',
+          },
+        },
+        required: ['datasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            columnCount: { type: 'number' },
+            columns: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            suspectKeys: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          required: ['datasetId', 'rowCount', 'columns'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            columns?: Array<{ name: string; nullRate?: number; typeStability?: string }>
+            warnings?: Array<{ code: string; column?: string }>
+            suspectKeys?: Array<{ columns: string[] }>
+          }
+          const cols = (v.columns ?? [])
+            .map(
+              c =>
+                `- ${c.name}: ${c.typeStability ?? '?'}` +
+                (typeof c.nullRate === 'number' ? ` null=${(c.nullRate * 100).toFixed(2)}%` : ''),
+            )
+            .join('\n')
+          const warn = (v.warnings ?? []).map(w => `- ${w.code}${w.column ? `: ${w.column}` : ''}`).join('\n')
+          const keys = (v.suspectKeys ?? []).map(k => k.columns.join('+')).join(', ')
+          return textRender(
+            `profile ${v.datasetId}: ${v.rowCount} rows\n${cols}` +
+              (warn ? `\nwarnings:\n${warn}` : '') +
+              (keys ? `\nsuspect keys: ${keys}` : ''),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { datasetId: string; highCardinalityThreshold?: number }
+        validateDatasetId(a.datasetId)
+        const cliArgs = ['profile', '--dataset-id', a.datasetId]
+        if (a.highCardinalityThreshold !== undefined && a.highCardinalityThreshold !== null) {
+          const t = Number(a.highCardinalityThreshold)
+          if (!Number.isInteger(t) || t < 1) {
+            const err = new Error(
+              'analysis/invalid-args: highCardinalityThreshold must be integer >= 1',
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--high-cardinality-threshold', String(t))
+        }
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_dedup: {
+      name: 'dataset_dedup',
+      description:
+        'Detect exact full-row duplicates or keyed duplicate groups. Returns counts + a few sample groups — never the full duplicate set. ' +
+        'Omit keyColumns for exact whole-row mode; pass keyColumns for keyed export-duplicate checks.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          keyColumns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional 1..16 key column names. Omit for exact whole-row dedup.',
+          },
+          sampleLimit: {
+            type: 'number',
+            description: '1–20 duplicate sample groups (default 5).',
+          },
+        },
+        required: ['datasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            mode: { type: 'string' },
+            duplicateRowCount: { type: 'number' },
+            duplicateRowRate: { type: 'number' },
+            samples: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            samplesTruncated: { type: 'boolean' },
+          },
+          required: ['datasetId', 'rowCount', 'mode', 'duplicateRowCount'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            mode: string
+            duplicateRowCount: number
+            duplicateRowRate?: number
+            samplesTruncated?: boolean
+          }
+          const pct =
+            typeof v.duplicateRowRate === 'number' ? ` (${(v.duplicateRowRate * 100).toFixed(2)}%)` : ''
+          return textRender(
+            `dedup ${v.datasetId} mode=${v.mode}: ${v.duplicateRowCount}/${v.rowCount} duplicate rows${pct}` +
+              (v.samplesTruncated ? ' [samples truncated]' : ''),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { datasetId: string; keyColumns?: string[]; sampleLimit?: number }
+        validateDatasetId(a.datasetId)
+        const cliArgs = ['dedup', '--dataset-id', a.datasetId]
+        if (Array.isArray(a.keyColumns) && a.keyColumns.length > 0) {
+          if (a.keyColumns.length > limits.maxKeyColumns) {
+            const err = new Error(
+              `analysis/invalid-args: keyColumns must be 1..${limits.maxKeyColumns} names`,
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (a.keyColumns.some(c => typeof c !== 'string' || !c.trim())) {
+            const err = new Error(
+              'analysis/invalid-args: keyColumns entries must be non-empty strings',
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--key-columns', a.keyColumns.join(','))
+        }
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 5, limits.maxSampleRows)
+        cliArgs.push('--sample-limit', String(sampleLimit))
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_outliers: {
+      name: 'dataset_outliers',
+      description:
+        'Flag numeric outliers on one or more columns using iqr | zscore | mad. ' +
+        'Returns bounds, counts, and ≤20 sample rows per column — never full outlier lists. ' +
+        'Optional outLabel writes a new dataset of outlier rows for further head/agg.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Numeric-capable column names (1..32).',
+          },
+          method: { type: 'string', enum: ['iqr', 'zscore', 'mad'], description: 'Default iqr.' },
+          k: { type: 'number', description: 'Threshold; default 1.5 (iqr) or 3.0 (zscore/mad).' },
+          sampleLimit: {
+            type: 'number',
+            description: '1–20 sample rows per column (default 10).',
+          },
+          outLabel: {
+            type: 'string',
+            description: 'If set, write a new dataset of rows that are outliers in any column.',
+          },
+        },
+        required: ['datasetId', 'columns'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            method: { type: 'string' },
+            k: { type: 'number' },
+            outDatasetId: { type: ['string', 'null'] },
+            columns: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          required: ['datasetId', 'method', 'columns'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            method: string
+            k?: number
+            outDatasetId?: string | null
+            columns?: Array<{ name: string; outlierCount: number; lowerBound?: number | null; upperBound?: number | null }>
+          }
+          const lines = (v.columns ?? [])
+            .map(
+              c =>
+                `- ${c.name}: ${c.outlierCount} outliers` +
+                (c.lowerBound != null && c.upperBound != null
+                  ? ` bounds=[${c.lowerBound}, ${c.upperBound}]`
+                  : ''),
+            )
+            .join('\n')
+          return textRender(
+            `outliers ${v.datasetId} method=${v.method} k=${v.k ?? '?'}\n${lines}` +
+              (v.outDatasetId ? `\n→ ${v.outDatasetId}` : ''),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          datasetId: string
+          columns: string[]
+          method?: string
+          k?: number
+          sampleLimit?: number
+          outLabel?: string
+        }
+        validateDatasetId(a.datasetId)
+        if (!Array.isArray(a.columns) || a.columns.length === 0 || a.columns.length > limits.maxOutlierColumns) {
+          const err = new Error(
+            `analysis/invalid-args: columns must be 1..${limits.maxOutlierColumns} names`,
+          ) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (a.columns.some(c => typeof c !== 'string' || !c.trim())) {
+          const err = new Error(
+            'analysis/invalid-args: columns entries must be non-empty strings',
+          ) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const method = a.method ?? 'iqr'
+        if (method !== 'iqr' && method !== 'zscore' && method !== 'mad') {
+          const err = new Error('analysis/invalid-args: method must be iqr|zscore|mad') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const cliArgs = [
+          'outliers',
+          '--dataset-id',
+          a.datasetId,
+          '--columns',
+          a.columns.join(','),
+          '--method',
+          method,
+        ]
+        if (a.k !== undefined && a.k !== null) {
+          if (!Number.isFinite(a.k) || a.k <= 0) {
+            const err = new Error('analysis/invalid-args: k must be a finite number > 0') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--k', String(a.k))
+        }
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 10, limits.maxSampleRows)
+        cliArgs.push('--sample-limit', String(sampleLimit))
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
         const result = await run(cliArgs, exec?.signal)
         return result.data

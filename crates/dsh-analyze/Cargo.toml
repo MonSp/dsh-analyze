@@ -3,7 +3,7 @@ name = "dsh-analyze"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "dsh-analyze CLI: ingest/head/schema/describe/agg/list/export/rm for session datasets"
+description = "dsh-analyze CLI: ingest/head/schema/describe/agg/list/export/rm + profile/dedup/outliers for session datasets"
 
 [[bin]]
 name = "dsh-analyze"

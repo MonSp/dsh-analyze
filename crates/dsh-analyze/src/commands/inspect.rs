@@ -109,6 +109,10 @@ pub(crate) fn cmd_describe(workspace: &Path, args: &[String]) -> Result<String, 
         let mut q25 = Value::Null;
         let mut q50 = Value::Null;
         let mut q75 = Value::Null;
+        let mut q01 = Value::Null;
+        let mut q10 = Value::Null;
+        let mut q90 = Value::Null;
+        let mut q99 = Value::Null;
         if !nums.is_empty() {
             let mut s = nums.clone();
             s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -127,9 +131,13 @@ pub(crate) fn cmd_describe(workspace: &Path, args: &[String]) -> Result<String, 
             q25 = Value::F64(pct(0.25));
             q50 = Value::F64(pct(0.50));
             q75 = Value::F64(pct(0.75));
+            q01 = Value::F64(pct(0.01));
+            q10 = Value::F64(pct(0.10));
+            q90 = Value::F64(pct(0.90));
+            q99 = Value::F64(pct(0.99));
         }
         stats.push(format!(
-            "{{\"name\":{},\"dtype\":{},\"nullCount\":{},\"min\":{},\"max\":{},\"mean\":{},\"std\":{},\"q25\":{},\"q50\":{},\"q75\":{}}}",
+            "{{\"name\":{},\"dtype\":{},\"nullCount\":{},\"min\":{},\"max\":{},\"mean\":{},\"std\":{},\"q25\":{},\"q50\":{},\"q75\":{},\"q01\":{},\"q10\":{},\"q90\":{},\"q99\":{}}}",
             json_string(&col.name),
             json_string(&col.dtype),
             nulls,
@@ -139,7 +147,11 @@ pub(crate) fn cmd_describe(workspace: &Path, args: &[String]) -> Result<String, 
             std.to_json(),
             q25.to_json(),
             q50.to_json(),
-            q75.to_json()
+            q75.to_json(),
+            q01.to_json(),
+            q10.to_json(),
+            q90.to_json(),
+            q99.to_json()
         ));
     }
     Ok(format!(
