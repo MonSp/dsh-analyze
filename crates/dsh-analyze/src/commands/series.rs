@@ -1,5 +1,7 @@
 //! Time-series transforms: lag / lead / diff / pct_change / rolling (v0.1.5).
 
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 
@@ -10,6 +12,7 @@ use crate::dataset::{
     Column, Meta, Table, Value,
 };
 
+const NULL: Value = Value::Null;
 const MAX_OPS: usize = 8;
 const MAX_PERIODS: usize = 10_000;
 const MAX_WINDOW: usize = 10_000;
@@ -364,8 +367,12 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         2u8
     })?;
 
-    let (meta, table) = load_or_fail(workspace, &id)?;
+    let (meta, mut table) = load_or_fail(workspace, &id)?;
     let _ = meta;
+    // Series never drops rows; reject oversized input before sort/ops.
+    if table.rows.len() > max_rows {
+        return fail(3, "analysis/limit: series result too large");
+    }
     let order_idx = table
         .columns
         .iter()
@@ -397,18 +404,17 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         col_idxs.push(ci);
     }
 
-    // Stable sort by order-by; nulls last.
+    // Stable sort by order-by; nulls last. Compare by reference (no Value clones).
     let mut order: Vec<usize> = (0..table.rows.len()).collect();
     order.sort_by(|&i, &j| {
-        let a = table.rows[i]
-            .get(order_idx)
-            .cloned()
-            .unwrap_or(Value::Null);
-        let b = table.rows[j]
-            .get(order_idx)
-            .cloned()
-            .unwrap_or(Value::Null);
-        compare_keys(&a, &b).then(i.cmp(&j))
+        let a = table.rows[i].get(order_idx);
+        let b = table.rows[j].get(order_idx);
+        match (a, b) {
+            (Some(a), Some(b)) => compare_keys(a, b).then(i.cmp(&j)),
+            (None, None) => i.cmp(&j),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+        }
     });
 
     let n = order.len();
@@ -420,17 +426,15 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         });
     }
 
-    // Build sorted value matrix for source columns used by ops.
-    let mut sorted_rows: Vec<Vec<Value>> = Vec::with_capacity(n);
-    for &ri in &order {
-        sorted_rows.push(table.rows[ri].clone());
-    }
+    let cell = |i: usize, ci: usize| -> &Value {
+        table.rows[order[i]].get(ci).unwrap_or(&NULL)
+    };
 
     // Whole source column is only I64/null → rolling min/max emit I64 and dtype i64.
     let mut col_all_i64: Vec<bool> = table.columns.iter().map(|_| true).collect();
     for row in &table.rows {
-        for (ci, cell) in row.iter().enumerate() {
-            match cell {
+        for (ci, cell_val) in row.iter().enumerate() {
+            match cell_val {
                 Value::Null | Value::I64(_) => {}
                 _ => {
                     col_all_i64[ci] = false;
@@ -448,7 +452,7 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
                     if i < op.periods {
                         col.push(Value::Null);
                     } else {
-                        col.push(sorted_rows[i - op.periods][ci].clone());
+                        col.push(cell(i - op.periods, ci).clone());
                     }
                 }
             }
@@ -458,7 +462,7 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
                     if j >= n {
                         col.push(Value::Null);
                     } else {
-                        col.push(sorted_rows[j][ci].clone());
+                        col.push(cell(j, ci).clone());
                     }
                 }
             }
@@ -468,13 +472,14 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
                         col.push(Value::Null);
                         continue;
                     }
-                    let cur = finite_num(&sorted_rows[i][ci]);
-                    let prev = finite_num(&sorted_rows[i - op.periods][ci]);
+                    let cur = finite_num(cell(i, ci));
+                    let prev = finite_num(cell(i - op.periods, ci));
                     match (cur, prev) {
                         (Some(c), Some(p)) => {
                             let d = c - p;
-                            let both_i64 = matches!(sorted_rows[i][ci], Value::I64(_))
-                                && matches!(sorted_rows[i - op.periods][ci], Value::I64(_));
+                            let both_i64 =
+                                matches!(cell(i, ci), Value::I64(_))
+                                    && matches!(cell(i - op.periods, ci), Value::I64(_));
                             col.push(numeric_result("diff", both_i64 && d.fract() == 0.0, d));
                         }
                         _ => col.push(Value::Null),
@@ -487,8 +492,8 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
                         col.push(Value::Null);
                         continue;
                     }
-                    let cur = finite_num(&sorted_rows[i][ci]);
-                    let prev = finite_num(&sorted_rows[i - op.periods][ci]);
+                    let cur = finite_num(cell(i, ci));
+                    let prev = finite_num(cell(i - op.periods, ci));
                     match (cur, prev) {
                         (Some(c), Some(p)) if p != 0.0 => {
                             col.push(Value::F64((c - p) / p));
@@ -500,52 +505,99 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
             SeriesFn::Rolling { window, agg } => {
                 let window = *window;
                 let agg = agg.as_str();
-                // Running buffer of finite values in trailing window of positions.
-                // Spec: count non-null finite in positions i-window+1..=i; if count < window → Null.
+                // Spec: non-null only when positions i-window+1..=i are all finite
+                // (count of finite must equal window). Incomplete windows → Null.
+                let mut vals: Vec<Option<f64>> = Vec::with_capacity(n);
                 for i in 0..n {
-                    let start = i.saturating_sub(window - 1);
-                    let mut nums: Vec<f64> = Vec::with_capacity(window);
-                    for j in start..=i {
-                        if let Some(v) = finite_num(&sorted_rows[j][ci]) {
-                            nums.push(v);
+                    vals.push(finite_num(cell(i, ci)));
+                }
+                let promote_i64 = col_all_i64[ci];
+                match agg {
+                    "mean" | "sum" => {
+                        // O(n) sliding sum; bad = non-finite count in the trailing window.
+                        let mut sum = 0.0f64;
+                        let mut bad = 0usize;
+                        for i in 0..n {
+                            match vals[i] {
+                                Some(v) => sum += v,
+                                None => bad += 1,
+                            }
+                            if i >= window {
+                                match vals[i - window] {
+                                    Some(v) => sum -= v,
+                                    None => bad -= 1,
+                                }
+                            }
+                            if i + 1 < window || bad > 0 {
+                                col.push(Value::Null);
+                                continue;
+                            }
+                            let raw = if agg == "sum" {
+                                sum
+                            } else {
+                                sum / window as f64
+                            };
+                            col.push(numeric_result(agg, false, raw));
                         }
                     }
-                    if nums.len() < window {
-                        col.push(Value::Null);
-                        continue;
+                    "min" | "max" => {
+                        // O(n) monotonic deque over finite values + non-finite count.
+                        let want_min = agg == "min";
+                        let mut bad = 0usize;
+                        let mut dq: VecDeque<usize> = VecDeque::new();
+                        for i in 0..n {
+                            match vals[i] {
+                                Some(v) => {
+                                    while let Some(&b) = dq.back() {
+                                        let bv = vals[b].unwrap_or(f64::NAN);
+                                        let pop = if want_min { bv >= v } else { bv <= v };
+                                        if pop {
+                                            dq.pop_back();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    dq.push_back(i);
+                                }
+                                None => bad += 1,
+                            }
+                            if i >= window {
+                                match vals[i - window] {
+                                    Some(_) => {
+                                        if dq.front() == Some(&(i - window)) {
+                                            dq.pop_front();
+                                        }
+                                    }
+                                    None => bad -= 1,
+                                }
+                            }
+                            if i + 1 < window || bad > 0 {
+                                col.push(Value::Null);
+                                continue;
+                            }
+                            let raw = vals[dq.front().copied().unwrap_or(i)].unwrap_or(0.0);
+                            col.push(numeric_result(agg, promote_i64, raw));
+                        }
                     }
-                    let raw = match agg {
-                        "mean" => nums.iter().sum::<f64>() / nums.len() as f64,
-                        "sum" => nums.iter().sum::<f64>(),
-                        "min" => nums.iter().cloned().fold(f64::INFINITY, f64::min),
-                        "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                        _ => unreachable!(),
-                    };
-                    // min/max: promote to I64 only when the whole source column is I64/null
-                    // (same rule as the output dtype below).
-                    let all_i64 = match agg {
-                        "mean" | "sum" => false,
-                        _ => col_all_i64[ci],
-                    };
-                    col.push(numeric_result(agg, all_i64, raw));
+                    _ => unreachable!(),
                 }
             }
         }
         new_cols.push(col);
     }
 
-    // Assemble output rows in sorted order (original cols + new cols).
+    // Assemble output rows in sorted order without keeping a full sorted_rows copy.
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(n);
-    for (i, base) in sorted_rows.iter().enumerate() {
-        if out_rows.len() >= max_rows {
-            return fail(3, "analysis/limit: series result too large");
-        }
-        let mut row = base.clone();
+    let mut slots: Vec<Option<Vec<Value>>> =
+        std::mem::take(&mut table.rows).into_iter().map(Some).collect();
+    for (i, &ri) in order.iter().enumerate() {
+        let mut row = slots[ri].take().expect("each source row used once");
         for col in &new_cols {
             row.push(col[i].clone());
         }
         out_rows.push(row);
     }
+    drop(slots);
 
     // Fix dtypes for lag/lead to source dtype; rolling mean/sum f64; min/max per column.
     for (k, op) in ops.iter().enumerate() {

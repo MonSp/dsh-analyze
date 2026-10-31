@@ -202,6 +202,22 @@ fn series_order_by_nulls_last() {
     assert_rows_json(&head, "[[1,10,null],[2,20,10],[null,99,20]]");
 }
 
+/// Any non-finite inside a full trailing window → Null (count of finite < window).
+#[test]
+fn series_rolling_null_in_window_is_null() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n2,\n3,20\n4,30\n");
+    let id = ingest(&ws, "data/s.csv");
+    let ops = r#"[{"fn":"rolling","column":"v","window":2,"agg":"sum","as":"s"}]"#;
+    let out = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id, "--order-by", "t", "--ops", ops],
+    );
+    let head = head_json(&ws, &extract_ds_id(&out).unwrap());
+    // windows: [10],[10,null],[null,20],[20,30] → only last is complete+finite
+    assert_rows_json(&head, "[[1,10,null],[2,null,null],[3,20,null],[4,30,50]]");
+}
+
 #[test]
 fn series_pct_change_zero_prev_and_incomplete_window() {
     let ws = temp_workspace();
