@@ -32,6 +32,16 @@ fn json_f64(v: f64) -> String {
     }
 }
 
+/// JSON label for a crosstab category. Null prints as the contract token
+/// `__null__`; a data string `"__null__"` stays a distinct map key and the
+/// same JSON label — counts never merge.
+fn category_json(v: &Value) -> String {
+    match v {
+        Value::Null => json_string("__null__"),
+        other => other.to_json(),
+    }
+}
+
 /// Pearson correlation on paired samples; (r, degenerate).
 fn pearson(xs: &[f64], ys: &[f64]) -> (Option<f64>, bool) {
     debug_assert_eq!(xs.len(), ys.len());
@@ -405,17 +415,11 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
             null_row_count += 1;
             continue;
         }
-        // When drop_null=false, null becomes category `__null__`.
-        let r_key = if r_is_null {
-            Value::Str("__null__".into())
-        } else {
-            rv
-        };
-        let c_key = if c_is_null {
-            Value::Str("__null__".into())
-        } else {
-            cv
-        };
+        // When drop_null=false, keep Value::Null as its own map key so it
+        // cannot collide with the literal string "__null__"; JSON label is
+        // still `__null__` via category_json.
+        let r_key = rv;
+        let c_key = cv;
         *cell_counts.entry((r_key.clone(), c_key.clone())).or_insert(0) += 1;
         *row_marg.entry(r_key.clone()).or_insert(0) += 1;
         *col_marg.entry(c_key.clone()).or_insert(0) += 1;
@@ -494,12 +498,12 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
 
     let row_cates_json = row_cates
         .iter()
-        .map(|v| v.to_json())
+        .map(category_json)
         .collect::<Vec<_>>()
         .join(",");
     let col_cates_json = col_cates
         .iter()
-        .map(|v| v.to_json())
+        .map(category_json)
         .collect::<Vec<_>>()
         .join(",");
     let matrix_json = matrix
@@ -525,8 +529,8 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
         .map(|&(i, j, n)| {
             format!(
                 "{{\"row\":{},\"col\":{},\"count\":{}}}",
-                row_cates[i].to_json(),
-                col_cates[j].to_json(),
+                category_json(&row_cates[i]),
+                category_json(&col_cates[j]),
                 n
             )
         })
