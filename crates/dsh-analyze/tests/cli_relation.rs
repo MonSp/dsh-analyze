@@ -391,3 +391,316 @@ fn version_capabilities_include_corr_crosstab() {
     let out_at = out.find("\"outliers\"").expect("outliers");
     assert!(out_at < corr_at && corr_at < ct_at, "order wrong: {out}");
 }
+
+/// Spearman on x=[1,2,3], y=[1,3,2]: mid-ranks = identity; pearson(ranks)=0.5.
+#[test]
+fn corr_spearman_ties_hand_calc() {
+    let ws = temp_workspace();
+    write_csv(&ws, "c.csv", "x,y\n1,1\n2,3\n3,2\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "x,y",
+            "--method",
+            "spearman",
+        ],
+    );
+    assert!(out.contains("\"method\":\"spearman\""), "got: {out}");
+    let r = json_f64_field(&out, "r").expect("r field");
+    assert!(
+        (r - 0.5).abs() < 1e-12,
+        "expected spearman r=0.5, got {r}\n{out}"
+    );
+    assert_eq!(json_usize_field(&out, "n"), Some(3), "got: {out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Listwise omit keeps only rows where every listed column is numeric.
+#[test]
+fn corr_pairwise_omit_is_listwise() {
+    let ws = temp_workspace();
+    // rows 1 and 3 have null y; omit on (x,y) → n=2; complete → n=2 as well.
+    // With (x,y,z): omit uses only row 0 (all three present); complete uses per-pair.
+    write_csv(
+        &ws,
+        "c.csv",
+        "x,y,z\n1,2,10\n2,,10\n3,6,10\n4,,9\n",
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+
+    // complete on x,y: rows 0 and 2 → n=2, r=1
+    let complete = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "x,y",
+            "--pairwise",
+            "complete",
+        ],
+    );
+    assert_eq!(json_usize_field(&complete, "n"), Some(2), "got: {complete}");
+    let r_c = json_f64_field(&complete, "r").expect("r");
+    assert!((r_c - 1.0).abs() < 1e-12, "got: {complete}");
+
+    // omit listwise: rows where x,y,z are ALL numeric → rows 0 and 2 → n=2 for every pair.
+    let omit = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "x,y,z",
+            "--pairwise",
+            "omit",
+        ],
+    );
+    assert!(omit.contains("\"pairwise\":\"omit\""), "got: {omit}");
+    for n in json_all_usize_field(&omit, "n") {
+        assert_eq!(n, 2, "omit listwise keeps only full rows: {omit}");
+    }
+    // x,z under omit: rows (1,10) and (3,10) → constant z → degenerate, not n=4
+    assert!(omit.contains("\"degenerate\":true"), "got: {omit}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// min-numeric: n below threshold → r null, degenerate false.
+#[test]
+fn corr_min_numeric_threshold() {
+    let ws = temp_workspace();
+    write_csv(&ws, "c.csv", "x,y\n1,2\n3,4\n5,6\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "x,y",
+            "--min-numeric",
+            "4",
+        ],
+    );
+    assert!(out.contains("\"minNumeric\":4"), "got: {out}");
+    assert!(out.contains("\"r\":null"), "got: {out}");
+    assert!(out.contains("\"degenerate\":false"), "got: {out}");
+    assert_eq!(json_usize_field(&out, "n"), Some(3), "got: {out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// corr rejects duplicate column names.
+#[test]
+fn corr_rejects_duplicate_columns() {
+    let ws = temp_workspace();
+    write_csv(&ws, "c.csv", "x,y\n1,2\n3,4\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let stderr = run_fail(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "x,x",
+        ],
+        2,
+    );
+    assert!(stderr.contains("duplicate"), "stderr={stderr}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// drop-null false: Null is its own category (JSON label `__null__`),
+/// distinct from the literal string `"__null__"`.
+#[test]
+fn crosstab_drop_null_false_null_is_separate_category() {
+    let ws = temp_workspace();
+    // r: x, x, "__null__" (string); c: 1, null, 2
+    write_csv(&ws, "x.csv", "r,c\nx,1\nx,\n__null__,2\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/x.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+
+    let out = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "r",
+            "--cols",
+            "c",
+            "--drop-null",
+            "false",
+        ],
+    );
+    assert!(out.contains("\"nullRowCount\":0"), "got: {out}");
+    assert_eq!(json_usize_field(&out, "grandTotal"), Some(3), "got: {out}");
+    // 2 distinct row categories (x + string "__null__"), 3 col categories (1, null, 2)
+    let rows_json = extract_array(&out, "rowCategories");
+    assert_eq!(
+        rows_json.matches("\"__null__\"").count(),
+        1,
+        "string __null__ category: {out}"
+    );
+    assert!(
+        rows_json.contains("null"),
+        "null category labeled __null__ or null: {rows_json} / {out}"
+    );
+    // matrix must be 2×3 (not merged): two outer rows
+    let matrix = extract_array(&out, "matrix");
+    assert!(
+        matrix.starts_with("[[") && matrix.matches("],[").count() == 1,
+        "expected 2×3 matrix: {out}"
+    );
+    // cell counts: each of 3 cells is 1
+    assert_eq!(json_usize_field(&out, "cellCount"), Some(3), "got: {out}");
+
+    // drop-null true: only the (x, null) row is dropped → 2 cells remain
+    let dropped = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "r",
+            "--cols",
+            "c",
+        ],
+    );
+    assert_eq!(json_usize_field(&dropped, "nullRowCount"), Some(1), "got: {dropped}");
+    assert_eq!(json_usize_field(&dropped, "grandTotal"), Some(2), "got: {dropped}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Categories containing `|` must not break the matrix.
+#[test]
+fn crosstab_pipe_in_category_values() {
+    let ws = temp_workspace();
+    write_csv(&ws, "x.csv", "r,c\na|b,1\na|b,2\nc|d,1\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/x.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "r",
+            "--cols",
+            "c",
+        ],
+    );
+    assert_eq!(json_usize_field(&out, "grandTotal"), Some(3), "got: {out}");
+    assert!(
+        out.contains("\"rowCategories\":[\"a|b\",\"c|d\"]"),
+        "got: {out}"
+    );
+    // rows: a|b → [1,1]; c|d → [1,0]
+    assert!(out.contains("\"matrix\":[[1,1],[1,0]]"), "got: {out}");
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Pull every `"n":<usize>` occurrence (pair list has multiple).
+fn json_all_usize_field(line: &str, field: &str) -> Vec<usize> {
+    let needle = format!("\"{field}\":");
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find(&needle) {
+        let after = &rest[start + needle.len()..];
+        let end = after.find([',', '}', ']']).unwrap_or(after.len());
+        if let Ok(v) = after[..end].trim().parse::<usize>() {
+            out.push(v);
+        }
+        rest = &rest[start + needle.len()..];
+    }
+    out
+}
+
+/// Extract a top-level JSON array value by key (naive but enough for tests).
+fn extract_array(line: &str, field: &str) -> String {
+    let needle = format!("\"{field}\":[");
+    let start = line.find(&needle).expect("field") + needle.len() - 1;
+    let mut depth = 0usize;
+    for (i, ch) in line[start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return line[start..=start + i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated array for {field}");
+}
