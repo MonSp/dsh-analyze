@@ -371,7 +371,7 @@ Flags: `--dataset-id` (required), `--order-by <col>` (required), `--ops <json-or
 - `lag`/`lead`: copy source value `periods` steps back/forward; out of range → Null. Output dtype = source dtype.
 - `diff`: `src(i) - src(i-p)` when both are finite numbers (`as_f64`); else Null. I64−I64 with integer result → i64, else f64.
 - `pct_change`: `(src(i)-src(i-p))/src(i-p)`; prev 0 or non-numeric → Null; output f64.
-- `rolling`: trailing positions `i-window+1..=i`. If fewer than `window` non-null finite values → Null. Else `mean`/`sum`/`min`/`max` over those non-null values. mean/sum → f64; min/max → i64 when the source column is all I64/null, else f64.
+- `rolling`: trailing positions `i-window+1..=i`. If fewer than `window` non-null finite values → Null. Else `mean`/`sum`/`min`/`max` over those non-null values. mean/sum → f64. min/max: cell values and schema dtype are i64 only when the **whole source column** is all I64/null; any float (or non-numeric) in the source forces f64 — a window of ints alone does not promote.
 - No rows dropped. `producedBy: "series"`, `sourceKind: "series"`, `source_path: series:<src>`.
 - Invalid ops / unknown column / empty ops / >8 ops → exit 2. No sample rows in the success body.
 

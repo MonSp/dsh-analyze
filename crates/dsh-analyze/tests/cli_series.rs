@@ -151,6 +151,41 @@ fn series_lag_diff_rolling_hand_calc() {
     );
 }
 
+/// min/max dtype follows the whole source column: all-I64/null → i64 cells;
+/// any float in the source forces f64 cells (even when a window is all ints).
+#[test]
+fn series_rolling_min_dtype_all_i64_vs_mixed() {
+    let ws = temp_workspace();
+    write_csv(&ws, "all_i64.csv", "t,v\n1,10\n2,20\n3,5\n");
+    write_csv(&ws, "mixed.csv", "t,v\n1,10\n2,1.5\n3,3\n");
+    let ops = r#"[{"fn":"rolling","column":"v","window":2,"agg":"min","as":"v_min"}]"#;
+
+    let id_int = ingest(&ws, "data/all_i64.csv");
+    let out_int = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id_int, "--order-by", "t", "--ops", ops],
+    );
+    assert!(
+        out_int.contains(r#"{"name":"v_min","dtype":"i64"}"#),
+        "all-int source should declare i64: {out_int}"
+    );
+    let head_int = head_json(&ws, &extract_ds_id(&out_int).unwrap());
+    assert_rows_json(&head_int, "[[1,10,null],[2,20,10],[3,5,5]]");
+
+    let id_mix = ingest(&ws, "data/mixed.csv");
+    let out_mix = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id_mix, "--order-by", "t", "--ops", ops],
+    );
+    assert!(
+        out_mix.contains(r#"{"name":"v_min","dtype":"f64"}"#),
+        "mixed source should declare f64: {out_mix}"
+    );
+    // window [10,1.5] → 1.5; window [1.5,3] → 1.5 — no I64 promotion.
+    let head_mix = head_json(&ws, &extract_ds_id(&out_mix).unwrap());
+    assert_rows_json(&head_mix, "[[1,10,null],[2,1.5,1.5],[3,3,1.5]]");
+}
+
 #[test]
 fn series_order_by_nulls_last() {
     let ws = temp_workspace();

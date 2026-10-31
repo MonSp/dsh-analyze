@@ -426,13 +426,12 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         sorted_rows.push(table.rows[ri].clone());
     }
 
-    // Track whether a numeric source column is entirely I64 (for min/max dtype).
+    // Whole source column is only I64/null → rolling min/max emit I64 and dtype i64.
     let mut col_all_i64: Vec<bool> = table.columns.iter().map(|_| true).collect();
     for row in &table.rows {
         for (ci, cell) in row.iter().enumerate() {
             match cell {
-                Value::Null => {}
-                Value::I64(_) => {}
+                Value::Null | Value::I64(_) => {}
                 _ => {
                     col_all_i64[ci] = false;
                 }
@@ -522,12 +521,11 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
                         "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                         _ => unreachable!(),
                     };
+                    // min/max: promote to I64 only when the whole source column is I64/null
+                    // (same rule as the output dtype below).
                     let all_i64 = match agg {
                         "mean" | "sum" => false,
-                        _ => {
-                            // min/max: all contributing values in column slice are I64
-                            (start..=i).all(|j| matches!(sorted_rows[j][ci], Value::Null | Value::I64(_)))
-                        }
+                        _ => col_all_i64[ci],
                     };
                     col.push(numeric_result(agg, all_i64, raw));
                 }
@@ -572,19 +570,10 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
             SeriesFn::Rolling { agg, .. } => {
                 out_cols[table.columns.len() + k].dtype = if agg == "mean" || agg == "sum" {
                     "f64".into()
+                } else if col_all_i64[col_idxs[k]] {
+                    "i64".into()
                 } else {
-                    let ci = col_idxs[k];
-                    let all_i64 = (0..n).all(|i| {
-                        matches!(
-                            sorted_rows[i][ci],
-                            Value::Null | Value::I64(_)
-                        )
-                    });
-                    if all_i64 {
-                        "i64".into()
-                    } else {
-                        "f64".into()
-                    }
+                    "f64".into()
                 };
             }
         }
