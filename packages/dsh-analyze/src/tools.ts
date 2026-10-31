@@ -1604,11 +1604,32 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             fn: string
             column: string
             as: string
-            periods?: number
-            window?: number
+            periods?: number | string | null
+            window?: number | string | null
             agg?: string
           }>
           outLabel?: string
+        }
+        const requireInt = (value: number | string | null | undefined, name: string, max: number): number => {
+          if (value === undefined || value === null) {
+            const err = new Error(`analysis/invalid-args: ${name} required`) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value.trim()))) {
+            const err = new Error(`analysis/invalid-args: ${name} must be a non-negative integer`) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          const n = Number(value)
+          if (!Number.isInteger(n) || n < 1 || n > max) {
+            const err = new Error(
+              `analysis/invalid-args: ${name} must be integer 1..${max}`,
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          return n
         }
         validateDatasetId(a.datasetId)
         if (typeof a.orderBy !== 'string' || !a.orderBy.trim()) {
@@ -1674,20 +1695,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               err.code = 'analysis/invalid-args'
               throw err
             }
-            const window = op.window === undefined || op.window === null ? NaN : Number(op.window)
-            if (!Number.isInteger(window) || window < 1 || window > limits.maxSeriesWindow) {
-              const err = new Error(
-                `analysis/invalid-args: window must be integer 1..${limits.maxSeriesWindow}`,
-              ) as Error & { code?: string }
-              err.code = 'analysis/invalid-args'
-              throw err
-            }
+            out.window = requireInt(op.window, 'window', limits.maxSeriesWindow)
             if (typeof op.agg !== 'string' || !aggs.has(op.agg)) {
               const err = new Error('analysis/invalid-args: rolling agg must be mean|sum|min|max') as Error & { code?: string }
               err.code = 'analysis/invalid-args'
               throw err
             }
-            out.window = window
             out.agg = op.agg
           } else {
             if (op.window !== undefined && op.window !== null) {
@@ -1700,19 +1713,10 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               err.code = 'analysis/invalid-args'
               throw err
             }
-            const periods = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
-            if (
-              !Number.isInteger(periods) ||
-              periods < 1 ||
-              periods > limits.maxSeriesPeriods
-            ) {
-              const err = new Error(
-                `analysis/invalid-args: periods must be integer 1..${limits.maxSeriesPeriods}`,
-              ) as Error & { code?: string }
-              err.code = 'analysis/invalid-args'
-              throw err
-            }
-            out.periods = periods
+            out.periods =
+              op.periods === undefined || op.periods === null
+                ? 1
+                : requireInt(op.periods, 'periods', limits.maxSeriesPeriods)
           }
           return out
         })

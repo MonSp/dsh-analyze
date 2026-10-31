@@ -213,11 +213,6 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
                         "analysis/invalid-args: unknown field in op fn={fn_name}"
                     ));
                 }
-                if obj.contains("\"window\"") || obj.contains("\"agg\"") {
-                    return Err(format!(
-                        "analysis/invalid-args: fn {fn_name} does not take window/agg"
-                    ));
-                }
                 let p = periods.unwrap_or(1);
                 if !(1..=MAX_PERIODS).contains(&p) {
                     return Err(format!(
@@ -280,13 +275,19 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
 
 fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    fn rank(v: &Value) -> u8 {
+        match v {
+            Value::Bool(_) => 0,
+            Value::I64(_) | Value::F64(_) => 1,
+            Value::Str(_) => 2,
+            Value::Null => 3,
+        }
+    }
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Bool(_), _) => Ordering::Less,
-        (_, Value::Bool(_)) => Ordering::Greater,
         (Value::I64(_) | Value::F64(_), Value::I64(_) | Value::F64(_)) => {
             let ax = match a {
                 Value::I64(v) => *v as f64,
@@ -301,7 +302,7 @@ fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
             ax.partial_cmp(&bx).unwrap_or(Ordering::Equal)
         }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
-        _ => Ordering::Equal,
+        _ => rank(a).cmp(&rank(b)),
     }
 }
 
@@ -364,6 +365,7 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
     })?;
 
     let (meta, table) = load_or_fail(workspace, &id)?;
+    let _ = meta;
     let order_idx = table
         .columns
         .iter()
@@ -443,8 +445,6 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         let mut col: Vec<Value> = Vec::with_capacity(n);
         match &op.r#fn {
             SeriesFn::Lag => {
-                let dtype_i64 = table.columns[ci].dtype == "i64";
-                let _ = dtype_i64;
                 for i in 0..n {
                     if i < op.periods {
                         col.push(Value::Null);
@@ -613,7 +613,6 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         eprintln!("{e}");
         1u8
     })?;
-    let _ = meta;
     Ok(format!(
         "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"sourceDatasetId\":{},\"orderBy\":{},\"opCount\":{}}}",
         json_string(&new_id),

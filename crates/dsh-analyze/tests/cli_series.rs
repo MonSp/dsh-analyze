@@ -215,6 +215,32 @@ fn series_version_has_capability() {
     assert!(out.contains("\"series\""));
 }
 
+/// Mixed-type order-by: Bool < number < Str; nulls last.
+/// Input order: str-a, 2, true, null, 1, str-b, false
+/// Expected sort: false, true, 1, 2, str-a, str-b, null
+#[test]
+fn series_order_by_mixed_types_bool_num_str() {
+    let ws = temp_workspace();
+    write_csv(
+        &ws,
+        "s.csv",
+        "k,v\nstr-a,10\n2,20\ntrue,30\n,40\n1,50\nstr-b,60\nfalse,70\n",
+    );
+    let id = ingest(&ws, "data/s.csv");
+    let ops = r#"[{"fn":"lag","column":"v","as":"v_lag"}]"#;
+    let out = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id, "--order-by", "k", "--ops", ops],
+    );
+    let new_id = extract_ds_id(&out).unwrap();
+    let head = head_json(&ws, &new_id);
+    // v after sort: 70,30,50,20,10,60,40 → lag: null,70,30,50,20,10,60
+    assert_rows_json(
+        &head,
+        "[[false,70,null],[true,30,70],[1,50,30],[2,20,50],[\"str-a\",10,20],[\"str-b\",60,10],[null,40,60]]",
+    );
+}
+
 #[test]
 fn series_rejects_empty_ops_and_bad_fn() {
     let ws = temp_workspace();

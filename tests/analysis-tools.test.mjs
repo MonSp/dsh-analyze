@@ -1072,7 +1072,7 @@ test('dataset_series rejects empty ops / bad as / unknown fn / missing window', 
           orderBy: 't',
           ops: [{ fn: 'rolling', column: 'v', as: 'x' }],
         }),
-      /window must be/,
+      /window (must be|required)/,
     )
     await assert.rejects(
       () =>
