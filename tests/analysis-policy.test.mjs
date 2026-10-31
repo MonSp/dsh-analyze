@@ -54,7 +54,7 @@ test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the frozen v0.1.3 surface', () => {
+test('ANALYSIS_TOOL_NAMES is the frozen v0.1.4 surface', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -70,6 +70,8 @@ test('ANALYSIS_TOOL_NAMES is the frozen v0.1.3 surface', () => {
     'dataset_profile',
     'dataset_dedup',
     'dataset_outliers',
+    'dataset_corr',
+    'dataset_crosstab',
   ])
 })
 
@@ -82,6 +84,11 @@ test('v0.1.3 quality tools are recognized by isAnalysisToolName', () => {
   assert.equal(isAnalysisToolName('dataset_outliers'), true)
 })
 
+test('v0.1.4 relation tools are recognized by isAnalysisToolName', () => {
+  assert.equal(isAnalysisToolName('dataset_corr'), true)
+  assert.equal(isAnalysisToolName('dataset_crosstab'), true)
+})
+
 test('analysisToolsForScopedAllow can enable quality tools only', () => {
   const names = analysisToolsForScopedAllow({
     mode: 'unconfigured',
@@ -89,4 +96,13 @@ test('analysisToolsForScopedAllow can enable quality tools only', () => {
     analysisTools: ['dataset_profile', 'dataset_dedup', 'dataset_outliers'],
   })
   assert.deepEqual(names, ['dataset_profile', 'dataset_dedup', 'dataset_outliers'])
+})
+
+test('analysisToolsForScopedAllow can enable relation tools only', () => {
+  const names = analysisToolsForScopedAllow({
+    mode: 'unconfigured',
+    toolAllowlist: [],
+    analysisTools: ['dataset_corr', 'dataset_crosstab'],
+  })
+  assert.deepEqual(names, ['dataset_corr', 'dataset_crosstab'])
 })

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "dsh-analyze",
-    "description": "Local dataset analysis tools (ingest / head / schema / stats / agg / quality)"
+    "description": "Local dataset analysis tools (ingest / head / schema / stats / agg / quality / relation)"
   }
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.4
+
+Relation & association increment (corr / crosstab / join anti·semi).
+
+### Added
+
+- CLI + tools: `corr` / `dataset_corr` — pairwise Pearson or Spearman among
+  2–16 numeric-capable columns; pairs sorted by \|r\| (cap 50) with per-pair `n`.
+- CLI + tools: `crosstab` / `dataset_crosstab` — two-column contingency table
+  (top categories per dimension, matrix, margins, top cells).
+- `join` / `dataset_join`: `--how` extends to `anti` \| `semi` (left rows only;
+  no right payload columns; null keys never match).
+
+### Changed
+
+- Version and `version` capabilities: `0.1.4` plus `corr`, `crosstab`.
+- Public contract updated in `docs/interface.md` (v0.1.4).
+- Package version `dsh-analyze@0.1.4`.
+
 ## 0.1.3
 
 Data-quality increment for agent sessions (profile / dedup / outliers + long-tail quantiles).

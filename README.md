@@ -106,6 +106,8 @@ The crate is pure-std and builds offline.
 | `dataset_profile` | Quality profile: nulls, nunique, type stability, suspect keys |
 | `dataset_dedup` | Exact or keyed duplicate detection (counts + sample groups) |
 | `dataset_outliers` | IQR / z-score / MAD outliers; optional write of outlier dataset |
+| `dataset_corr` | Pairwise Pearson/Spearman correlations among numeric columns (top pairs by \|r\|) |
+| `dataset_crosstab` | Two-column contingency table: top categories, matrix, margins, top cells |
 
 CLI mirrors the same names as subcommands (`values`, `sample`, `join`, `profile`, …).
 See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
@@ -116,6 +118,12 @@ See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
 - **`dataset_dedup`**: omit `keyColumns` for whole-row exact dupes; pass keys for export-style collisions.
 - **`dataset_outliers`**: `method: iqr|zscore|mad`; `outLabel` writes a new dataset — never dumps full outlier lists.
 - **`stats_describe`**: also returns `q01` / `q10` / `q90` / `q99` on numeric columns.
+
+### Relation tools (v0.1.4)
+
+- **`dataset_corr`**: 2–16 numeric-capable columns; `method: pearson|spearman`; pairs sorted by \|r\| (cap 50).
+- **`dataset_crosstab`**: `rows` × `cols` frequency table with `top` categories and top cells only.
+- **`dataset_join`**: `how` now includes `anti` \| `semi` (left rows only; null keys never match).
 
 ### `transform_agg` extras (v0.1.2)
 

@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.3)
+# dsh-analyze interface specification (v0.1.4)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.3` |
+| Version | `0.1.4` |
 
 ## 2. Invocation
 
@@ -57,12 +57,13 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.3","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers"]}
+{"ok":true,"version":"0.1.4","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab"]}
 ```
 
-Capability tokens: the v0.1.2 set plus `profile`, `dedup`, `outliers`.
-Mutate, time-period grouping, and extended `describe` quantiles ship inside
-existing commands and do not add separate capability tokens.
+Capability tokens: the v0.1.3 set plus `corr`, `crosstab` (appended, never
+inserted mid-list). Mutate, time-period grouping, extended `describe` quantiles,
+and join `anti`/`semi` ship inside existing commands and do not add separate
+capability tokens.
 
 ### `ingest`
 
@@ -232,21 +233,60 @@ inline `rows` may be empty with `truncated: true` (budget 20 rows).
 
 Equi-join on one or more key columns. Result is **always** a new dataset.
 
-Flags: `--left <id>` (required), `--right <id>` (required), `--on a,b` (required, non-empty list of shared column names), `--how inner|left` (default `inner`), `--out <label>` (optional)
+Flags: `--left <id>` (required), `--right <id>` (required), `--on a,b` (required, non-empty list of shared column names), `--how inner|left|anti|semi` (default `inner`), `--out <label>` (optional)
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"leftDatasetId":"ds_…","rightDatasetId":"ds_…","how":"inner"}
 ```
 
 - Does **not** return sample rows. Callers use `dataset_head` / `agg` / `export` on the new id.
-- Column layout: all left columns (including keys) first, then right columns **excluding** key columns. On name collision, right columns get suffix `_r` (repeat `_r` until unique).
+- Column layout for `inner`/`left`: all left columns (including keys) first, then right columns **excluding** key columns. On name collision, right columns get suffix `_r` (repeat `_r` until unique).
+- Column layout for `anti`/`semi`: **left columns only** (no right payload).
 - Key equality: same `Value` tag (I64==I64, Str==Str, …). `Null` keys never match (SQL-style).
 - `how=inner`: rows where every `on` key matches on both sides.
 - `how=left`: all left rows; unmatched right cells are `null`.
-- Multi-match is a cross product per matching key group (standard relational join).
+- `how=semi`: left rows whose key matches **≥1** right row (each left row at most once).
+- `how=anti`: left rows whose key matches **0** right rows (null keys count as no match).
+- Multi-match is a cross product per matching key group for `inner`/`left` only.
 - Result row count must be ≤ `DSH_ANALYZE_MAX_ROWS` else `analysis/limit` (exit 3). Nothing is written on limit failure.
 - New meta: `producedBy: "join"`, `parentDatasetId` = left dataset id, `label` = `--out` when provided, `sourceKind: "join"`.
 - Missing `--on` column on either side → `analysis/invalid-args`.
+- Bad `--how` → `analysis/invalid-args: --how must be inner|left|anti|semi`.
+
+### `corr` (v0.1.4)
+
+Pairwise correlation among numeric-capable columns. Summary only — never a full dense matrix dump beyond the pair cap.
+
+Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--method pearson|spearman` (default `pearson`), `--pairwise complete|omit` (default `complete`), `--min-numeric <n>` (integer ≥ 2, default 2)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"method":"pearson","pairwise":"complete","minNumeric":2,"columns":["a","b","c"],"pairCount":3,"pairs":[{"columns":["a","b"],"n":123,"r":0.87,"degenerate":false}],"truncated":false}
+```
+
+- Response uses a **pairs array** (upper triangle), sorted by `|r|` desc (nulls last), then `n` desc, then input column order. Cap **50** pairs; more → `truncated: true`.
+- Each pair has `n` (rows contributing under `--pairwise`). `n < --min-numeric` → `r: null`, `degenerate: false`.
+- Non-numeric-capable column (zero `as_f64` successes) → exit 2 `analysis/invalid-args: column {name} is not numeric-capable`.
+- Degenerate (either variance 0 after enough samples) → `r: null`, `degenerate: true`.
+- `--pairwise complete`: pairwise deletion (each pair uses its own complete rows).
+- `--pairwise omit`: listwise deletion (only rows where **all** listed columns are non-null numeric).
+- Spearman: mid-ranks (average ranks for ties) then Pearson on ranks.
+
+### `crosstab` (v0.1.4)
+
+Two-column contingency table. Summary + top cells only.
+
+Flags: `--dataset-id` (required), `--rows <col>` (required), `--cols <col>` (required, ≠ rows), `--top <n>` (1..=50, default 20), `--min-count <n>` (integer ≥ 1, default 1), `--drop-null true|false` (default `true`)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"rowColumn":"a","colColumn":"b","rowCategories":["x","y"],"colCategories":["1","2"],"matrix":[[c00,c01],[c10,c11]],"rowTotals":[…],"colTotals":[…],"grandTotal":N,"cellCount":N,"truncated":true,"nullRowCount":0,"topCells":[{"row":"x","col":"1","count":10}]}
+```
+
+- Categories: distinct `Value` JSON forms (same encoding as `values`); selected by marginal count desc, then first-seen. Length ≤ `--top`. With the default `--drop-null true`, only non-null categories appear. With `--drop-null false`, null participates as JSON string category `__null__` (a data string `"__null__"` is a separate category with the same label). Mixed numeric kinds that share a JSON form (e.g. integer `1` vs float `1.0`) may yield repeated labels in the category list.
+- `matrix` is `len(rowCategories) × len(colCategories)`; margins only cover the kept grid.
+- `truncated`: distinct categories exceeded `--top` or cells fell outside the selected grid.
+- `topCells`: cells with `count >= --min-count`, count desc, cap 50.
+- Nulls: `--drop-null true` (default) excludes rows with null on either side → counted in `nullRowCount`; `--drop-null false` keeps them as the `__null__` category and leaves `nullRowCount` at 0.
+- Algorithm: one `HashMap` pass over cell pairs — never materializes full cartesian of raw distinct values.
 
 ### `profile`
 
@@ -328,16 +368,19 @@ The DSH plugin registers the same operations as tools:
 `dataset_ingest` · `dataset_head` · `dataset_schema` · `dataset_list` ·
 `dataset_export` · `dataset_rm` · `stats_describe` · `transform_agg` ·
 `dataset_values` · `dataset_sample` · `dataset_join` ·
-`dataset_profile` · `dataset_dedup` · `dataset_outliers`
+`dataset_profile` · `dataset_dedup` · `dataset_outliers` ·
+`dataset_corr` · `dataset_crosstab`
 
 | Tool | CLI | Notes |
 |---|---|---|
 | `dataset_values` | `values` | requires `column`; `limit` 1–100 default 20 |
 | `dataset_sample` | `sample` | `n` 1–20 default 10; optional `seed`, `stratifyBy` |
-| `dataset_join` | `join` | writes new dataset; returns ids + counts only |
+| `dataset_join` | `join` | writes new dataset; returns ids + counts only; `how` inner\|left\|anti\|semi |
 | `dataset_profile` | `profile` | optional `highCardinalityThreshold` (default 200) |
 | `dataset_dedup` | `dedup` | optional `keyColumns` (1–16); `sampleLimit` integer 1–20 default 5 |
 | `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel`; `sampleLimit` integer 1–20 default 10 |
+| `dataset_corr` | `corr` | 2..16 numeric-capable columns; `method` pearson\|spearman; `pairwise` complete\|omit; `minNumeric` integer ≥2 default 2 |
+| `dataset_crosstab` | `crosstab` | `rows`/`cols` required and distinct; `top` 1–50 default 20; `minCount` ≥1 default 1; `dropNull` boolean default true |
 
 `transform_agg` `spec` string gains optional `mutate` and time-period
 `groupBy` objects (see §4 `agg`). Tool-layer `validateAggSpec` must reject
@@ -367,7 +410,9 @@ profile root is known. The deny list is a defensive path guard only; see
 - Arbitrary code execution
 - Write-side SQL or mutating external systems
 - Parquet (planned behind a feature flag; still exit 4 in this version)
-- Correlation matrices, crosstab, diff, anti/semi-join, window functions
-- UDF / JS / Python expressions
+- Window functions, UDF / JS / Python expressions, diff
+- Full correlation-matrix export, p-values / confidence intervals
+- Crosstab with three or more dimensions
 
-(Duplicate detection and outlier detection shipped in v0.1.3 via `dedup` / `outliers`.)
+(Duplicate detection, outlier detection shipped in v0.1.3; correlation, crosstab,
+and anti/semi join shipped in v0.1.4.)

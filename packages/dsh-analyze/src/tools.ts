@@ -877,7 +877,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       description:
         'Equi-join two datasets on shared key column(s). Always writes a new datasetId ' +
         '(producedBy=join). Returns only the new id + row/column counts — never full rows. ' +
-        'how: inner (default) or left. Null keys never match.',
+        'how: inner (default), left, anti, semi. anti/semi keep left rows only. Null keys never match.',
       parameters: {
         type: 'object',
         properties: {
@@ -888,7 +888,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             items: { type: 'string' },
             description: 'Non-empty list of column names present on both sides.',
           },
-          how: { type: 'string', enum: ['inner', 'left'], description: 'Default inner.' },
+          how: {
+            type: 'string',
+            enum: ['inner', 'left', 'anti', 'semi'],
+            description:
+              'Default inner. anti/semi keep left rows only (no right payload columns); null keys never match.',
+          },
           outLabel: { type: 'string', description: 'Optional label stored on the new dataset.' },
         },
         required: ['leftDatasetId', 'rightDatasetId', 'on'],
@@ -942,8 +947,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           throw err
         }
         const how = a.how ?? 'inner'
-        if (how !== 'inner' && how !== 'left') {
-          const err = new Error('analysis/invalid-args: how must be inner|left') as Error & { code?: string }
+        if (how !== 'inner' && how !== 'left' && how !== 'anti' && how !== 'semi') {
+          const err = new Error('analysis/invalid-args: how must be inner|left|anti|semi') as Error & { code?: string }
           err.code = 'analysis/invalid-args'
           throw err
         }
@@ -1234,6 +1239,271 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         const sampleLimit = validateSampleLimit(a.sampleLimit, 10, limits.maxSampleRows)
         cliArgs.push('--sample-limit', String(sampleLimit))
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_corr: {
+      name: 'dataset_corr',
+      description:
+        'Pairwise correlations among numeric-capable columns (Pearson or Spearman). ' +
+        'Returns top pairs sorted by |r| with sample size n — never a full matrix dump beyond the pair cap. ' +
+        'Use to find co-moving numeric signals before deeper agg.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '2..16 numeric-capable column names.',
+          },
+          method: {
+            type: 'string',
+            enum: ['pearson', 'spearman'],
+            description: 'Default pearson.',
+          },
+          pairwise: {
+            type: 'string',
+            enum: ['complete', 'omit'],
+            description: 'complete = per-pair complete rows; omit = listwise (all columns non-null).',
+          },
+          minNumeric: {
+            type: 'number',
+            description: 'Pairs with n below this report r=null (default 2).',
+          },
+        },
+        required: ['datasetId', 'columns'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            method: { type: 'string' },
+            pairwise: { type: 'string' },
+            columns: { type: 'array', items: { type: 'string' } },
+            pairs: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            truncated: { type: 'boolean' },
+          },
+          required: ['datasetId', 'method', 'pairs'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            method?: string
+            pairwise?: string
+            pairs?: Array<{ columns: string[]; n: number; r: number | null; degenerate?: boolean }>
+            truncated?: boolean
+          }
+          const lines = (v.pairs ?? []).map((p) =>
+            `- ${p.columns.join('×')}: r=${p.r == null ? 'null' : p.r} n=${p.n}` +
+              (p.degenerate ? ' (degenerate)' : ''),
+          )
+          return textRender(
+            `corr ${v.datasetId} method=${v.method ?? 'pearson'} pairwise=${v.pairwise ?? 'complete'}` +
+              (v.truncated ? ' [pairs truncated]' : '') +
+              '\n' +
+              (lines.join('\n') || '  (no pairs)'),
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          datasetId: string
+          columns: string[]
+          method?: string
+          pairwise?: string
+          minNumeric?: number
+        }
+        validateDatasetId(a.datasetId)
+        if (!Array.isArray(a.columns) || a.columns.length < 2 || a.columns.length > limits.maxCorrColumns) {
+          const err = new Error(
+            `analysis/invalid-args: columns must be 2..${limits.maxCorrColumns} names`,
+          ) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (a.columns.some(c => typeof c !== 'string' || !c.trim())) {
+          const err = new Error('analysis/invalid-args: columns entries must be non-empty strings') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (new Set(a.columns).size !== a.columns.length) {
+          const dup = a.columns.find((c, i) => a.columns.indexOf(c) !== i)
+          const err = new Error(`analysis/invalid-args: duplicate column ${dup}`) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const method = a.method ?? 'pearson'
+        if (method !== 'pearson' && method !== 'spearman') {
+          const err = new Error('analysis/invalid-args: method must be pearson|spearman') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const pairwise = a.pairwise ?? 'complete'
+        if (pairwise !== 'complete' && pairwise !== 'omit') {
+          const err = new Error('analysis/invalid-args: pairwise must be complete|omit') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const cliArgs = [
+          'corr',
+          '--dataset-id',
+          a.datasetId,
+          '--columns',
+          a.columns.join(','),
+          '--method',
+          method,
+          '--pairwise',
+          pairwise,
+        ]
+        if (a.minNumeric !== undefined && a.minNumeric !== null) {
+          const n = Number(a.minNumeric)
+          if (!Number.isInteger(n) || n < 2) {
+            const err = new Error('analysis/invalid-args: minNumeric must be integer >= 2') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--min-numeric', String(n))
+        }
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_crosstab: {
+      name: 'dataset_crosstab',
+      description:
+        'Two-column contingency table (frequency cross-tab). Returns top categories per dimension, ' +
+        'a compact matrix, margins, and top cells — never a full cartesian dump. ' +
+        'Use to compare two categorical / low-cardinality columns.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          rows: { type: 'string', description: 'Row category column name.' },
+          cols: { type: 'string', description: 'Column category column name (must differ from rows).' },
+          top: {
+            type: 'number',
+            description: '1–50 categories per dimension (default 20).',
+          },
+          minCount: {
+            type: 'number',
+            description: 'Cells with count below this are omitted from topCells (default 1).',
+          },
+          dropNull: {
+            type: 'boolean',
+            description: 'Default true: exclude rows with null on either side (counted in nullRowCount).',
+          },
+        },
+        required: ['datasetId', 'rows', 'cols'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowColumn: { type: 'string' },
+            colColumn: { type: 'string' },
+            rowCategories: { type: 'array' },
+            colCategories: { type: 'array' },
+            matrix: { type: 'array', items: { type: 'array', items: { type: 'number' } } },
+            topCells: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            truncated: { type: 'boolean' },
+            nullRowCount: { type: 'number' },
+          },
+          required: ['datasetId', 'rowColumn', 'colColumn', 'matrix'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowColumn: string
+            colColumn: string
+            rowCategories?: unknown[]
+            colCategories?: unknown[]
+            matrix?: number[][]
+            grandTotal?: number
+            truncated?: boolean
+            nullRowCount?: number
+          }
+          const rows = (v.rowCategories ?? []).map(String)
+          const cols = (v.colCategories ?? []).map(String)
+          const header = ['', ...cols].join('\t')
+          const body = rows
+            .map((r, i) => [r, ...(v.matrix?.[i] ?? [])].join('\t'))
+            .join('\n')
+          return textRender(
+            `crosstab ${v.datasetId}: ${v.rowColumn} × ${v.colColumn} ` +
+              `(grandTotal=${v.grandTotal ?? '?'} nulls=${v.nullRowCount ?? 0}` +
+              (v.truncated ? ', truncated' : '') +
+              ')\n' +
+              header +
+              '\n' +
+              body,
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          datasetId: string
+          rows: string
+          cols: string
+          top?: number
+          minCount?: number
+          dropNull?: boolean
+        }
+        validateDatasetId(a.datasetId)
+        if (typeof a.rows !== 'string' || !a.rows.trim()) {
+          const err = new Error('analysis/invalid-args: rows required') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (typeof a.cols !== 'string' || !a.cols.trim()) {
+          const err = new Error('analysis/invalid-args: cols required') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (a.rows.trim() === a.cols.trim()) {
+          const err = new Error('analysis/invalid-args: rows and cols must be different columns') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const top = a.top === undefined || a.top === null ? 20 : Number(a.top)
+        if (!Number.isInteger(top) || top < 1 || top > limits.maxCrosstabTop) {
+          const err = new Error(
+            `analysis/invalid-args: top must be integer 1..${limits.maxCrosstabTop}`,
+          ) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const minCount = a.minCount === undefined || a.minCount === null ? 1 : Number(a.minCount)
+        if (!Number.isInteger(minCount) || minCount < 1) {
+          const err = new Error('analysis/invalid-args: minCount must be integer >= 1') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const dropNull = a.dropNull !== false
+        const cliArgs = [
+          'crosstab',
+          '--dataset-id',
+          a.datasetId,
+          '--rows',
+          a.rows.trim(),
+          '--cols',
+          a.cols.trim(),
+          '--top',
+          String(top),
+          '--min-count',
+          String(minCount),
+          '--drop-null',
+          dropNull ? 'true' : 'false',
+        ]
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },

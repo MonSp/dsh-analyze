@@ -749,3 +749,249 @@ test('dataset_dedup / outliers reject invalid sampleLimit before spawn', async (
     rmSync(ws, { recursive: true, force: true })
   }
 })
+
+test('dataset_corr pearson happy path + rejects bad method', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'c.csv'), 'x,y\n1,2\n2,4\n3,5\n4,4\n5,5\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/c.csv' })
+    const res = await defs.dataset_corr.execute({
+      datasetId: ing.datasetId,
+      columns: ['x', 'y'],
+      method: 'pearson',
+    })
+    assert.equal(res.ok, true)
+    assert.equal(res.method, 'pearson')
+    assert.equal(res.pairs.length, 1)
+    assert.equal(res.pairs[0].n, 5)
+    assert.ok(Math.abs(res.pairs[0].r - 6 / Math.sqrt(60)) < 1e-9)
+    assert.equal(res.pairs[0].degenerate, false)
+    const rendered = defs.dataset_corr.output.render({}, res)
+    assert.match(rendered[0].text, /r=/)
+
+    await assert.rejects(
+      () => defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x', 'y'], method: 'nope' }),
+      /pearson\|spearman/,
+    )
+    await assert.rejects(
+      () => defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x'] }),
+      /2\.\.16/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_crosstab matrix + top=1 truncated + rejects same column', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'x.csv'), 'r,c\na,1\na,1\na,2\nb,2\nc,3\nc,3\nc,1\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/x.csv' })
+    const res = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'r',
+      cols: 'c',
+    })
+    assert.equal(res.grandTotal, 7)
+    assert.equal(res.cellCount, 7)
+    assert.deepEqual(res.matrix, [[2, 1, 0], [1, 0, 2], [0, 1, 0]])
+    const top1 = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'r',
+      cols: 'c',
+      top: 1,
+    })
+    assert.equal(top1.truncated, true)
+    assert.deepEqual(top1.rowCategories, ['a'])
+
+    await assert.rejects(
+      () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'r', cols: 'r' }),
+      /different columns/,
+    )
+    await assert.rejects(
+      () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'r', cols: 'c', top: 0 }),
+      /top must be integer/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_join how anti|semi left-only columns', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'l.csv'), 'k,vl\n1,L1\n2,L2\n3,L3\n,Lnull\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r.csv'), 'k,vr\n1,R1\n1,R1b\n2,R2\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/l.csv' })
+    const right = await defs.dataset_ingest.execute({ path: 'data/r.csv' })
+
+    const semi = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'semi',
+    })
+    assert.equal(semi.how, 'semi')
+    assert.equal(semi.rowCount, 2)
+    assert.equal(semi.columnCount, 2)
+    assert.ok(semi.columns.every(c => c.name === 'k' || c.name === 'vl'))
+
+    const anti = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'anti',
+    })
+    assert.equal(anti.how, 'anti')
+    assert.equal(anti.rowCount, 2)
+    assert.equal(anti.columnCount, 2)
+
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: left.datasetId,
+          rightDatasetId: right.datasetId,
+          on: ['k'],
+          how: 'outer',
+        }),
+      /inner\|left\|anti\|semi/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_join string keys with null substring still match', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    // CSV token "null" becomes a real null at ingest (both CLI and mock);
+    // keys that merely *contain* "null" must still join.
+    writeFileSync(join(ws, 'data', 'ls.csv'), 'k,vl\nnullable,L-nsh\nnullify,L-nfy\na,L-a\n,L-missing\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'rs.csv'), 'k,vr\nnullable,R-nsh\nnullify,R-nfy\nb,R-b\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/ls.csv' })
+    const right = await defs.dataset_ingest.execute({ path: 'data/rs.csv' })
+
+    const inner = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'inner',
+    })
+    assert.equal(inner.rowCount, 2, JSON.stringify(inner))
+
+    const head = await defs.dataset_head.execute({ datasetId: inner.datasetId, n: 10 })
+    const keys = head.rows.map(r => r[0]).sort()
+    assert.deepEqual(keys, ['nullable', 'nullify'])
+
+    const anti = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'anti',
+    })
+    // left a + missing key
+    assert.equal(anti.rowCount, 2)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_corr spearman + omit + rejects duplicate columns', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'c.csv'), 'x,y,z\n1,1,10\n2,3,10\n3,2,10\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/c.csv' })
+
+    const spearman = await defs.dataset_corr.execute({
+      datasetId: ing.datasetId,
+      columns: ['x', 'y'],
+      method: 'spearman',
+    })
+    assert.equal(spearman.method, 'spearman')
+    assert.ok(Math.abs(spearman.pairs[0].r - 0.5) < 1e-12, `r=${spearman.pairs[0].r}`)
+
+    // omit listwise with nulls: only one full row (x,y,z all present) → n=1 → r null
+    // complete x,y still sees rows 0 and 1 → n=2
+    writeFileSync(join(ws, 'data', 'm.csv'), 'x,y,z\n1,2,10\n2,4,\n3,,10\n', 'utf8')
+    const ing2 = await defs.dataset_ingest.execute({ path: 'data/m.csv' })
+    const omit = await defs.dataset_corr.execute({
+      datasetId: ing2.datasetId,
+      columns: ['x', 'y', 'z'],
+      pairwise: 'omit',
+    })
+    assert.equal(omit.pairwise, 'omit')
+    for (const p of omit.pairs) assert.equal(p.n, 1, JSON.stringify(p))
+    assert.equal(omit.pairs[0].r, null)
+
+    const complete = await defs.dataset_corr.execute({
+      datasetId: ing2.datasetId,
+      columns: ['x', 'y'],
+      pairwise: 'complete',
+    })
+    assert.equal(complete.pairs[0].n, 2)
+    assert.ok(Math.abs(complete.pairs[0].r - 1) < 1e-12)
+
+    await assert.rejects(
+      () => defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x', 'x'] }),
+      /duplicate/i,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_crosstab drop-null false + pipe categories stay distinct', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'x.csv'), 'r,c\na|b,1\na|b,2\nc|d,1\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/x.csv' })
+    const pipe = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'r',
+      cols: 'c',
+    })
+    assert.equal(pipe.grandTotal, 3)
+    assert.deepEqual(pipe.rowCategories, ['a|b', 'c|d'])
+    assert.deepEqual(pipe.matrix, [[1, 1], [1, 0]])
+
+    writeFileSync(join(ws, 'data', 'n.csv'), 'r,c\nx,1\nx,\n__null__,2\n', 'utf8')
+    const ing2 = await defs.dataset_ingest.execute({ path: 'data/n.csv' })
+    const withNull = await defs.dataset_crosstab.execute({
+      datasetId: ing2.datasetId,
+      rows: 'r',
+      cols: 'c',
+      dropNull: false,
+    })
+    assert.equal(withNull.nullRowCount, 0)
+    assert.equal(withNull.grandTotal, 3)
+    assert.equal(withNull.rowCategories.length, 2)
+    assert.equal(withNull.colCategories.length, 3)
+    assert.equal(withNull.cellCount, 3)
+    // matrix 2×3, not merged into a single __null__ row
+    assert.equal(withNull.matrix.length, 2)
+    assert.equal(withNull.matrix[0].length, 3)
+
+    const dropped = await defs.dataset_crosstab.execute({
+      datasetId: ing2.datasetId,
+      rows: 'r',
+      cols: 'c',
+    })
+    // only (x, null) is dropped; ("__null__", 2) stays
+    assert.equal(dropped.nullRowCount, 1)
+    assert.equal(dropped.grandTotal, 2)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})

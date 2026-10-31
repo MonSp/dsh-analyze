@@ -17,6 +17,8 @@ export interface AnalysisLimits {
   maxJoinOnColumns: number
   maxKeyColumns: number
   maxOutlierColumns: number
+  maxCorrColumns: number
+  maxCrosstabTop: number
 }
 
 export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
@@ -33,6 +35,8 @@ export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
   maxJoinOnColumns: 8,
   maxKeyColumns: 16,
   maxOutlierColumns: 32,
+  maxCorrColumns: 16,
+  maxCrosstabTop: 50,
 }
 
 export function clampHeadN(n: unknown, limits: AnalysisLimits): number {
