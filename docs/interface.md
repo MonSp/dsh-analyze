@@ -268,7 +268,7 @@ Flags: `--dataset-id` (required), `--high-cardinality-threshold <n>` (optional, 
 
 Exact whole-row or keyed duplicate detection. Samples only — never the full duplicate set.
 
-Flags: `--dataset-id` (required), `--key-columns a,b` (optional, 1–16 shared columns), `--sample-limit <n>` (1–20, default 5)
+Flags: `--dataset-id` (required), `--key-columns a,b` (optional, 1–16 shared columns), `--sample-limit <n>` (1–20, default 5; invalid integer → exit 2)
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"mode":"exact","keyColumns":null,"duplicateRowCount":0,"duplicateRowRate":0.0,"distinctRowCount":0,"duplicateRowCountGroups":0,"maxMultiplicity":1,"samples":[{"key":null,"count":2,"rows":[[…],[…]]}],"samplesTruncated":false}
@@ -285,7 +285,7 @@ Keyed mode uses `"mode":"keyed"`, `"keyColumns":["…"]`, and replaces `distinct
 
 Numeric outlier detection. Samples only; optional `--out` writes a new dataset.
 
-Flags: `--dataset-id` (required), `--columns a,b` (required, 1–32 numeric-capable), `--method iqr|zscore|mad` (default `iqr`), `--k <f>` (finite > 0; default 1.5 for iqr else 3.0), `--sample-limit <n>` (1–20, default 10), `--out <label>` (optional)
+Flags: `--dataset-id` (required), `--columns a,b` (required, 1–32 numeric-capable), `--method iqr|zscore|mad` (default `iqr`), `--k <f>` (finite > 0; default 1.5 for iqr else 3.0), `--sample-limit <n>` (1–20, default 10; invalid integer → exit 2), `--out <label>` (optional)
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"method":"iqr","k":1.5,"outDatasetId":null,"columns":[{"name":"…","dtype":"…","numericCount":0,"nullCount":0,"lowerBound":0,"upperBound":0,"outlierCount":0,"outlierRate":0.0,"degenerateIqr":false,"degenerateStd":false,"degenerateMad":false,"samples":[{"rowIndex":0,"value":0,"row":[…]}]}]}
@@ -336,8 +336,8 @@ The DSH plugin registers the same operations as tools:
 | `dataset_sample` | `sample` | `n` 1–20 default 10; optional `seed`, `stratifyBy` |
 | `dataset_join` | `join` | writes new dataset; returns ids + counts only |
 | `dataset_profile` | `profile` | optional `highCardinalityThreshold` (default 200) |
-| `dataset_dedup` | `dedup` | optional `keyColumns` (1–16); `sampleLimit` 1–20 default 5 |
-| `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel` |
+| `dataset_dedup` | `dedup` | optional `keyColumns` (1–16); `sampleLimit` integer 1–20 default 5 |
+| `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel`; `sampleLimit` integer 1–20 default 10 |
 
 `transform_agg` `spec` string gains optional `mutate` and time-period
 `groupBy` objects (see §4 `agg`). Tool-layer `validateAggSpec` must reject

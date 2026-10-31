@@ -122,6 +122,22 @@ function getFlag(args, name) {
   return i >= 0 ? args[i + 1] : undefined
 }
 
+function parseSampleLimit(raw, defaultN) {
+  if (raw === undefined) return defaultN
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    fail(2, 'analysis/invalid-args: --sample-limit must be integer 1..=20')
+  }
+  return Math.min(n, 20)
+}
+
+function envU64(key, legacyKey, fallback) {
+  const v = process.env[key] ?? process.env[legacyKey]
+  if (v === undefined || v === '') return fallback
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback
+}
+
 async function main() {
   const argv = process.argv.slice(2)
   let i = 0
@@ -835,7 +851,7 @@ async function main() {
     const id = getFlag(rest, '--dataset-id')
     if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
     const keyRaw = getFlag(rest, '--key-columns')
-    const sampleLimit = Math.min(20, Math.max(1, Number(getFlag(rest, '--sample-limit') || 5)))
+    const sampleLimit = parseSampleLimit(getFlag(rest, '--sample-limit'), 5)
     const { meta, table } = loadDataset(ws, id)
     const rowCount = table.rows.length
     let keyIdx = []
@@ -943,7 +959,7 @@ async function main() {
       k = Number(kRaw)
       if (!Number.isFinite(k) || k <= 0) fail(2, 'analysis/invalid-args: --k must be a finite number > 0')
     }
-    const sampleLimit = Math.min(20, Math.max(1, Number(getFlag(rest, '--sample-limit') || 10)))
+    const sampleLimit = parseSampleLimit(getFlag(rest, '--sample-limit'), 10)
     const outLabel = getFlag(rest, '--out')
     const { meta, table } = loadDataset(ws, id)
     const rowCount = table.rows.length
@@ -1036,6 +1052,8 @@ async function main() {
     if (outLabel !== undefined) {
       const outId = newId()
       const outRows = [...anyOutlier].sort((a, b) => a - b).map(ri => table.rows[ri])
+      const maxRows = envU64('DSH_ANALYZE_MAX_ROWS', 'INV_ANALYSIS_MAX_ROWS', 5_000_000)
+      if (outRows.length > maxRows) fail(3, 'analysis/limit: outlier dataset too large')
       writeDataset(ws, outId, { headers: table.headers, rows: outRows }, {
         sourceKind: 'outliers',
         sourcePath: `outliers:${id}`,

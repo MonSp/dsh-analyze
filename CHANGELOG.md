@@ -20,6 +20,8 @@ Data-quality increment for agent sessions (profile / dedup / outliers + long-tai
 - Version and `version` capabilities: `0.1.3` plus `profile`, `dedup`, `outliers`.
 - Public contract updated in `docs/interface.md` (v0.1.3).
 - Package version `dsh-analyze@0.1.3`.
+- `dedup` / `outliers` `--sample-limit` is strict: non-integer or `< 1` → exit 2
+  (was silently clamped to the default). Values `> 20` still clamp to 20.
 
 ## 0.1.2
 

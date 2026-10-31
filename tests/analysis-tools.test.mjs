@@ -671,6 +671,9 @@ test('dataset_outliers iqr flags extreme and --out writes dataset', async () => 
       outLabel: 'extreme',
     })
     assert.ok(withOut.outDatasetId)
+    assert.equal(typeof withOut.outDatasetId, 'string')
+    assert.match(withOut.outDatasetId, /^ds_/)
+    assert.equal(withOut.outRowCount, 1)
     const head = await defs.dataset_head.execute({ datasetId: withOut.outDatasetId, n: 5 })
     assert.equal(head.rowCount, 1)
     assert.equal(head.rows[0][0], 100)
@@ -715,6 +718,32 @@ test('dataset_outliers rejects bad method before spawn', async () => {
           method: 'nope',
         }),
       /iqr\|zscore\|mad/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_dedup / outliers reject invalid sampleLimit before spawn', async () => {
+  const ws = makeWorkspace()
+  try {
+    const defs = makeDefs(ws)
+    await assert.rejects(
+      () => defs.dataset_dedup.execute({ datasetId: 'ds_0123456789ab', sampleLimit: 0 }),
+      /sampleLimit must be integer/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_outliers.execute({
+          datasetId: 'ds_0123456789ab',
+          columns: ['a'],
+          sampleLimit: 0,
+        }),
+      /sampleLimit must be integer/,
+    )
+    await assert.rejects(
+      () => defs.dataset_dedup.execute({ datasetId: 'ds_0123456789ab', sampleLimit: 1.5 }),
+      /sampleLimit must be integer/,
     )
   } finally {
     rmSync(ws, { recursive: true, force: true })

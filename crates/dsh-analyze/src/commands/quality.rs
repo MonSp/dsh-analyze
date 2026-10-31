@@ -93,8 +93,6 @@ pub(crate) fn cmd_profile(workspace: &Path, args: &[String]) -> Result<String, u
         let mut bool_count = 0usize;
         let mut seen: HashSet<Value> = HashSet::new();
         let mut samples: Vec<Value> = Vec::new();
-        let mut has_numeric = false;
-        let mut has_non_numeric_non_null = false;
 
         for row in &table.rows {
             let v = row.get(ci).cloned().unwrap_or(Value::Null);
@@ -108,20 +106,10 @@ pub(crate) fn cmd_profile(workspace: &Path, args: &[String]) -> Result<String, u
             }
             match &v {
                 Value::Bool(_) => bool_count += 1,
-                Value::I64(_) => {
-                    numeric_count += 1;
-                    has_numeric = true;
-                }
-                Value::F64(_) => {
-                    numeric_count += 1;
-                    has_numeric = true;
-                }
+                Value::I64(_) | Value::F64(_) => numeric_count += 1,
                 Value::Str(s) => {
                     if s.trim().parse::<f64>().is_ok() {
                         numeric_count += 1;
-                        has_numeric = true;
-                    } else {
-                        has_non_numeric_non_null = true;
                     }
                 }
                 Value::Null => {}
@@ -188,14 +176,12 @@ pub(crate) fn cmd_profile(workspace: &Path, args: &[String]) -> Result<String, u
             nunique,
             json_f64_fixed(unique_rate),
             high_cardinality,
-            json_string(&type_stability),
+            json_string(type_stability),
             numeric_count,
             json_f64_fixed(numeric_share),
             bool_count,
             samples_json
         ));
-
-        let _ = (has_numeric, has_non_numeric_non_null);
     }
 
     // suspect primary keys: single-column unique non-null
@@ -317,10 +303,7 @@ fn classify_stability(table: &Table, ci: usize, nulls: usize) -> &'static str {
     if has_i64 && !has_f64 && !has_str {
         return "int";
     }
-    if has_f64 || (has_i64 && has_str) || (has_f64 && has_i64) {
-        return "float";
-    }
-    if has_i64 && has_f64 {
+    if has_f64 || (has_i64 && has_str) {
         return "float";
     }
     "mixed"
@@ -342,10 +325,15 @@ pub(crate) fn cmd_dedup(workspace: &Path, args: &[String]) -> Result<String, u8>
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --dataset-id required"),
     };
-    let sample_limit: usize = flag_value(args, "--sample-limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5)
-        .clamp(1, 20);
+    let sample_limit: usize = match flag_value(args, "--sample-limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(20),
+            _ => {
+                return fail(2, "analysis/invalid-args: --sample-limit must be integer 1..=20")
+            }
+        },
+        None => 5,
+    };
     let key_columns: Option<Vec<String>> = flag_value(args, "--key-columns").map(parse_column_list);
 
     if let Some(keys) = &key_columns {
@@ -376,8 +364,7 @@ pub(crate) fn cmd_dedup(workspace: &Path, args: &[String]) -> Result<String, u8>
                 .ok_or_else(|| {
                     eprintln!("analysis/invalid-args: unknown column {name}");
                     2u8
-                })
-                .map_err(|e| e)?;
+                })?;
             key_idx.push(idx);
         }
     }
@@ -386,7 +373,7 @@ pub(crate) fn cmd_dedup(workspace: &Path, args: &[String]) -> Result<String, u8>
     let rows_per_group_cap = 3usize;
     for (ri, row) in table.rows.iter().enumerate() {
         let key: Vec<Value> = if key_idx.is_empty() {
-            row.iter().cloned().collect()
+            row.to_vec()
         } else {
             key_idx
                 .iter()
@@ -546,10 +533,15 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
         },
         None => default_k,
     };
-    let sample_limit: usize = flag_value(args, "--sample-limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10)
-        .clamp(1, 20);
+    let sample_limit: usize = match flag_value(args, "--sample-limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(20),
+            _ => {
+                return fail(2, "analysis/invalid-args: --sample-limit must be integer 1..=20")
+            }
+        },
+        None => 10,
+    };
     let out_label = flag_value(args, "--out").map(|s| s.to_string());
     let max_rows: usize =
         env_u64("DSH_ANALYZE_MAX_ROWS", "INV_ANALYSIS_MAX_ROWS", 5_000_000) as usize;
@@ -566,8 +558,7 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
             .ok_or_else(|| {
                 eprintln!("analysis/invalid-args: unknown column {name}");
                 2u8
-            })
-            .map_err(|e| e)?;
+            })?;
         col_idxs.push(idx);
     }
 
@@ -652,14 +643,11 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
                     } else {
                         lower = Some(mean - k * std);
                         upper = Some(mean + k * std);
-                        let lo = lower.unwrap();
-                        let hi = upper.unwrap();
                         for &(ri, n) in &series {
                             if (n - mean).abs() / std > k {
                                 outlier_flags.push((ri, n));
                             }
                         }
-                        let _ = (lo, hi);
                     }
                 }
                 _ => {
@@ -676,12 +664,9 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
                     } else {
                         lower = Some(med - k * scale);
                         upper = Some(med + k * scale);
-                        let hi = upper.unwrap();
-                        let lo = lower.unwrap();
                         for &(ri, n) in &series {
                             if (n - med).abs() / scale > k {
                                 outlier_flags.push((ri, n));
-                                let _ = (lo, hi);
                             }
                         }
                     }
@@ -754,7 +739,7 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
             1u8
         })?;
         out_row_count_json = format!(",\"outRowCount\":{}", result.rows.len());
-        out_dataset_id = new_id;
+        out_dataset_id = json_string(&new_id);
     }
 
     let columns_json = results

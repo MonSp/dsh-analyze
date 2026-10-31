@@ -98,6 +98,20 @@ function failMessage(e: unknown): never {
   throw err
 }
 
+/** Strict integer 1..=max for quality-tool sample limits (invalid → invalid-args). */
+export function validateSampleLimit(n: unknown, def: number, max: number): number {
+  if (n === undefined || n === null) return def
+  const raw = typeof n === 'number' ? n : Number(n)
+  if (!Number.isInteger(raw) || raw < 1 || raw > max) {
+    const err = new Error(
+      `analysis/invalid-args: sampleLimit must be integer 1..${max}`,
+    ) as Error & { code?: string }
+    err.code = 'analysis/invalid-args'
+    throw err
+  }
+  return raw
+}
+
 /** Whitelist arithmetic expression: identifiers, numbers, + - * /, parens, unary minus. */
 export function validateMutateExpr(expr: unknown): string {
   if (typeof expr !== 'string' || !expr.trim() || expr.length > 512) {
@@ -1097,7 +1111,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           }
           cliArgs.push('--key-columns', a.keyColumns.join(','))
         }
-        const sampleLimit = clampSampleN(a.sampleLimit ?? 5, limits)
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 5, limits.maxSampleRows)
         cliArgs.push('--sample-limit', String(sampleLimit))
         const result = await run(cliArgs, exec?.signal)
         return result.data
@@ -1217,7 +1231,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           }
           cliArgs.push('--k', String(a.k))
         }
-        const sampleLimit = clampSampleN(a.sampleLimit ?? 10, limits)
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 10, limits.maxSampleRows)
         cliArgs.push('--sample-limit', String(sampleLimit))
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
         const result = await run(cliArgs, exec?.signal)
