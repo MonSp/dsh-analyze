@@ -218,6 +218,104 @@ fn series_rolling_null_in_window_is_null() {
     assert_rows_json(&head, "[[1,10,null],[2,null,null],[3,20,null],[4,30,50]]");
 }
 
+/// Column / `as` names equal to op field names must not confuse key lookup.
+/// Regression: substring extract matched `"column":"periods"` as the periods key
+/// and silently fell back to periods=1.
+#[test]
+fn series_op_field_name_collision_column_and_as() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "periods,v\n1,10\n2,20\n3,30\n4,40\n5,50\n");
+    let id = ingest(&ws, "data/s.csv");
+
+    // Lag the column literally named `periods` by 3 steps.
+    let ops = r#"[{"fn":"lag","column":"periods","as":"y","periods":3}]"#;
+    let out = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id, "--order-by", "v", "--ops", ops],
+    );
+    let head = head_json(&ws, &extract_ds_id(&out).unwrap());
+    // ordered by v: periods col = 1,2,3,4,5 → lag3 = null,null,null,1,2
+    assert_rows_json(
+        &head,
+        "[[1,10,null],[2,20,null],[3,30,null],[4,40,1],[5,50,2]]",
+    );
+
+    // `as` named `periods` must not swallow the periods key either.
+    // (Use a dataset without a source column named `periods` so `as` is legal.)
+    write_csv(&ws, "as.csv", "t,v\n1,10\n2,20\n3,30\n4,40\n5,50\n");
+    let id_as = ingest(&ws, "data/as.csv");
+    let ops2 = r#"[{"fn":"lag","column":"v","as":"periods","periods":2}]"#;
+    let out2 = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id_as, "--order-by", "t", "--ops", ops2],
+    );
+    let head2 = head_json(&ws, &extract_ds_id(&out2).unwrap());
+    assert_rows_json(
+        &head2,
+        "[[1,10,null],[2,20,null],[3,30,10],[4,40,20],[5,50,30]]",
+    );
+
+    // rolling window/agg keys with column named `window`.
+    write_csv(&ws, "w.csv", "window,v\n1,10\n2,20\n3,30\n");
+    let id_w = ingest(&ws, "data/w.csv");
+    let ops3 = r#"[{"fn":"rolling","column":"window","window":2,"agg":"max","as":"m"}]"#;
+    let out3 = run_ok(
+        &ws,
+        &["series", "--dataset-id", &id_w, "--order-by", "v", "--ops", ops3],
+    );
+    let head3 = head_json(&ws, &extract_ds_id(&out3).unwrap());
+    assert_rows_json(&head3, "[[1,10,null],[2,20,2],[3,30,3]]");
+}
+
+/// `--ops` as workspace-relative file path with UTF-8 BOM.
+#[test]
+fn series_ops_file_path_with_bom() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n2,20\n3,30\n");
+    let id = ingest(&ws, "data/s.csv");
+    let ops_path = ws.join("ops.json");
+    fs::write(
+        &ops_path,
+        "\u{feff}[{\"fn\":\"lag\",\"column\":\"v\",\"periods\":1,\"as\":\"v_lag\"}]",
+    )
+    .unwrap();
+    let out = run_ok(
+        &ws,
+        &[
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            "ops.json",
+        ],
+    );
+    let head = head_json(&ws, &extract_ds_id(&out).unwrap());
+    assert_rows_json(&head, "[[1,10,null],[2,20,10],[3,30,20]]");
+}
+
+/// `as` colliding with an existing source column is rejected.
+#[test]
+fn series_as_collides_with_source_column() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n");
+    let id = ingest(&ws, "data/s.csv");
+    run_fail(
+        &ws,
+        &[
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            r#"[{"fn":"lag","column":"v","as":"v"}]"#,
+        ],
+        2,
+    );
+}
+
 #[test]
 fn series_pct_change_zero_prev_and_incomplete_window() {
     let ws = temp_workspace();

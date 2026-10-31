@@ -1,16 +1,17 @@
 //! Time-series transforms: lag / lead / diff / pct_change / rolling (v0.1.5).
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::Path;
 
 use crate::cli::{env_u64, fail, flag_value};
 use crate::commands::load_or_fail;
 use crate::dataset::{
-    ensure_within_workspace, json_string, new_dataset_id, save_meta, write_table_parquet_placeholder,
-    Column, Meta, Table, Value,
+    ensure_within_workspace, json_string, new_dataset_id, parse_json_object, save_meta,
+    write_table_parquet_placeholder, Column, Meta, Table, Value,
 };
+use crate::expr::validate_as_name;
 
 const NULL: Value = Value::Null;
 const MAX_OPS: usize = 8;
@@ -34,80 +35,32 @@ struct SeriesOp {
     periods: usize,
 }
 
-fn is_valid_as(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if name.is_empty() || name.len() > 64 {
-        return false;
+fn map_str(map: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, String> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(Value::Str(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("analysis/invalid-args: {key} must be a string")),
     }
-    let first = bytes[0];
-    if !(first.is_ascii_alphabetic() || first == b'_') {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-fn extract_str(obj: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let idx = obj.find(&needle)?;
-    let after = obj[idx + needle.len()..].trim_start();
-    if !after.starts_with(':') {
-        return None;
-    }
-    let after = after[1..].trim_start();
-    if !after.starts_with('"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut chars = after[1..].chars();
-    while let Some(c) = chars.next() {
-        if c == '"' {
-            break;
+fn map_usize(map: &BTreeMap<String, Value>, key: &str) -> Result<Option<usize>, String> {
+    match map.get(key) {
+        None => Ok(None),
+        // Do not compare against `usize::MAX as i64` — on 64-bit that wraps to -1.
+        Some(Value::I64(n)) if *n >= 0 => Ok(Some(*n as usize)),
+        Some(Value::F64(f))
+            if f.fract() == 0.0 && *f >= 0.0 && *f <= usize::MAX as f64 =>
+        {
+            Ok(Some(*f as usize))
         }
-        if c == '\\' {
-            if let Some(n) = chars.next() {
-                out.push(n);
-            }
-        } else {
-            out.push(c);
-        }
+        _ => Err(format!(
+            "analysis/invalid-args: {key} must be a non-negative integer"
+        )),
     }
-    Some(out)
 }
 
-fn extract_usize(obj: &str, key: &str) -> Result<Option<usize>, String> {
-    let needle = format!("\"{key}\"");
-    let Some(idx) = obj.find(&needle) else {
-        return Ok(None);
-    };
-    let after = obj[idx + needle.len()..].trim_start();
-    if !after.starts_with(':') {
-        return Ok(None);
-    }
-    let after = after[1..].trim_start();
-    let end = after
-        .find([',', '}', ']'])
-        .unwrap_or(after.len());
-    after[..end].trim().parse::<usize>().map(Some).map_err(|_| {
-        format!("analysis/invalid-args: {key} must be a non-negative integer")
-    })
-}
-
-fn has_unknown_keys(obj: &str, allowed: &[&str]) -> bool {
-    // Cheap check: any "key": not in allowed set → reject. Best-effort for agent errors.
-    let mut rest = obj;
-    while let Some(q) = rest.find('"') {
-        let after = &rest[q + 1..];
-        let Some(end) = after.find('"') else { break };
-        let key = &after[..end];
-        let after_key = &after[end + 1..];
-        if after_key.trim_start().starts_with(':') && !allowed.contains(&key) {
-            return true;
-        }
-        rest = &after[end + 1..];
-    }
-    false
+fn has_unknown_keys(map: &BTreeMap<String, Value>, allowed: &[&str]) -> bool {
+    map.keys().any(|k| !allowed.contains(&k.as_str()))
 }
 
 fn split_objects(arr: &str) -> Result<Vec<String>, String> {
@@ -184,19 +137,21 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
     let mut ops = Vec::with_capacity(objs.len());
     let mut names: Vec<String> = Vec::new();
     for obj in &objs {
-        if !obj.trim_start().starts_with('{') {
-            return Err("analysis/invalid-args: each op must be a JSON object".into());
-        }
-        let fn_name = extract_str(obj, "fn")
+        // Real flat-object parse (map keys), not substring search — column names
+        // may equal field names like "periods"/"window"/"agg".
+        let map = parse_json_object(obj).map_err(|_| {
+            "analysis/invalid-args: each op must be a JSON object with scalar fields".to_string()
+        })?;
+        let fn_name = map_str(&map, "fn")?
             .ok_or_else(|| "analysis/invalid-args: op requires fn".to_string())?;
-        let column = extract_str(obj, "column")
+        let column = map_str(&map, "column")?
             .ok_or_else(|| "analysis/invalid-args: op requires column".to_string())?;
-        let as_name = extract_str(obj, "as")
+        let as_name = map_str(&map, "as")?
             .ok_or_else(|| "analysis/invalid-args: op requires as".to_string())?;
         if column.trim().is_empty() {
             return Err("analysis/invalid-args: column must be non-empty".into());
         }
-        if !is_valid_as(&as_name) {
+        if !validate_as_name(&as_name) {
             return Err(format!(
                 "analysis/invalid-args: as must match [A-Za-z_][A-Za-z0-9_]* (<=64), got {as_name}"
             ));
@@ -208,10 +163,10 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
         }
         names.push(as_name.clone());
 
-        let periods = extract_usize(obj, "periods")?;
+        let periods = map_usize(&map, "periods")?;
         match fn_name.as_str() {
             "lag" | "lead" | "diff" | "pct_change" => {
-                if has_unknown_keys(obj, &["fn", "column", "as", "periods"]) {
+                if has_unknown_keys(&map, &["fn", "column", "as", "periods"]) {
                     return Err(format!(
                         "analysis/invalid-args: unknown field in op fn={fn_name}"
                     ));
@@ -236,7 +191,7 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
                 });
             }
             "rolling" => {
-                if has_unknown_keys(obj, &["fn", "column", "as", "window", "agg"]) {
+                if has_unknown_keys(&map, &["fn", "column", "as", "window", "agg"]) {
                     return Err(
                         "analysis/invalid-args: unknown field in op fn=rolling".into(),
                     );
@@ -244,7 +199,7 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
                 if periods.is_some() {
                     return Err("analysis/invalid-args: rolling takes window, not periods".into());
                 }
-                let window = extract_usize(obj, "window")?.ok_or_else(|| {
+                let window = map_usize(&map, "window")?.ok_or_else(|| {
                     "analysis/invalid-args: rolling requires window".to_string()
                 })?;
                 if !(1..=MAX_WINDOW).contains(&window) {
@@ -252,7 +207,7 @@ fn parse_ops(text: &str) -> Result<Vec<SeriesOp>, String> {
                         "analysis/invalid-args: window must be 1..={MAX_WINDOW}"
                     ));
                 }
-                let agg = extract_str(obj, "agg")
+                let agg = map_str(&map, "agg")?
                     .ok_or_else(|| "analysis/invalid-args: rolling requires agg".to_string())?;
                 if !matches!(agg.as_str(), "mean" | "sum" | "min" | "max") {
                     return Err(
@@ -664,4 +619,26 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         json_string(&order_by),
         ops.len()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ops_reads_integer_fields_from_map() {
+        let ops = parse_ops(r#"[{"fn":"lag","column":"v","periods":1,"as":"v_lag"}]"#)
+            .expect("parse");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].periods, 1);
+        assert_eq!(ops[0].column, "v");
+    }
+
+    #[test]
+    fn parse_ops_column_named_periods_uses_real_key() {
+        let ops = parse_ops(r#"[{"fn":"lag","column":"periods","as":"y","periods":3}]"#)
+            .expect("parse");
+        assert_eq!(ops[0].column, "periods");
+        assert_eq!(ops[0].periods, 3);
+    }
 }
