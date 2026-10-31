@@ -1100,6 +1100,7 @@ async function main() {
     if (!columnsRaw) fail(2, 'analysis/invalid-args: --columns required')
     const columns = columnsRaw.split(',').map(s => s.trim()).filter(Boolean)
     if (columns.length < 2 || columns.length > 16) fail(2, 'analysis/invalid-args: --columns must list 2..16 columns')
+    if (new Set(columns).size !== columns.length) fail(2, 'analysis/invalid-args: duplicate column in --columns')
     const method = getFlag(rest, '--method') || 'pearson'
     if (method !== 'pearson' && method !== 'spearman') fail(2, 'analysis/invalid-args: --method must be pearson|spearman')
     const pairwise = getFlag(rest, '--pairwise') || 'complete'
@@ -1215,7 +1216,7 @@ async function main() {
           r = out.r
           degenerate = out.degenerate
         }
-        pairs.push({ columns: [columns[i], columns[j]], n, r, degenerate })
+        pairs.push({ columns: [columns[i], columns[j]], n, r, degenerate, _i: i, _j: j })
       }
     }
     pairs.sort((a, b) => {
@@ -1223,8 +1224,13 @@ async function main() {
       const br = b.r === null ? -1 : Math.abs(b.r)
       if (ar !== br) return br - ar
       if (a.n !== b.n) return b.n - a.n
-      return 0
+      if (a._i !== b._i) return a._i - b._i
+      return a._j - b._j
     })
+    for (const p of pairs) {
+      delete p._i
+      delete p._j
+    }
     const truncated = pairs.length > 50
     pairs.length = Math.min(pairs.length, 50)
     console.log(json({
@@ -1281,8 +1287,12 @@ async function main() {
     const colFirst = new Map()
     let nullRowCount = 0
     let seq = 0
+    // Null uses a non-printable sentinel (not "__null__") so a literal
+    // string category cannot collide. Values stay JSON text; the cell
+    // key is JSON.stringify([rowKey, colKey]) so pipes in values are safe.
+    const NULL_KEY = String.fromCharCode(0)
     const keyOf = (v) => {
-      if (v === null || v === undefined) return dropNull ? null : '__null__'
+      if (v === null || v === undefined) return NULL_KEY
       return JSON.stringify(v)
     }
     for (const row of table.rows) {
@@ -1294,9 +1304,8 @@ async function main() {
       }
       const rk = keyOf(rv)
       const ck = keyOf(cv)
-      const ck2 = rk === null || ck === null ? null : `${rk}|${ck}`
-      if (ck2 === null) continue
-      cellCounts.set(ck2, (cellCounts.get(ck2) || 0) + 1)
+      const cellKey = JSON.stringify([rk, ck])
+      cellCounts.set(cellKey, (cellCounts.get(cellKey) || 0) + 1)
       rowMarg.set(rk, (rowMarg.get(rk) || 0) + 1)
       colMarg.set(ck, (colMarg.get(ck) || 0) + 1)
       if (!rowFirst.has(rk)) rowFirst.set(rk, seq)
@@ -1321,8 +1330,8 @@ async function main() {
     let truncated = distinctRows > top || distinctCols > top
     const matrix = rowCates.map(() => colCates.map(() => 0))
     let cellCount = 0
-    for (const [ck, n] of cellCounts) {
-      const [rk, ckv] = ck.split('|')
+    for (const [cellKey, n] of cellCounts) {
+      const [rk, ckv] = JSON.parse(cellKey)
       const i = rowCates.findIndex(x => x === rk)
       const j = colCates.findIndex(x => x === ckv)
       if (i < 0 || j < 0) {
@@ -1336,7 +1345,7 @@ async function main() {
     const colTotals = colCates.map((_, j) => matrix.reduce((a, row) => a + row[j], 0))
     const grandTotal = rowTotals.reduce((a, b) => a + b, 0)
     const decode = (k) => {
-      if (k === '__null__') return '__null__'
+      if (k === NULL_KEY) return '__null__'
       return JSON.parse(k)
     }
     const topCells = []
