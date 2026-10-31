@@ -18,6 +18,8 @@ export const ANALYSIS_TOOL_NAMES = [
   'dataset_profile',
   'dataset_dedup',
   'dataset_outliers',
+  'dataset_corr',
+  'dataset_crosstab',
 ] as const
 
 export type AnalysisToolName = (typeof ANALYSIS_TOOL_NAMES)[number]
