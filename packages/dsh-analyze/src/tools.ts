@@ -1332,6 +1332,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           err.code = 'analysis/invalid-args'
           throw err
         }
+        if (new Set(a.columns).size !== a.columns.length) {
+          const dup = a.columns.find((c, i) => a.columns.indexOf(c) !== i)
+          const err = new Error(`analysis/invalid-args: duplicate column ${dup}`) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
         const method = a.method ?? 'pearson'
         if (method !== 'pearson' && method !== 'spearman') {
           const err = new Error('analysis/invalid-args: method must be pearson|spearman') as Error & { code?: string }
