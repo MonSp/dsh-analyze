@@ -281,12 +281,11 @@ Flags: `--dataset-id` (required), `--rows <col>` (required), `--cols <col>` (req
 {"ok":true,"datasetId":"ds_…","rowCount":N,"rowColumn":"a","colColumn":"b","rowCategories":["x","y"],"colCategories":["1","2"],"matrix":[[c00,c01],[c10,c11]],"rowTotals":[…],"colTotals":[…],"grandTotal":N,"cellCount":N,"truncated":true,"nullRowCount":0,"topCells":[{"row":"x","col":"1","count":10}]}
 ```
 
-- Categories: distinct non-null `Value` JSON forms (same encoding as `values`); selected by marginal count desc, then first-seen. Length ≤ `--top`.
+- Categories: distinct `Value` JSON forms (same encoding as `values`); selected by marginal count desc, then first-seen. Length ≤ `--top`. With the default `--drop-null true`, only non-null categories appear. With `--drop-null false`, null participates as JSON string category `__null__` (a data string `"__null__"` is a separate category with the same label). Mixed numeric kinds that share a JSON form (e.g. integer `1` vs float `1.0`) may yield repeated labels in the category list.
 - `matrix` is `len(rowCategories) × len(colCategories)`; margins only cover the kept grid.
 - `truncated`: distinct categories exceeded `--top` or cells fell outside the selected grid.
 - `topCells`: cells with `count >= --min-count`, count desc, cap 50.
-- `--drop-null true`: rows with null on either side excluded → `nullRowCount`.
-- `--drop-null false`: null participates as category `__null__`; `nullRowCount` stays 0.
+- Nulls: `--drop-null true` (default) excludes rows with null on either side → counted in `nullRowCount`; `--drop-null false` keeps them as the `__null__` category and leaves `nullRowCount` at 0.
 - Algorithm: one `HashMap` pass over cell pairs — never materializes full cartesian of raw distinct values.
 
 ### `profile`
