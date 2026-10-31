@@ -867,6 +867,43 @@ test('dataset_join how anti|semi left-only columns', async () => {
   }
 })
 
+test('dataset_join string keys with null substring still match', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    // CSV token "null" becomes a real null at ingest (both CLI and mock);
+    // keys that merely *contain* "null" must still join.
+    writeFileSync(join(ws, 'data', 'ls.csv'), 'k,vl\nnullable,L-nsh\nnullify,L-nfy\na,L-a\n,L-missing\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'rs.csv'), 'k,vr\nnullable,R-nsh\nnullify,R-nfy\nb,R-b\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/ls.csv' })
+    const right = await defs.dataset_ingest.execute({ path: 'data/rs.csv' })
+
+    const inner = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'inner',
+    })
+    assert.equal(inner.rowCount, 2, JSON.stringify(inner))
+
+    const head = await defs.dataset_head.execute({ datasetId: inner.datasetId, n: 10 })
+    const keys = head.rows.map(r => r[0]).sort()
+    assert.deepEqual(keys, ['nullable', 'nullify'])
+
+    const anti = await defs.dataset_join.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+      how: 'anti',
+    })
+    // left a + missing key
+    assert.equal(anti.rowCount, 2)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
 test('dataset_corr spearman + omit + rejects duplicate columns', async () => {
   const ws = makeWorkspace()
   try {

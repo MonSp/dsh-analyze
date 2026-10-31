@@ -654,15 +654,17 @@ async function main() {
     const keyOf = (row, idxs) => idxs.map(i => row[i] === undefined ? null : row[i])
     const rightMap = new Map()
     right.table.rows.forEach((row, ri) => {
-      const k = JSON.stringify(keyOf(row, rKey))
-      if (k.includes('null')) return
+      // Value-based null only — string keys like "null"/"nullable" are valid.
+      const parts = keyOf(row, rKey)
+      if (parts.some(v => v === null || v === undefined)) return
+      const k = JSON.stringify(parts)
       if (!rightMap.has(k)) rightMap.set(k, [])
       rightMap.get(k).push(ri)
     })
     const outRows = []
     for (const lrow of left.table.rows) {
       const k = keyOf(lrow, lKey)
-      if (k.some(v => v === null)) {
+      if (k.some(v => v === null || v === undefined)) {
         if (how === 'left') outRows.push([...lrow, ...rightPayload.map(() => null)])
         else if (how === 'anti') outRows.push([...lrow])
         if (outRows.length > maxRows) fail(3, 'analysis/limit: join result too large')

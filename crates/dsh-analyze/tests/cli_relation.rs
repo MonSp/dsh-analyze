@@ -357,6 +357,75 @@ fn join_semi_anti_left_only_and_null_keys() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+/// String keys that merely contain "null" are valid join keys (only real Null is missing).
+#[test]
+fn join_string_keys_with_null_substring() {
+    let ws = temp_workspace();
+    write_csv(
+        &ws,
+        "ls.csv",
+        "k,vl\nnullable,L-nsh\nnullify,L-nfy\na,L-a\n,L-missing\n",
+    );
+    write_csv(&ws, "rs.csv", "k,vr\nnullable,R-nsh\nnullify,R-nfy\nb,R-b\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/ls.csv",
+            "--dataset-id",
+            "ds_left000000000001",
+        ],
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/rs.csv",
+            "--dataset-id",
+            "ds_right00000000001",
+        ],
+    );
+
+    let inner = run_ok(
+        &ws,
+        &[
+            "join",
+            "--left",
+            "ds_left000000000001",
+            "--right",
+            "ds_right00000000001",
+            "--on",
+            "k",
+            "--how",
+            "inner",
+        ],
+    );
+    assert_eq!(json_usize_field(&inner, "rowCount"), Some(2), "got: {inner}");
+    let id = json_str_field(&inner, "datasetId").expect("inner id");
+    let head = run_ok(&ws, &["head", "--dataset-id", &id, "--n", "5"]);
+    assert!(head.contains("nullable") && head.contains("nullify"), "got: {head}");
+
+    let anti = run_ok(
+        &ws,
+        &[
+            "join",
+            "--left",
+            "ds_left000000000001",
+            "--right",
+            "ds_right00000000001",
+            "--on",
+            "k",
+            "--how",
+            "anti",
+        ],
+    );
+    assert_eq!(json_usize_field(&anti, "rowCount"), Some(2), "got: {anti}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
 #[test]
 fn version_capabilities_include_corr_crosstab() {
     let out = {
