@@ -154,8 +154,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.4-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab'],
+      version: '0.1.5-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series'],
     }))
     return
   }
@@ -1375,6 +1375,162 @@ async function main() {
       truncated,
       nullRowCount,
       topCells,
+    }))
+    return
+  }
+
+  if (cmd === 'series') {
+    const id = getFlag(rest, '--dataset-id')
+    const orderBy = getFlag(rest, '--order-by')
+    const opsRaw = getFlag(rest, '--ops')
+    const outLabel = getFlag(rest, '--out')
+    if (!id || !orderBy || !opsRaw) fail(2, 'analysis/invalid-args: --dataset-id --order-by --ops required')
+    let opsText = opsRaw
+    if (!opsRaw.trimStart().startsWith('[')) {
+      const opsPath = within(ws, opsRaw)
+      if (!existsSync(opsPath)) fail(2, 'analysis/invalid-args: cannot read ops file')
+      opsText = readFileSync(opsPath, 'utf8').replace(/^﻿/, '')
+    }
+    let ops
+    try {
+      ops = JSON.parse(opsText)
+    } catch {
+      fail(2, 'analysis/invalid-args: bad ops JSON')
+    }
+    if (!Array.isArray(ops) || ops.length === 0) fail(2, 'analysis/invalid-args: ops must list at least one transform')
+    if (ops.length > 8) fail(2, 'analysis/invalid-args: ops must be 1..=8 transforms')
+    const { meta, table } = loadDataset(ws, id)
+    const orderIdx = table.headers.indexOf(orderBy)
+    if (orderIdx < 0) fail(2, `analysis/invalid-args: unknown order-by column ${orderBy}`)
+    const asRe = /^[A-Za-z_][A-Za-z0-9_]*$/
+    const names = new Set(table.headers)
+    const colIdxs = []
+    for (const op of ops) {
+      if (!op || typeof op !== 'object') fail(2, 'analysis/invalid-args: each op must be a JSON object')
+      if (!['lag', 'lead', 'diff', 'pct_change', 'rolling'].includes(op.fn)) {
+        fail(2, `analysis/invalid-args: unknown fn ${op.fn}`)
+      }
+      if (typeof op.column !== 'string' || !op.column) fail(2, 'analysis/invalid-args: op requires column')
+      if (typeof op.as !== 'string' || !asRe.test(op.as) || op.as.length > 64) {
+        fail(2, 'analysis/invalid-args: as must match [A-Za-z_][A-Za-z0-9_]* (<=64)')
+      }
+      if (names.has(op.as)) fail(2, `analysis/invalid-args: as column collides: ${op.as}`)
+      names.add(op.as)
+      const ci = table.headers.indexOf(op.column)
+      if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${op.column}`)
+      colIdxs.push(ci)
+      if (op.fn === 'rolling') {
+        if (op.periods !== undefined && op.periods !== null) fail(2, 'analysis/invalid-args: rolling takes window, not periods')
+        const window = Number(op.window)
+        if (!Number.isInteger(window) || window < 1 || window > 10000) {
+          fail(2, 'analysis/invalid-args: window must be 1..=10000')
+        }
+        if (!['mean', 'sum', 'min', 'max'].includes(op.agg)) {
+          fail(2, 'analysis/invalid-args: rolling agg must be mean|sum|min|max')
+        }
+      } else {
+        if (op.window !== undefined && op.window !== null) fail(2, `analysis/invalid-args: fn ${op.fn} does not take window`)
+        const periods = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
+        if (!Number.isInteger(periods) || periods < 1 || periods > 10000) {
+          fail(2, 'analysis/invalid-args: periods must be 1..=10000')
+        }
+      }
+    }
+
+    const typeRank = v => {
+      if (v === null || v === undefined) return 5
+      if (typeof v === 'boolean') return 0
+      if (typeof v === 'number') return 1
+      return 2
+    }
+    const cmpVal = (a, b) => {
+      const ra = typeRank(a)
+      const rb = typeRank(b)
+      if (ra !== rb) return ra - rb
+      if (ra === 5) return 0
+      if (ra === 0) return (a === b ? 0 : a ? 1 : -1)
+      if (ra === 1) return a === b ? 0 : a < b ? -1 : 1
+      return a < b ? -1 : a > b ? 1 : 0
+    }
+    const order = table.rows.map((_, i) => i).sort((i, j) => {
+      const c = cmpVal(table.rows[i][orderIdx] ?? null, table.rows[j][orderIdx] ?? null)
+      return c !== 0 ? c : i - j
+    })
+    const sorted = order.map(i => table.rows[i])
+    const n = sorted.length
+    const finite = v => {
+      if (v === null || v === undefined || typeof v === 'boolean') return null
+      const num = typeof v === 'number' ? v : Number(String(v).trim())
+      return Number.isFinite(num) ? num : null
+    }
+    const newCols = ops.map((op, k) => {
+      const ci = colIdxs[k]
+      const col = new Array(n).fill(null)
+      if (op.fn === 'lag') {
+        const p = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
+        for (let i = 0; i < n; i++) col[i] = i < p ? null : sorted[i - p][ci] ?? null
+      } else if (op.fn === 'lead') {
+        const p = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
+        for (let i = 0; i < n; i++) {
+          const j = i + p
+          col[i] = j >= n ? null : sorted[j][ci] ?? null
+        }
+      } else if (op.fn === 'diff') {
+        const p = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
+        for (let i = 0; i < n; i++) {
+          if (i < p) continue
+          const c = finite(sorted[i][ci])
+          const prev = finite(sorted[i - p][ci])
+          if (c !== null && prev !== null) col[i] = c - prev
+        }
+      } else if (op.fn === 'pct_change') {
+        const p = op.periods === undefined || op.periods === null ? 1 : Number(op.periods)
+        for (let i = 0; i < n; i++) {
+          if (i < p) continue
+          const c = finite(sorted[i][ci])
+          const prev = finite(sorted[i - p][ci])
+          if (c !== null && prev !== null && prev !== 0) col[i] = (c - prev) / prev
+        }
+      } else if (op.fn === 'rolling') {
+        const window = Number(op.window)
+        for (let i = 0; i < n; i++) {
+          const start = Math.max(0, i - window + 1)
+          const nums = []
+          for (let j = start; j <= i; j++) {
+            const v = finite(sorted[j][ci])
+            if (v !== null) nums.push(v)
+          }
+          if (nums.length < window) continue
+          if (op.agg === 'mean') col[i] = nums.reduce((a, b) => a + b, 0) / nums.length
+          else if (op.agg === 'sum') col[i] = nums.reduce((a, b) => a + b, 0)
+          else if (op.agg === 'min') col[i] = Math.min(...nums)
+          else col[i] = Math.max(...nums)
+        }
+      }
+      return col
+    })
+    const outHeaders = [...table.headers, ...ops.map(o => o.as)]
+    const outRows = sorted.map((row, i) => [...row, ...newCols.map(col => col[i])])
+    const newIdVal = newId()
+    writeDataset(ws, newIdVal, { headers: outHeaders, rows: outRows }, {
+      sourceKind: 'series',
+      sourcePath: `series:${id}`,
+      label: outLabel,
+      producedBy: 'series',
+      parentDatasetId: id,
+    })
+    console.log(json({
+      ok: true,
+      datasetId: newIdVal,
+      rowCount: outRows.length,
+      columnCount: outHeaders.length,
+      columns: outHeaders.map((name, idx) => ({
+        name,
+        dtype: inferDtype(outRows.map(r => r[idx])),
+      })),
+      sourceDatasetId: id,
+      orderBy,
+      opCount: ops.length,
     }))
     return
   }

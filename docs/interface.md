@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.4)
+# dsh-analyze interface specification (v0.1.5)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.4` |
+| Version | `0.1.5` |
 
 ## 2. Invocation
 
@@ -57,11 +57,11 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.4","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab"]}
+{"ok":true,"version":"0.1.5","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series"]}
 ```
 
-Capability tokens: the v0.1.3 set plus `corr`, `crosstab` (appended, never
-inserted mid-list). Mutate, time-period grouping, extended `describe` quantiles,
+Capability tokens: the v0.1.4 set plus `series` (appended, never inserted
+mid-list). Mutate, time-period grouping, extended `describe` quantiles,
 and join `anti`/`semi` ship inside existing commands and do not add separate
 capability tokens.
 
@@ -336,6 +336,45 @@ Flags: `--dataset-id` (required), `--columns a,b` (required, 1–32 numeric-capa
 - Only cells where `as_f64()` succeeds count as numeric; nulls/non-numeric are excluded from bounds.
 - `--out`: persists rows that are outliers in **any** listed column (`producedBy: "outliers"`, `sourceKind: "outliers"`). Response never returns full outlier rows; use `head`/`agg` on `outDatasetId`. Limit → exit 3, nothing written.
 
+### `series`
+
+Time-series transforms. Always writes a new dataset (ids + schema only; no sample rows).
+
+Flags: `--dataset-id` (required), `--order-by <col>` (required), `--ops <json-or-path>` (required, 1–8 ops), `--out <label>` (optional label)
+
+```text
+--ops may be an inline JSON array or a workspace-relative file path (UTF-8 BOM stripped).
+```
+
+```json
+[{"fn":"lag","column":"v","periods":1,"as":"v_lag"},
+ {"fn":"lead","column":"v","periods":1,"as":"v_lead"},
+ {"fn":"diff","column":"v","periods":1,"as":"v_diff"},
+ {"fn":"pct_change","column":"v","periods":1,"as":"v_pct"},
+ {"fn":"rolling","column":"v","window":7,"agg":"mean","as":"v_ma7"}]
+```
+
+| Field | Required | Applies to | Rules |
+|---|---|---|---|
+| `fn` | yes | all | `lag` \| `lead` \| `diff` \| `pct_change` \| `rolling` |
+| `column` | yes | all | Existing source column |
+| `as` | yes | all | New column: `[A-Za-z_][A-Za-z0-9_]*`, ≤64 chars; no collision with input columns or prior `as` |
+| `periods` | no (default 1) | lag/lead/diff/pct_change | Integer `1..=10000` |
+| `window` | yes | rolling | Integer `1..=10000` |
+| `agg` | yes | rolling | `mean` \| `sum` \| `min` \| `max` |
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"sourceDatasetId":"ds_…","orderBy":"…","opCount":N}
+```
+
+- Sequence: stable sort by `--order-by` ascending; **null keys last** (rows kept); ties keep input order. Cross-type key order: Bool < number < Str.
+- `lag`/`lead`: copy source value `periods` steps back/forward; out of range → Null. Output dtype = source dtype.
+- `diff`: `src(i) - src(i-p)` when both are finite numbers (`as_f64`); else Null. I64−I64 with integer result → i64, else f64.
+- `pct_change`: `(src(i)-src(i-p))/src(i-p)`; prev 0 or non-numeric → Null; output f64.
+- `rolling`: trailing positions `i-window+1..=i`. If fewer than `window` non-null finite values → Null. Else `mean`/`sum`/`min`/`max` over those non-null values. mean/sum → f64. min/max: cell values and schema dtype are i64 only when the **whole source column** is all I64/null; any float (or non-numeric) in the source forces f64 — a window of ints alone does not promote.
+- No rows dropped. `producedBy: "series"`, `sourceKind: "series"`, `source_path: series:<src>`.
+- Invalid ops / unknown column / empty ops / >8 ops → exit 2. No sample rows in the success body.
+
 ### `list`
 
 ```json
@@ -369,7 +408,7 @@ The DSH plugin registers the same operations as tools:
 `dataset_export` · `dataset_rm` · `stats_describe` · `transform_agg` ·
 `dataset_values` · `dataset_sample` · `dataset_join` ·
 `dataset_profile` · `dataset_dedup` · `dataset_outliers` ·
-`dataset_corr` · `dataset_crosstab`
+`dataset_corr` · `dataset_crosstab` · `dataset_series`
 
 | Tool | CLI | Notes |
 |---|---|---|
@@ -381,6 +420,7 @@ The DSH plugin registers the same operations as tools:
 | `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel`; `sampleLimit` integer 1–20 default 10 |
 | `dataset_corr` | `corr` | 2..16 numeric-capable columns; `method` pearson\|spearman; `pairwise` complete\|omit; `minNumeric` integer ≥2 default 2 |
 | `dataset_crosstab` | `crosstab` | `rows`/`cols` required and distinct; `top` 1–50 default 20; `minCount` ≥1 default 1; `dropNull` boolean default true |
+| `dataset_series` | `series` | `orderBy` required; `ops` array 1–8 of lag\|lead\|diff\|pct_change\|rolling; always writes new dataset |
 
 `transform_agg` `spec` string gains optional `mutate` and time-period
 `groupBy` objects (see §4 `agg`). Tool-layer `validateAggSpec` must reject
@@ -410,9 +450,11 @@ profile root is known. The deny list is a defensive path guard only; see
 - Arbitrary code execution
 - Write-side SQL or mutating external systems
 - Parquet (planned behind a feature flag; still exit 4 in this version)
-- Window functions, UDF / JS / Python expressions, diff
+- Window functions, UDF / JS / Python expressions, diff of two datasets
 - Full correlation-matrix export, p-values / confidence intervals
 - Crosstab with three or more dimensions
+- Centered series windows, ewm / cumsum / expanding, multi-key series order
 
 (Duplicate detection, outlier detection shipped in v0.1.3; correlation, crosstab,
-and anti/semi join shipped in v0.1.4.)
+and anti/semi join shipped in v0.1.4; series lag/lead/diff/pct_change/rolling
+shipped in v0.1.5.)

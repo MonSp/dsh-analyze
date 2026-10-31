@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.5
+
+Time-series increment (lag / lead / diff / pct_change / rolling).
+
+### Added
+
+- CLI + tools: `series` / `dataset_series` — one call sorts by `--order-by`
+  (nulls last), applies 1–8 ops (`lag`, `lead`, `diff`, `pct_change`,
+  `rolling` mean|sum|min|max), and **always** writes a new dataset. Response is
+  ids + schema only (never full rows).
+
+### Changed
+
+- Version and `version` capabilities: `0.1.5` plus `series`.
+- Public contract updated in `docs/interface.md` (v0.1.5).
+- Package version `dsh-analyze@0.1.5`.
+
 ## 0.1.4
 
 Relation & association increment (corr / crosstab / join anti·semi).
