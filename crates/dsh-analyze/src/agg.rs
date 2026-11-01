@@ -843,15 +843,46 @@ fn top_level_keys(json: &str) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
+/// String-aware scan of `json[..pos]`: is `pos` a key position directly inside
+/// the outermost object (depth 1, not inside any string)?
+fn is_top_key_pos(json: &str, pos: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for ch in json[..pos].chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    !in_str && depth == 1
+}
+
 fn find_key(json: &str, quoted_key: &str) -> Option<usize> {
-    // Only treat `"key"` as a field when it follows `{` or `,` (object-key position).
-    // Substring matches inside string values (e.g. column name "periods") are skipped.
+    // Only treat `"key"` as a field when it follows `{` or `,` (object-key
+    // position) AND sits directly inside the outermost object, outside any
+    // string. Substring matches inside string values (e.g. column name
+    // "periods") are skipped, and nested same-name keys (e.g. `limit` inside a
+    // filter item) never shadow the top-level field — key order must not
+    // change results.
     let mut base = 0usize;
     let mut rest = json;
     while let Some(idx) = rest.find(quoted_key) {
         let abs = base + idx;
         let before = json[..abs].trim_end();
-        if before.ends_with('{') || before.ends_with(',') {
+        if (before.ends_with('{') || before.ends_with(',')) && is_top_key_pos(json, abs) {
             return Some(abs);
         }
         base = abs + quoted_key.len();
@@ -1034,6 +1065,32 @@ mod tests {
         assert!(parse_spec_json(r#"{"limit":100}"#).is_ok());
         let err = parse_spec_json(r#"{"limit":"100"}"#).unwrap_err();
         assert!(err.contains("limit must be a number"));
+    }
+
+    /// Nested same-name keys must never shadow top-level fields: key order in
+    /// the spec JSON must not change the result.
+    #[test]
+    fn nested_keys_never_shadow_top_level() {
+        for spec in [
+            r#"{"filter":[{"op":"gt","column":"amount","value":0,"limit":2}],"limit":1}"#,
+            r#"{"limit":1,"filter":[{"op":"gt","column":"amount","value":0,"limit":2}]}"#,
+        ] {
+            let parsed = parse_spec_json(spec).unwrap();
+            assert_eq!(parsed.limit, Some(1), "spec={spec}");
+        }
+        // nested `filter` inside a mutate item is not the spec filter
+        let parsed = parse_spec_json(
+            r#"{"mutate":[{"as":"n","expr":"hits + total","filter":[]}],"filter":[{"op":"eq","column":"region","value":"A"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.filter.len(), 1);
+        assert_eq!(parsed.filter[0].column, "region");
+        // nested `select` inside a mutate item is not the spec select
+        let parsed = parse_spec_json(
+            r#"{"mutate":[{"as":"n","expr":"hits + total","select":[]}],"select":["region"]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.select.as_deref(), Some(&["region".to_string()][..]));
     }
 
     #[test]

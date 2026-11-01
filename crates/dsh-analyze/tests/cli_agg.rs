@@ -104,3 +104,36 @@ fn agg_filter_array_applies() {
     let line = String::from_utf8_lossy(&out.stdout);
     assert!(line.contains("\"rowCount\":1"), "stdout={line}");
 }
+
+/// Nested same-name keys (e.g. `limit` inside a filter item) must never shadow
+/// top-level fields: key order must not change the result.
+#[test]
+fn agg_nested_keys_never_shadow_top_level() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    for spec in [
+        r#"{"filter":[{"op":"gt","column":"amount","value":0,"limit":2}],"limit":1}"#,
+        r#"{"limit":1,"filter":[{"op":"gt","column":"amount","value":0,"limit":2}]}"#,
+    ] {
+        let out = run_agg(&ws, spec);
+        assert!(
+            out.status.success(),
+            "spec {spec} must succeed, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.contains("\"rowCount\":1"), "spec {spec} stdout={line}");
+    }
+    // a nested `filter` array must not replace the real top-level filter
+    let out = run_agg(
+        &ws,
+        r#"{"mutate":[{"as":"dbl","expr":"amount * 2","filter":[]}],"filter":[{"op":"eq","column":"amount","value":100}]}"#,
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(line.contains("\"rowCount\":1"), "stdout={line}");
+}
