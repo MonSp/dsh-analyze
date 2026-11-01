@@ -530,6 +530,16 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
     if !s.starts_with('{') || !s.ends_with('}') {
         return Err("analysis/invalid-args: spec must be object".into());
     }
+    let keys = top_level_keys(s)?;
+    for key in &keys {
+        if !matches!(
+            key.as_str(),
+            "select" | "filter" | "mutate" | "groupBy" | "aggs" | "orderBy" | "limit"
+        ) {
+            return Err(format!("analysis/invalid-args: unknown spec key {key}"));
+        }
+    }
+    let has = |k: &str| keys.iter().any(|x| x.as_str() == k);
     let mut spec = Spec {
         select: None,
         filter: Vec::new(),
@@ -542,10 +552,12 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
 
     if let Some(arr) = extract_array(s, "select")? {
         spec.select = Some(parse_string_array(&arr)?);
+    } else if has("select") {
+        return Err("analysis/invalid-args: select must be an array".into());
     }
     if let Some(arr) = extract_array(s, "groupBy")? {
         spec.group_by = parse_group_by(&arr)?;
-    } else if find_key(s, "\"groupBy\"").is_some() {
+    } else if has("groupBy") {
         return Err("analysis/invalid-args: groupBy must be an array".into());
     }
     if let Some(arr) = extract_array(s, "mutate")? {
@@ -565,11 +577,13 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
                 expr: parsed,
             });
         }
-    } else if find_key(s, "\"mutate\"").is_some() {
+    } else if has("mutate") {
         return Err("analysis/invalid-args: mutate must be an array".into());
     }
     if let Some(n) = extract_number(s, "limit")? {
         spec.limit = Some(n as usize);
+    } else if has("limit") {
+        return Err("analysis/invalid-args: limit must be a number".into());
     }
     if let Some(arr) = extract_array(s, "filter")? {
         for obj in split_top_objects(&arr)? {
@@ -596,6 +610,8 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             };
             spec.filter.push(Filter { op, column, value });
         }
+    } else if has("filter") {
+        return Err("analysis/invalid-args: filter must be an array".into());
     }
     if let Some(arr) = extract_array(s, "aggs")? {
         for obj in split_top_objects(&arr)? {
@@ -612,6 +628,8 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
                 r#as,
             });
         }
+    } else if has("aggs") {
+        return Err("analysis/invalid-args: aggs must be an array".into());
     }
     if let Some(arr) = extract_array(s, "orderBy")? {
         for obj in split_top_objects(&arr)? {
@@ -620,6 +638,8 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             let desc = extract_bool(&obj, "desc")?.unwrap_or(false);
             spec.order_by.push(OrderBy { column, desc });
         }
+    } else if has("orderBy") {
+        return Err("analysis/invalid-args: orderBy must be an array".into());
     }
     Ok(spec)
 }
@@ -754,6 +774,73 @@ fn extract_string_field(json: &str, key: &str) -> Result<Option<String>, String>
         }
     }
     Ok(Some(out))
+}
+
+/// Top-level keys of a JSON object; nested keys are ignored (string-aware scan).
+fn top_level_keys(json: &str) -> Result<Vec<String>, String> {
+    let s = json.trim();
+    let Some(inner) = s.strip_prefix('{').and_then(|t| t.strip_suffix('}')) else {
+        return Err("analysis/invalid-args: spec must be object".into());
+    };
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut expect_key = true;
+    let mut reading_key = false;
+    let mut cur = String::new();
+    for ch in inner.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+                if reading_key {
+                    cur.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '\\' => esc = true,
+                '"' => {
+                    in_str = false;
+                    if reading_key {
+                        keys.push(std::mem::take(&mut cur));
+                        reading_key = false;
+                    }
+                }
+                _ => {
+                    if reading_key {
+                        cur.push(ch);
+                    }
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_str = true;
+                if depth == 0 && expect_key {
+                    reading_key = true;
+                }
+            }
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ':' => {
+                if depth == 0 {
+                    expect_key = false;
+                }
+            }
+            ',' => {
+                if depth == 0 {
+                    expect_key = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str {
+        return Err("analysis/invalid-args: unterminated string".into());
+    }
+    Ok(keys)
 }
 
 fn find_key(json: &str, quoted_key: &str) -> Option<usize> {
@@ -909,6 +996,44 @@ mod tests {
         assert_eq!(spec.filter.len(), 1);
         assert_eq!(spec.filter[0].op, "eq");
         assert_eq!(spec.filter[0].column, "op");
+    }
+
+    /// filter must be an array; object/string/empty-object shapes must error, never pass through.
+    #[test]
+    fn filter_must_be_array() {
+        let err =
+            parse_spec_json(r#"{"filter":{"column":"amount","op":"gt","value":3000}}"#).unwrap_err();
+        assert!(err.contains("filter must be an array"));
+        assert!(parse_spec_json(r#"{"filter":"amount > 3000"}"#).is_err());
+        assert!(parse_spec_json(r#"{"filter":{}}"#).is_err());
+        assert!(parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":1}]}"#).is_ok());
+    }
+
+    #[test]
+    fn array_keys_reject_wrong_shape() {
+        assert!(parse_spec_json(r#"{"select":"a,b"}"#).is_err());
+        assert!(parse_spec_json(r#"{"aggs":{}}"#).is_err());
+        assert!(parse_spec_json(r#"{"orderBy":"a"}"#).is_err());
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a"}]}"#).is_ok());
+    }
+
+    /// Unknown top-level keys must be rejected instead of silently dropped.
+    #[test]
+    fn unknown_spec_key_rejected() {
+        let err = parse_spec_json(r#"{"filters":[]}"#).unwrap_err();
+        assert!(err.contains("unknown spec key"));
+        assert!(parse_spec_json(r#"{"select":["a"],"extra":1}"#).is_err());
+        // nested non-key strings are not top-level keys
+        assert!(
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"unknown","value":1}]}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn limit_must_be_number() {
+        assert!(parse_spec_json(r#"{"limit":100}"#).is_ok());
+        let err = parse_spec_json(r#"{"limit":"100"}"#).unwrap_err();
+        assert!(err.contains("limit must be a number"));
     }
 
     #[test]

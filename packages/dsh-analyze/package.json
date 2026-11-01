@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test ../tests/analysis-policy.test.mjs ../tests/analysis-tools.test.mjs"
+    "test": "node --test ../tests/analysis-policy.test.mjs ../tests/analysis-tools.test.mjs ../tests/analysis-schema.test.mjs"
   },
   "exports": {
     ".": "./dist/index.js",

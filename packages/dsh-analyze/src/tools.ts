@@ -164,9 +164,24 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     throw err
   }
   const obj = parsed as Record<string, unknown>
+  const knownSpecKeys = new Set(['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy', 'limit'])
+  for (const key of Object.keys(obj)) {
+    if (!knownSpecKeys.has(key)) {
+      const err = new Error(`analysis/invalid-args: unknown spec key ${key}`) as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+  }
+  for (const key of ['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy']) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) {
+      const err = new Error(`analysis/invalid-args: ${key} must be an array`) as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+  }
   if (obj.limit !== undefined) {
-    const n = Number(obj.limit)
-    if (!Number.isFinite(n) || n < 1 || n > limits.maxAggLimit) {
+    const n = obj.limit
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > limits.maxAggLimit) {
       const err = new Error(`analysis/invalid-args: limit must be 1..${limits.maxAggLimit}`) as Error & { code?: string }
       err.code = 'analysis/invalid-args'
       throw err
@@ -469,7 +484,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                   datasetId: { type: 'string' },
                   rowCount: { type: 'number' },
                   columnCount: { type: 'number' },
-                  label: { type: ['string', 'null'] },
+                  label: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   producedBy: { type: 'string' },
                 },
                 additionalProperties: true,
@@ -674,10 +689,15 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             type: 'string',
             description:
               'JSON string: { select?, filter?, mutate?, groupBy?, aggs?, orderBy?, limit? }. ' +
+              'filter MUST be an array of predicate objects, e.g. ' +
+              '[{"column":"amount","op":"gt","value":3000}]; a bare object filter ' +
+              '(e.g. {"filter":{"column":"amount","op":"gt","value":3000}}) or a string filter ' +
+              'is rejected with analysis/invalid-args. ' +
               'filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
               'agg fns: count/sum/mean/min/max/median/std. ' +
               'mutate: [{as,expr}] whitelist arithmetic only (no functions). ' +
-              'groupBy entries: column name or {dateColumn,period:day|week|month}.',
+              'groupBy entries: column name or {dateColumn,period:day|week|month}. ' +
+              'Unknown top-level spec keys are rejected.',
           },
           outLabel: {
             type: 'string',
@@ -692,7 +712,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           type: 'object',
           properties: {
             datasetId: { type: 'string' },
-            outDatasetId: { type: 'string' },
+            outDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             rowCount: { type: 'number' },
             columns: { type: 'array', items: { type: 'string' } },
             rows: { type: 'array', items: { type: 'array' } },
@@ -831,7 +851,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                 method: { type: 'string' },
                 n: { type: 'number' },
                 seed: { type: 'number' },
-                stratifyBy: { type: ['string', 'null'] },
+                stratifyBy: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                 population: { type: 'number' },
               },
             },
@@ -1160,7 +1180,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             rowCount: { type: 'number' },
             method: { type: 'string' },
             k: { type: 'number' },
-            outDatasetId: { type: ['string', 'null'] },
+            outDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             columns: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'method', 'columns'],
