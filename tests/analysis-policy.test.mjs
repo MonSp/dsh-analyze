@@ -54,7 +54,7 @@ test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the frozen v0.1.4 surface', () => {
+test('ANALYSIS_TOOL_NAMES is the frozen v0.1.5 surface', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -72,6 +72,7 @@ test('ANALYSIS_TOOL_NAMES is the frozen v0.1.4 surface', () => {
     'dataset_outliers',
     'dataset_corr',
     'dataset_crosstab',
+    'dataset_series',
   ])
 })
 
@@ -87,6 +88,10 @@ test('v0.1.3 quality tools are recognized by isAnalysisToolName', () => {
 test('v0.1.4 relation tools are recognized by isAnalysisToolName', () => {
   assert.equal(isAnalysisToolName('dataset_corr'), true)
   assert.equal(isAnalysisToolName('dataset_crosstab'), true)
+})
+
+test('v0.1.5 series tool is recognized by isAnalysisToolName', () => {
+  assert.equal(isAnalysisToolName('dataset_series'), true)
 })
 
 test('analysisToolsForScopedAllow can enable quality tools only', () => {

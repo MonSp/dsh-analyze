@@ -1508,6 +1508,232 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         return result.data
       },
     },
+
+    dataset_series: {
+      name: 'dataset_series',
+      description:
+        'Time-series transforms on one order-by column. Always writes a new datasetId ' +
+        '(producedBy=series). Ops in one call: lag | lead | diff | pct_change | rolling ' +
+        '(mean|sum|min|max). Returns only the new id + schema — never full rows. ' +
+        'Null order-by values sort last and stay in the output.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          orderBy: {
+            type: 'string',
+            description: 'Existing column used as sequence order (ascending; nulls last).',
+          },
+          ops: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 8,
+            items: {
+              type: 'object',
+              properties: {
+                fn: {
+                  type: 'string',
+                  enum: ['lag', 'lead', 'diff', 'pct_change', 'rolling'],
+                },
+                column: { type: 'string' },
+                as: {
+                  type: 'string',
+                  description: 'New output column name [A-Za-z_][A-Za-z0-9_]* (<=64).',
+                },
+                periods: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: 10000,
+                  description: 'lag/lead/diff/pct_change only; default 1.',
+                },
+                window: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: 10000,
+                  description: 'rolling only; trailing window size.',
+                },
+                agg: {
+                  type: 'string',
+                  enum: ['mean', 'sum', 'min', 'max'],
+                  description: 'rolling only.',
+                },
+              },
+              required: ['fn', 'column', 'as'],
+              additionalProperties: false,
+            },
+          },
+          outLabel: { type: 'string', description: 'Optional label stored on the new dataset.' },
+        },
+        required: ['datasetId', 'orderBy', 'ops'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            columnCount: { type: 'number' },
+            sourceDatasetId: { type: 'string' },
+            orderBy: { type: 'string' },
+            opCount: { type: 'number' },
+          },
+          required: ['datasetId', 'rowCount', 'columnCount', 'sourceDatasetId', 'orderBy', 'opCount'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            columnCount: number
+            orderBy?: string
+            opCount?: number
+          }
+          return textRender(
+            `series → ${v.datasetId}: ${v.rowCount} rows × ${v.columnCount} cols ` +
+              `(orderBy=${v.orderBy ?? '?'}, ops=${v.opCount ?? '?'}). ` +
+              'Inspect with dataset_head / stats_describe / transform_agg.',
+          )
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          datasetId: string
+          orderBy: string
+          ops: Array<{
+            fn: string
+            column: string
+            as: string
+            periods?: number | string | null
+            window?: number | string | null
+            agg?: string
+          }>
+          outLabel?: string
+        }
+        const requireInt = (value: number | string | null | undefined, name: string, max: number): number => {
+          if (value === undefined || value === null) {
+            const err = new Error(`analysis/invalid-args: ${name} required`) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value.trim()))) {
+            const err = new Error(`analysis/invalid-args: ${name} must be a non-negative integer`) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          const n = Number(value)
+          if (!Number.isInteger(n) || n < 1 || n > max) {
+            const err = new Error(
+              `analysis/invalid-args: ${name} must be integer 1..${max}`,
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          return n
+        }
+        validateDatasetId(a.datasetId)
+        if (typeof a.orderBy !== 'string' || !a.orderBy.trim()) {
+          const err = new Error('analysis/invalid-args: orderBy required') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if (!Array.isArray(a.ops) || a.ops.length === 0 || a.ops.length > limits.maxSeriesOps) {
+          const err = new Error(
+            `analysis/invalid-args: ops must be 1..${limits.maxSeriesOps} transforms`,
+          ) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        const seen = new Set<string>()
+        const fns = new Set(['lag', 'lead', 'diff', 'pct_change', 'rolling'])
+        const aggs = new Set(['mean', 'sum', 'min', 'max'])
+        const asRe = /^[A-Za-z_][A-Za-z0-9_]*$/
+        const normalized = a.ops.map(op => {
+          if (!op || typeof op !== 'object') {
+            const err = new Error('analysis/invalid-args: each op must be an object') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          const fn = op.fn
+          if (typeof fn !== 'string' || !fns.has(fn)) {
+            const err = new Error(
+              'analysis/invalid-args: fn must be lag|lead|diff|pct_change|rolling',
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (typeof op.column !== 'string' || !op.column.trim()) {
+            const err = new Error('analysis/invalid-args: column required') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          const as = op.as
+          if (typeof as !== 'string' || !asRe.test(as) || as.length > 64) {
+            const err = new Error(
+              'analysis/invalid-args: as must match [A-Za-z_][A-Za-z0-9_]* (<=64)',
+            ) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (seen.has(as)) {
+            const err = new Error(`analysis/invalid-args: duplicate as column ${as}`) as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          seen.add(as)
+          const out: {
+            fn: string
+            column: string
+            as: string
+            periods?: number
+            window?: number
+            agg?: string
+          } = { fn, column: op.column.trim(), as }
+          if (fn === 'rolling') {
+            if (op.periods !== undefined && op.periods !== null) {
+              const err = new Error('analysis/invalid-args: rolling takes window, not periods') as Error & { code?: string }
+              err.code = 'analysis/invalid-args'
+              throw err
+            }
+            out.window = requireInt(op.window, 'window', limits.maxSeriesWindow)
+            if (typeof op.agg !== 'string' || !aggs.has(op.agg)) {
+              const err = new Error('analysis/invalid-args: rolling agg must be mean|sum|min|max') as Error & { code?: string }
+              err.code = 'analysis/invalid-args'
+              throw err
+            }
+            out.agg = op.agg
+          } else {
+            if (op.window !== undefined && op.window !== null) {
+              const err = new Error(`analysis/invalid-args: fn ${fn} does not take window`) as Error & { code?: string }
+              err.code = 'analysis/invalid-args'
+              throw err
+            }
+            if (op.agg !== undefined && op.agg !== null) {
+              const err = new Error(`analysis/invalid-args: fn ${fn} does not take agg`) as Error & { code?: string }
+              err.code = 'analysis/invalid-args'
+              throw err
+            }
+            out.periods =
+              op.periods === undefined || op.periods === null
+                ? 1
+                : requireInt(op.periods, 'periods', limits.maxSeriesPeriods)
+          }
+          return out
+        })
+        const cliArgs = [
+          'series',
+          '--dataset-id',
+          a.datasetId,
+          '--order-by',
+          a.orderBy.trim(),
+          '--ops',
+          JSON.stringify(normalized),
+        ]
+        if (a.outLabel) cliArgs.push('--out', a.outLabel)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
   }
 
   return defs as Record<AnalysisToolName, unknown>

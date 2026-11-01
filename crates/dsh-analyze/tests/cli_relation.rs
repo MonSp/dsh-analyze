@@ -439,7 +439,7 @@ fn version_capabilities_include_corr_crosstab() {
         assert!(out.status.success(), "version failed");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(out.contains("\"0.1.4\""), "got: {out}");
+    assert!(out.contains("\"0.1.5\""), "got: {out}");
     for tok in [
         "\"ingest\"",
         "\"head\"",
@@ -457,14 +457,19 @@ fn version_capabilities_include_corr_crosstab() {
         "\"outliers\"",
         "\"corr\"",
         "\"crosstab\"",
+        "\"series\"",
     ] {
         assert!(out.contains(tok), "missing {tok} in {out}");
     }
-    // order: corr then crosstab last
+    // order: corr then crosstab then series last
     let corr_at = out.find("\"corr\"").expect("corr");
     let ct_at = out.find("\"crosstab\"").expect("crosstab");
+    let series_at = out.find("\"series\"").expect("series");
     let out_at = out.find("\"outliers\"").expect("outliers");
-    assert!(out_at < corr_at && corr_at < ct_at, "order wrong: {out}");
+    assert!(
+        out_at < corr_at && corr_at < ct_at && ct_at < series_at,
+        "order wrong: {out}"
+    );
 }
 
 /// Spearman on x=[1,2,3], y=[1,3,2]: mid-ranks = identity; pearson(ranks)=0.5.

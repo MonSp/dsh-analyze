@@ -757,7 +757,20 @@ fn extract_string_field(json: &str, key: &str) -> Result<Option<String>, String>
 }
 
 fn find_key(json: &str, quoted_key: &str) -> Option<usize> {
-    json.find(quoted_key)
+    // Only treat `"key"` as a field when it follows `{` or `,` (object-key position).
+    // Substring matches inside string values (e.g. column name "periods") are skipped.
+    let mut base = 0usize;
+    let mut rest = json;
+    while let Some(idx) = rest.find(quoted_key) {
+        let abs = base + idx;
+        let before = json[..abs].trim_end();
+        if before.ends_with('{') || before.ends_with(',') {
+            return Some(abs);
+        }
+        base = abs + quoted_key.len();
+        rest = &json[base..];
+    }
+    None
 }
 
 fn parse_string_array(arr: &str) -> Result<Vec<String>, String> {
@@ -879,6 +892,23 @@ mod tests {
         assert!(parse_spec_json(r#"{"mutate":[{"as":"x","expr":"system(1)"}]}"#).is_err());
         let spec = parse_spec_json(r#"{"mutate":[{"as":"rate","expr":"missing / total"}]}"#).unwrap();
         assert!(run_agg(&table(), &spec, 1000, 5000).is_err());
+    }
+
+    /// Column / mutate names equal to field names must not shadow real keys.
+    #[test]
+    fn field_name_collision_in_spec_objects() {
+        // mutate as named "expr" next to expr key — as must still be "expr".
+        let spec = parse_spec_json(
+            r#"{"mutate":[{"as":"expr","expr":"hits + total"}],"aggs":[{"fn":"sum","column":"expr","as":"s"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.mutate.len(), 1);
+        assert_eq!(spec.mutate[0].r#as, "expr");
+        // filter column named "op" must not be read as the op field.
+        let spec = parse_spec_json(r#"{"filter":[{"op":"eq","column":"op","value":1}]}"#).unwrap();
+        assert_eq!(spec.filter.len(), 1);
+        assert_eq!(spec.filter[0].op, "eq");
+        assert_eq!(spec.filter[0].column, "op");
     }
 
     #[test]

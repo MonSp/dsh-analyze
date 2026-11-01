@@ -108,6 +108,7 @@ The crate is pure-std and builds offline.
 | `dataset_outliers` | IQR / z-score / MAD outliers; optional write of outlier dataset |
 | `dataset_corr` | Pairwise Pearson/Spearman correlations among numeric columns (top pairs by \|r\|) |
 | `dataset_crosstab` | Two-column contingency table: top categories, matrix, margins, top cells |
+| `dataset_series` | Time-series transforms (lag/lead/diff/pct_change/rolling) → new dataset |
 
 CLI mirrors the same names as subcommands (`values`, `sample`, `join`, `profile`, …).
 See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
@@ -124,6 +125,11 @@ See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
 - **`dataset_corr`**: 2–16 numeric-capable columns; `method: pearson|spearman`; pairs sorted by \|r\| (cap 50).
 - **`dataset_crosstab`**: `rows` × `cols` frequency table with `top` categories and top cells only.
 - **`dataset_join`**: `how` now includes `anti` \| `semi` (left rows only; null keys never match).
+
+### Series tools (v0.1.5)
+
+- **`dataset_series`**: one order-by column (nulls last); one-call `lag` / `lead` / `diff` / `pct_change` / `rolling` (mean|sum|min|max).
+- Always writes a new dataset; response is ids + schema only — inspect with `dataset_head` / `stats_describe`.
 
 ### `transform_agg` extras (v0.1.2)
 

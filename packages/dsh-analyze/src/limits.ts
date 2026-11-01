@@ -19,6 +19,9 @@ export interface AnalysisLimits {
   maxOutlierColumns: number
   maxCorrColumns: number
   maxCrosstabTop: number
+  maxSeriesOps: number
+  maxSeriesPeriods: number
+  maxSeriesWindow: number
 }
 
 export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
@@ -37,6 +40,9 @@ export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
   maxOutlierColumns: 32,
   maxCorrColumns: 16,
   maxCrosstabTop: 50,
+  maxSeriesOps: 8,
+  maxSeriesPeriods: 10_000,
+  maxSeriesWindow: 10_000,
 }
 
 export function clampHeadN(n: unknown, limits: AnalysisLimits): number {
