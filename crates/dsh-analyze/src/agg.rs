@@ -581,6 +581,9 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
         return Err("analysis/invalid-args: mutate must be an array".into());
     }
     if let Some(n) = extract_number(s, "limit")? {
+        if n.fract() != 0.0 || !(1.0..=5000.0).contains(&n) {
+            return Err("analysis/invalid-args: limit must be an integer 1..5000".into());
+        }
         spec.limit = Some(n as usize);
     } else if has("limit") {
         return Err("analysis/invalid-args: limit must be a number".into());
@@ -1063,8 +1066,27 @@ mod tests {
     #[test]
     fn limit_must_be_number() {
         assert!(parse_spec_json(r#"{"limit":100}"#).is_ok());
+        assert!(parse_spec_json(r#"{"limit":5000}"#).is_ok());
         let err = parse_spec_json(r#"{"limit":"100"}"#).unwrap_err();
         assert!(err.contains("limit must be a number"));
+    }
+
+    /// limit outside 1..5000 (or fractional) is rejected at parse time,
+    /// not silently clamped to the row count.
+    #[test]
+    fn limit_range_enforced() {
+        for spec in [
+            r#"{"limit":0}"#,
+            r#"{"limit":-5}"#,
+            r#"{"limit":5001}"#,
+            r#"{"limit":1.5}"#,
+        ] {
+            let err = parse_spec_json(spec).unwrap_err();
+            assert!(
+                err.contains("limit must be an integer 1..5000"),
+                "spec={spec} err={err}"
+            );
+        }
     }
 
     /// Nested same-name keys must never shadow top-level fields: key order in

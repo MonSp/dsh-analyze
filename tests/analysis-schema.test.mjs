@@ -130,6 +130,10 @@ test('BUG-1/2: nullable output fields are declared oneOf [string, null]', () => 
       NULLABLE_STRING,
     )
     assert.deepEqual(
+      defs.dataset_list.output.schema.properties.datasets.items.properties.parentDatasetId,
+      NULLABLE_STRING,
+    )
+    assert.deepEqual(
       defs.transform_agg.output.schema.properties.outDatasetId,
       NULLABLE_STRING,
     )
@@ -215,7 +219,15 @@ test('BUG-3: validateAggSpec rejects other wrong-shape keys and unknown keys', (
   assert.throws(() => validateAggSpec(JSON.stringify({ select: 'a,b' }), limits), /select must be an array/)
   assert.throws(() => validateAggSpec(JSON.stringify({ aggs: {} }), limits), /aggs must be an array/)
   assert.throws(() => validateAggSpec(JSON.stringify({ orderBy: 'a' }), limits), /orderBy must be an array/)
-  assert.throws(() => validateAggSpec(JSON.stringify({ limit: '100' }), limits), /limit must be/)
+  assert.throws(() => validateAggSpec(JSON.stringify({ limit: '100' }), limits), /limit must be a number/)
+  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 0 }), limits), /1\.\./)
+  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 1.5 }), limits), /1\.\./)
+  assert.throws(() => validateAggSpec(JSON.stringify({ select: [1] }), limits), /select entries must be strings/)
+  assert.throws(() => validateAggSpec(JSON.stringify({ orderBy: [{}] }), limits), /orderBy entries need a column name/)
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ orderBy: [{ column: 'a', desc: 'yes' }] }), limits),
+    /desc must be boolean/,
+  )
   assert.throws(() => validateAggSpec(JSON.stringify({ filters: [] }), limits), /unknown spec key/)
   assert.throws(() => validateAggSpec(JSON.stringify({ select: ['a'], extra: 1 }), limits), /unknown spec key/)
 })

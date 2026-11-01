@@ -400,6 +400,8 @@ Flags: `--dataset-id` (required), `--order-by <col>` (required), `--ops <json-or
 
 - `datasets[].label` is `string | null` — `null` when the dataset carries no
   label (created without `--label` / `--out`).
+- `datasets[].parentDatasetId` is `string | null` — `null` for datasets with
+  no parent (plain ingests); `sourceKind` is always a string.
 
 ### `export`
 

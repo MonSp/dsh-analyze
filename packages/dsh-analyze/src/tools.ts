@@ -181,10 +181,24 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
   }
   if (obj.limit !== undefined) {
     const n = obj.limit
-    if (typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > limits.maxAggLimit) {
-      const err = new Error(`analysis/invalid-args: limit must be 1..${limits.maxAggLimit}`) as Error & { code?: string }
+    if (typeof n !== 'number' || !Number.isFinite(n)) {
+      const err = new Error('analysis/invalid-args: limit must be a number') as Error & { code?: string }
       err.code = 'analysis/invalid-args'
       throw err
+    }
+    if (!Number.isInteger(n) || n < 1 || n > limits.maxAggLimit) {
+      const err = new Error(`analysis/invalid-args: limit must be an integer 1..${limits.maxAggLimit}`) as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+  }
+  if (Array.isArray(obj.select)) {
+    for (const s of obj.select as unknown[]) {
+      if (typeof s !== 'string') {
+        const err = new Error('analysis/invalid-args: select entries must be strings') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
     }
   }
   if (Array.isArray(obj.filter)) {
@@ -241,6 +255,21 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     for (const a of obj.aggs as Array<Record<string, unknown>>) {
       if (!a || typeof a !== 'object' || typeof a.fn !== 'string' || !fns.has(a.fn)) {
         const err = new Error('analysis/invalid-args: bad agg fn') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+    }
+  }
+  if (Array.isArray(obj.orderBy)) {
+    for (const o of obj.orderBy as unknown[]) {
+      const co = o as Record<string, unknown> | null
+      if (!co || typeof co !== 'object' || Array.isArray(co) || typeof co.column !== 'string') {
+        const err = new Error('analysis/invalid-args: orderBy entries need a column name') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      if (co.desc !== undefined && typeof co.desc !== 'boolean') {
+        const err = new Error('analysis/invalid-args: orderBy desc must be boolean') as Error & { code?: string }
         err.code = 'analysis/invalid-args'
         throw err
       }
@@ -486,6 +515,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                   columnCount: { type: 'number' },
                   label: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   producedBy: { type: 'string' },
+                  parentDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  sourceKind: { type: 'string' },
                 },
                 additionalProperties: true,
               },

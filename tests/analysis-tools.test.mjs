@@ -535,7 +535,7 @@ test('validateAggSpec rejects out-of-range limit and bad ops', () => {
   assert.throws(() => validateAggSpec('[]', limits), /must be object/)
   assert.throws(() => validateAggSpec(JSON.stringify({ limit: 0 }), limits), /1\.\./)
   assert.throws(() => validateAggSpec(JSON.stringify({ limit: limits.maxAggLimit + 1 }), limits), /1\.\./)
-  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 'x' }), limits), /1\.\./)
+  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 'x' }), limits), /limit must be a number/)
   assert.throws(
     () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'regex' }] }), limits),
     /bad filter op/,

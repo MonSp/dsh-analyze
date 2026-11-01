@@ -87,6 +87,19 @@ fn agg_unknown_spec_key_rejected_exit_2() {
     assert!(err.contains("unknown spec key"), "stderr={err}");
 }
 
+/// limit outside 1..5000 must exit 2 instead of silently clamping.
+#[test]
+fn agg_limit_out_of_range_rejected_exit_2() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    for spec in [r#"{"limit":0}"#, r#"{"limit":-5}"#, r#"{"limit":99999}"#] {
+        let out = run_agg(&ws, spec);
+        assert_eq!(out.status.code(), Some(2), "spec {spec} must exit 2");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("limit must be an integer 1..5000"), "stderr={err}");
+    }
+}
+
 /// Sanity: an array filter still filters (only rows above 3000 survive).
 #[test]
 fn agg_filter_array_applies() {
