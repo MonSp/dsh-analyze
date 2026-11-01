@@ -46,8 +46,9 @@ fn map_str(map: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, S
 fn map_usize(map: &BTreeMap<String, Value>, key: &str) -> Result<Option<usize>, String> {
     match map.get(key) {
         None => Ok(None),
-        // Do not compare against `usize::MAX as i64` — on 64-bit that wraps to -1.
-        Some(Value::I64(n)) if *n >= 0 => Ok(Some(*n as usize)),
+        Some(Value::I64(n)) => usize::try_from(*n).map(Some).map_err(|_| {
+            format!("analysis/invalid-args: {key} must be a non-negative integer")
+        }),
         Some(Value::F64(f))
             if f.fract() == 0.0 && *f >= 0.0 && *f <= usize::MAX as f64 =>
         {
@@ -635,5 +636,15 @@ mod tests {
             .expect("parse");
         assert_eq!(ops[0].column, "periods");
         assert_eq!(ops[0].periods, 3);
+    }
+
+    #[test]
+    fn map_usize_rejects_negative_and_fractional() {
+        let neg = parse_json_object(r#"{"periods":-2}"#).unwrap();
+        assert!(map_usize(&neg, "periods").is_err());
+        let frac = parse_json_object(r#"{"periods":1.5}"#).unwrap();
+        assert!(map_usize(&frac, "periods").is_err());
+        let ok = parse_json_object(r#"{"periods":3}"#).unwrap();
+        assert_eq!(map_usize(&ok, "periods").unwrap(), Some(3));
     }
 }
