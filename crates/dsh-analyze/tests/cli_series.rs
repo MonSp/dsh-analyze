@@ -316,6 +316,36 @@ fn series_as_collides_with_source_column() {
     );
 }
 
+/// Oversized input rejected before sort/ops (exit 3).
+#[test]
+fn series_max_rows_guard() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n2,20\n3,30\n");
+    let id = ingest(&ws, "data/s.csv");
+    let out = bin()
+        .env("DSH_ANALYZE_MAX_ROWS", "2")
+        .arg("--workspace")
+        .arg(&ws)
+        .args([
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            r#"[{"fn":"lag","column":"v","as":"v_lag"}]"#,
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("limit"));
+}
+
 #[test]
 fn series_pct_change_zero_prev_and_incomplete_window() {
     let ws = temp_workspace();

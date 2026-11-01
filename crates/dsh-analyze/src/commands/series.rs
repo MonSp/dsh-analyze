@@ -265,12 +265,7 @@ fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn finite_num(v: &Value) -> Option<f64> {
-    match v {
-        Value::I64(n) => Some(*n as f64),
-        Value::F64(n) if n.is_finite() => Some(*n),
-        Value::Str(s) => s.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
-        _ => None,
-    }
+    v.as_f64().filter(|n| n.is_finite())
 }
 
 fn numeric_result(agg_or_diff: &str, all_i64: bool, raw: f64) -> Value {
