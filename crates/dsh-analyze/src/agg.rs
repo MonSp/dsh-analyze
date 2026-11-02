@@ -11,6 +11,8 @@ pub struct Filter {
     pub op: String,
     pub column: String,
     pub value: Value,
+    /// Set members for `op == "in"` (possibly empty); empty for every other op.
+    pub members: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,10 +117,7 @@ pub fn run_agg(
                         _ => false,
                     }
                 }
-                "in" => match &f.value {
-                    Value::Str(_) => values_eq(&cell, &f.value),
-                    _ => false,
-                },
+                "in" => f.members.iter().any(|m| values_eq(&cell, m)),
                 "contains" => match (&cell, &f.value) {
                     (Value::Str(a), Value::Str(b)) => a.contains(b.as_str()),
                     _ => false,
@@ -530,6 +529,16 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
     if !s.starts_with('{') || !s.ends_with('}') {
         return Err("analysis/invalid-args: spec must be object".into());
     }
+    let keys = top_level_keys(s)?;
+    for key in &keys {
+        if !matches!(
+            key.as_str(),
+            "select" | "filter" | "mutate" | "groupBy" | "aggs" | "orderBy" | "limit"
+        ) {
+            return Err(format!("analysis/invalid-args: unknown spec key {key}"));
+        }
+    }
+    let has = |k: &str| keys.iter().any(|x| x.as_str() == k);
     let mut spec = Spec {
         select: None,
         filter: Vec::new(),
@@ -542,10 +551,12 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
 
     if let Some(arr) = extract_array(s, "select")? {
         spec.select = Some(parse_string_array(&arr)?);
+    } else if has("select") {
+        return Err("analysis/invalid-args: select must be an array".into());
     }
     if let Some(arr) = extract_array(s, "groupBy")? {
         spec.group_by = parse_group_by(&arr)?;
-    } else if find_key(s, "\"groupBy\"").is_some() {
+    } else if has("groupBy") {
         return Err("analysis/invalid-args: groupBy must be an array".into());
     }
     if let Some(arr) = extract_array(s, "mutate")? {
@@ -565,11 +576,16 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
                 expr: parsed,
             });
         }
-    } else if find_key(s, "\"mutate\"").is_some() {
+    } else if has("mutate") {
         return Err("analysis/invalid-args: mutate must be an array".into());
     }
     if let Some(n) = extract_number(s, "limit")? {
+        if n.fract() != 0.0 || !(1.0..=5000.0).contains(&n) {
+            return Err("analysis/invalid-args: limit must be an integer 1..5000".into());
+        }
         spec.limit = Some(n as usize);
+    } else if has("limit") {
+        return Err("analysis/invalid-args: limit must be a number".into());
     }
     if let Some(arr) = extract_array(s, "filter")? {
         for obj in split_top_objects(&arr)? {
@@ -580,6 +596,7 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             if !validate_op(&op) {
                 return Err(format!("analysis/invalid-args: bad filter op {op}"));
             }
+            let mut in_members: Option<Vec<Value>> = None;
             let value = if op == "is_null" || op == "not_null" {
                 Value::Null
             } else if let Some(v) = extract_number(&obj, "value")? {
@@ -589,13 +606,29 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             } else if let Some(v) = extract_string_field(&obj, "value")? {
                 Value::Str(v)
             } else if let Some(arr) = extract_array(&obj, "value")? {
-                let items = parse_string_array(&arr)?;
-                Value::Str(items.first().cloned().unwrap_or_default())
-            } else {
+                if op != "in" {
+                    return Err(format!(
+                        "analysis/invalid-args: filter value must not be an array for op {op}"
+                    ));
+                }
+                in_members = Some(parse_value_array(&arr)?);
                 Value::Null
+            } else if find_key(&obj, "\"value\"").is_some() {
+                return Err("analysis/invalid-args: bad filter value".into());
+            } else {
+                return Err(format!(
+                    "analysis/invalid-args: filter value required for op {op}"
+                ));
             };
-            spec.filter.push(Filter { op, column, value });
+            let members = match in_members {
+                Some(m) => m,
+                None if op == "in" => vec![value.clone()],
+                None => Vec::new(),
+            };
+            spec.filter.push(Filter { op, column, value, members });
         }
+    } else if has("filter") {
+        return Err("analysis/invalid-args: filter must be an array".into());
     }
     if let Some(arr) = extract_array(s, "aggs")? {
         for obj in split_top_objects(&arr)? {
@@ -612,14 +645,24 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
                 r#as,
             });
         }
+    } else if has("aggs") {
+        return Err("analysis/invalid-args: aggs must be an array".into());
     }
     if let Some(arr) = extract_array(s, "orderBy")? {
         for obj in split_top_objects(&arr)? {
             let column = extract_string_field(&obj, "column")?
                 .ok_or_else(|| "analysis/invalid-args: orderBy column required".to_string())?;
-            let desc = extract_bool(&obj, "desc")?.unwrap_or(false);
+            let desc = if find_key(&obj, "\"desc\"").is_some() {
+                extract_bool(&obj, "desc")?.ok_or_else(|| {
+                    "analysis/invalid-args: orderBy desc must be boolean".to_string()
+                })?
+            } else {
+                false
+            };
             spec.order_by.push(OrderBy { column, desc });
         }
+    } else if has("orderBy") {
+        return Err("analysis/invalid-args: orderBy must be an array".into());
     }
     Ok(spec)
 }
@@ -668,9 +711,24 @@ fn extract_array(json: &str, key: &str) -> Result<Option<String>, String> {
     if !after.starts_with('[') {
         return Ok(None);
     }
+    // String-aware bracket matching: `[` / `]` inside string elements must not
+    // truncate the array (e.g. select ["A]B"]).
     let mut depth = 0;
+    let mut in_str = false;
+    let mut esc = false;
     for (i, ch) in after.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_str = true,
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -684,6 +742,35 @@ fn extract_array(json: &str, key: &str) -> Result<Option<String>, String> {
     Err("analysis/invalid-args: unterminated array".into())
 }
 
+/// Lex a JSON-style number at the start of `s` (optional sign, digits,
+/// fraction, `e` / `E` exponent). Returns `Ok(None)` when `s` does not start
+/// with a number at all, `Err` when a number token is malformed or followed
+/// by junk (`2abc`, `2e`) — callers must never silently read a prefix like
+/// `2` from `2e1`.
+fn lex_number(s: &str) -> Result<Option<(f64, &str)>, String> {
+    let tok: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+        .collect();
+    if tok.is_empty() {
+        return Ok(None);
+    }
+    let after = &s[tok.len()..];
+    // The token must end at a value boundary: end of input, whitespace, or a
+    // structural character that can follow a value.
+    let boundary_ok = match after.chars().next() {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, ',' | '}' | ']'),
+    };
+    if !boundary_ok {
+        return Err("analysis/invalid-args: bad number".into());
+    }
+    let n: f64 = tok
+        .parse()
+        .map_err(|_| format!("analysis/invalid-args: bad number {tok}"))?;
+    Ok(Some((n, after)))
+}
+
 fn extract_number(json: &str, key: &str) -> Result<Option<f64>, String> {
     let needle = format!("\"{key}\"");
     let Some(idx) = find_key(json, &needle) else {
@@ -694,17 +781,7 @@ fn extract_number(json: &str, key: &str) -> Result<Option<f64>, String> {
         return Ok(None);
     }
     let after = after[1..].trim_start();
-    let digits: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    if digits.is_empty() {
-        return Ok(None);
-    }
-    digits
-        .parse()
-        .map(Some)
-        .map_err(|_| "analysis/invalid-args: bad number".into())
+    Ok(lex_number(after)?.map(|(n, _)| n))
 }
 
 fn extract_bool(json: &str, key: &str) -> Result<Option<bool>, String> {
@@ -756,15 +833,113 @@ fn extract_string_field(json: &str, key: &str) -> Result<Option<String>, String>
     Ok(Some(out))
 }
 
+/// Top-level keys of a JSON object; nested keys are ignored (string-aware scan).
+fn top_level_keys(json: &str) -> Result<Vec<String>, String> {
+    let s = json.trim();
+    let Some(inner) = s.strip_prefix('{').and_then(|t| t.strip_suffix('}')) else {
+        return Err("analysis/invalid-args: spec must be object".into());
+    };
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut expect_key = true;
+    let mut reading_key = false;
+    let mut cur = String::new();
+    for ch in inner.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+                if reading_key {
+                    cur.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '\\' => esc = true,
+                '"' => {
+                    in_str = false;
+                    if reading_key {
+                        keys.push(std::mem::take(&mut cur));
+                        reading_key = false;
+                    }
+                }
+                _ => {
+                    if reading_key {
+                        cur.push(ch);
+                    }
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_str = true;
+                if depth == 0 && expect_key {
+                    reading_key = true;
+                }
+            }
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ':' => {
+                if depth == 0 {
+                    expect_key = false;
+                }
+            }
+            ',' => {
+                if depth == 0 {
+                    expect_key = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str {
+        return Err("analysis/invalid-args: unterminated string".into());
+    }
+    Ok(keys)
+}
+
+/// String-aware scan of `json[..pos]`: is `pos` a key position directly inside
+/// the outermost object (depth 1, not inside any string)?
+fn is_top_key_pos(json: &str, pos: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for ch in json[..pos].chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    !in_str && depth == 1
+}
+
 fn find_key(json: &str, quoted_key: &str) -> Option<usize> {
-    // Only treat `"key"` as a field when it follows `{` or `,` (object-key position).
-    // Substring matches inside string values (e.g. column name "periods") are skipped.
+    // Only treat `"key"` as a field when it follows `{` or `,` (object-key
+    // position) AND sits directly inside the outermost object, outside any
+    // string. Substring matches inside string values (e.g. column name
+    // "periods") are skipped, and nested same-name keys (e.g. `limit` inside a
+    // filter item) never shadow the top-level field — key order must not
+    // change results.
     let mut base = 0usize;
     let mut rest = json;
     while let Some(idx) = rest.find(quoted_key) {
         let abs = base + idx;
         let before = json[..abs].trim_end();
-        if before.ends_with('{') || before.ends_with(',') {
+        if (before.ends_with('{') || before.ends_with(',')) && is_top_key_pos(json, abs) {
             return Some(abs);
         }
         base = abs + quoted_key.len();
@@ -790,6 +965,14 @@ fn parse_string_array(arr: &str) -> Result<Vec<String>, String> {
             chars.next();
             let mut s = String::new();
             while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    // Keep escaped characters (e.g. `\"` / `\\`) intact so a
+                    // quote inside a string element does not end it early.
+                    if let Some(n) = chars.next() {
+                        s.push(n);
+                    }
+                    continue;
+                }
                 if ch == '"' {
                     break;
                 }
@@ -808,6 +991,82 @@ fn parse_string_array(arr: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Parse a JSON array of scalar filter values (string / number / bool) for
+/// `op: "in"`. Non-scalar elements are rejected instead of silently dropped.
+fn parse_value_array(arr: &str) -> Result<Vec<Value>, String> {
+    let inner = arr
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| "analysis/invalid-args: bad array".to_string())?;
+    let mut out = Vec::new();
+    let mut rest = inner;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(t) = rest.strip_prefix(',') {
+            rest = t;
+            continue;
+        }
+        if rest.starts_with('"') {
+            let mut s = String::new();
+            let mut closed = false;
+            let mut esc = false;
+            let mut consumed = 1usize;
+            for (i, ch) in rest[1..].char_indices() {
+                let abs = 1 + i;
+                if esc {
+                    s.push(ch);
+                    esc = false;
+                    consumed = abs + ch.len_utf8();
+                    continue;
+                }
+                match ch {
+                    '\\' => {
+                        esc = true;
+                        consumed = abs + 1;
+                    }
+                    '"' => {
+                        closed = true;
+                        consumed = abs + 1;
+                        break;
+                    }
+                    _ => {
+                        s.push(ch);
+                        consumed = abs + ch.len_utf8();
+                    }
+                }
+            }
+            if !closed {
+                return Err("analysis/invalid-args: unterminated string".into());
+            }
+            out.push(Value::Str(s));
+            rest = &rest[consumed..];
+            continue;
+        }
+        if rest.starts_with("true") {
+            out.push(Value::Bool(true));
+            rest = &rest[4..];
+            continue;
+        }
+        if rest.starts_with("false") {
+            out.push(Value::Bool(false));
+            rest = &rest[5..];
+            continue;
+        }
+        match lex_number(rest)? {
+            Some((n, after)) => {
+                out.push(Value::F64(n));
+                rest = after;
+            }
+            None => return Err("analysis/invalid-args: bad filter value".into()),
+        }
+    }
+    Ok(out)
+}
+
 fn split_top_objects(arr: &str) -> Result<Vec<String>, String> {
     let inner = arr
         .trim()
@@ -818,10 +1077,15 @@ fn split_top_objects(arr: &str) -> Result<Vec<String>, String> {
     let mut depth = 0;
     let mut cur = String::new();
     let mut in_str = false;
+    let mut esc = false;
     for ch in inner.chars() {
         if in_str {
             cur.push(ch);
-            if ch == '"' {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
                 in_str = false;
             }
             continue;
@@ -909,6 +1173,199 @@ mod tests {
         assert_eq!(spec.filter.len(), 1);
         assert_eq!(spec.filter[0].op, "eq");
         assert_eq!(spec.filter[0].column, "op");
+    }
+
+    /// filter must be an array; object/string/empty-object shapes must error, never pass through.
+    #[test]
+    fn filter_must_be_array() {
+        let err =
+            parse_spec_json(r#"{"filter":{"column":"amount","op":"gt","value":3000}}"#).unwrap_err();
+        assert!(err.contains("filter must be an array"));
+        assert!(parse_spec_json(r#"{"filter":"amount > 3000"}"#).is_err());
+        assert!(parse_spec_json(r#"{"filter":{}}"#).is_err());
+        assert!(parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":1}]}"#).is_ok());
+    }
+
+    #[test]
+    fn array_keys_reject_wrong_shape() {
+        assert!(parse_spec_json(r#"{"select":"a,b"}"#).is_err());
+        assert!(parse_spec_json(r#"{"aggs":{}}"#).is_err());
+        assert!(parse_spec_json(r#"{"orderBy":"a"}"#).is_err());
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a"}]}"#).is_ok());
+    }
+
+    /// Unknown top-level keys must be rejected instead of silently dropped.
+    #[test]
+    fn unknown_spec_key_rejected() {
+        let err = parse_spec_json(r#"{"filters":[]}"#).unwrap_err();
+        assert!(err.contains("unknown spec key"));
+        assert!(parse_spec_json(r#"{"select":["a"],"extra":1}"#).is_err());
+        // nested non-key strings are not top-level keys
+        assert!(
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"unknown","value":1}]}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn limit_must_be_number() {
+        assert!(parse_spec_json(r#"{"limit":100}"#).is_ok());
+        assert!(parse_spec_json(r#"{"limit":5000}"#).is_ok());
+        let err = parse_spec_json(r#"{"limit":"100"}"#).unwrap_err();
+        assert!(err.contains("limit must be a number"));
+    }
+
+    /// limit outside 1..5000 (or fractional) is rejected at parse time,
+    /// not silently clamped to the row count.
+    #[test]
+    fn limit_range_enforced() {
+        for spec in [
+            r#"{"limit":0}"#,
+            r#"{"limit":-5}"#,
+            r#"{"limit":5001}"#,
+            r#"{"limit":1.5}"#,
+        ] {
+            let err = parse_spec_json(spec).unwrap_err();
+            assert!(
+                err.contains("limit must be an integer 1..5000"),
+                "spec={spec} err={err}"
+            );
+        }
+    }
+
+    /// Nested same-name keys must never shadow top-level fields: key order in
+    /// the spec JSON must not change the result.
+    #[test]
+    fn nested_keys_never_shadow_top_level() {
+        for spec in [
+            r#"{"filter":[{"op":"gt","column":"amount","value":0,"limit":2}],"limit":1}"#,
+            r#"{"limit":1,"filter":[{"op":"gt","column":"amount","value":0,"limit":2}]}"#,
+        ] {
+            let parsed = parse_spec_json(spec).unwrap();
+            assert_eq!(parsed.limit, Some(1), "spec={spec}");
+        }
+        // nested `filter` inside a mutate item is not the spec filter
+        let parsed = parse_spec_json(
+            r#"{"mutate":[{"as":"n","expr":"hits + total","filter":[]}],"filter":[{"op":"eq","column":"region","value":"A"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.filter.len(), 1);
+        assert_eq!(parsed.filter[0].column, "region");
+        // nested `select` inside a mutate item is not the spec select
+        let parsed = parse_spec_json(
+            r#"{"mutate":[{"as":"n","expr":"hits + total","select":[]}],"select":["region"]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.select.as_deref(), Some(&["region".to_string()][..]));
+    }
+
+    /// `in` matches every listed member (OR), not just the first (PR #6 review item).
+    #[test]
+    fn filter_in_matches_all_members() {
+        // all three rows: regions A and B are both members
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":["A","B"]}]}"#)
+                .unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 3);
+        // numeric members: hits 1 and 3 match, hits 2 does not
+        let spec = parse_spec_json(r#"{"filter":[{"op":"in","column":"hits","value":[1,3]}]}"#)
+            .unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 2);
+        // scalar form is a one-member set
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":"B"}]}"#).unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 1);
+        // empty member set matches nothing (literal empty set, not a null match)
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":[]}]}"#).unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 0);
+    }
+
+    /// filter value shapes: arrays only for `in`, value required for the other
+    /// ops, non-scalar values rejected — never a silent default.
+    #[test]
+    fn filter_value_shapes_enforced() {
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":[1,2]}]}"#).unwrap_err();
+        assert!(err.contains("filter value must not be an array"));
+        let err = parse_spec_json(r#"{"filter":[{"op":"eq","column":"a"}]}"#).unwrap_err();
+        assert!(err.contains("filter value required for op eq"));
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":{"x":1}}]}"#).unwrap_err();
+        assert!(err.contains("bad filter value"));
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"a","value":[1,null]}]}"#)
+                .unwrap_err();
+        assert!(err.contains("bad filter value"));
+        // is_null / not_null need no value
+        assert!(parse_spec_json(r#"{"filter":[{"op":"is_null","column":"a"}]}"#).is_ok());
+        assert!(parse_spec_json(r#"{"filter":[{"op":"not_null","column":"a"}]}"#).is_ok());
+    }
+
+    /// Bracket matching is string-aware: `[` / `]` inside string elements must
+    /// not truncate the array (PR #6 review item).
+    #[test]
+    fn extract_array_string_brackets() {
+        let spec = parse_spec_json(r#"{"select":["A]B","C"]}"#).unwrap();
+        assert_eq!(
+            spec.select.as_deref(),
+            Some(&["A]B".to_string(), "C".to_string()][..])
+        );
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"a","value":["x]y","z"]}]}"#)
+                .unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::Str("x]y".into()), Value::Str("z".into())]);
+    }
+
+    /// One number lexer for every path: exponents parse as JSON numbers
+    /// everywhere, trailing junk is rejected — never a silent prefix.
+    #[test]
+    fn number_lexing_consistent() {
+        assert_eq!(parse_spec_json(r#"{"limit":2e1}"#).unwrap().limit, Some(20));
+        assert_eq!(parse_spec_json(r#"{"limit":1e3}"#).unwrap().limit, Some(1000));
+        let err = parse_spec_json(r#"{"limit":2abc}"#).unwrap_err();
+        assert!(err.contains("bad number"), "err={err}");
+        let err = parse_spec_json(r#"{"limit":2e}"#).unwrap_err();
+        assert!(err.contains("bad number"), "err={err}");
+
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"gt","column":"amount","value":3e3}]}"#).unwrap();
+        assert_eq!(spec.filter[0].value, Value::F64(3000.0));
+
+        // scalar and array members of `in` read the same literal identically
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"amount","value":2e3}]}"#).unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::F64(2000.0)]);
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"amount","value":[2e3]}]}"#)
+                .unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::F64(2000.0)]);
+    }
+
+    /// Escaped quotes inside item strings must not swallow later items or
+    /// truncate string-array elements.
+    #[test]
+    fn escaped_quotes_in_item_strings() {
+        let spec = parse_spec_json(
+            r#"{"filter":[{"op":"ne","column":"amount","value":"x\"y"},{"op":"gt","column":"amount","value":2000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.filter.len(), 2);
+        assert_eq!(spec.filter[0].value, Value::Str("x\"y".into()));
+        assert_eq!(spec.filter[1].op, "gt");
+        assert_eq!(spec.filter[1].value, Value::F64(2000.0));
+        // select elements keep escaped quotes intact
+        let spec = parse_spec_json(r#"{"select":["a\"b"]}"#).unwrap();
+        assert_eq!(spec.select.as_deref(), Some(&["a\"b".to_string()][..]));
+    }
+
+    /// `desc` must be a boolean when present (same text as the tool layer).
+    #[test]
+    fn order_by_desc_strict() {
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a","desc":true}]}"#).is_ok());
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a"}]}"#).is_ok());
+        let err =
+            parse_spec_json(r#"{"orderBy":[{"column":"a","desc":"true"}]}"#).unwrap_err();
+        assert!(err.contains("orderBy desc must be boolean"), "err={err}");
     }
 
     #[test]

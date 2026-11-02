@@ -130,6 +130,7 @@ Flags: `--dataset-id` (required), `--n` (1–20, default 10), `--seed` (u64, def
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columns":["…"],"rows":[[…]],"sampling":{"method":"random"|"stratified","n":10,"seed":42,"stratifyBy":null|"…","population":N}}
 ```
 
+- `sampling.stratifyBy` is `string | null` — `null` when `--stratify-by` is not given (unstratified), else the strata column name.
 - PRNG: SplitMix64 seeded by `seed`. Same `(dataset, n, seed, stratifyBy)` always yields the same rows.
 - Without `--stratify-by`: sample without replacement over the full row set.
 - With `--stratify-by`: proportional allocation across strata (largest-remainder), then independent SplitMix64 draws per stratum. Null / empty stratum key is the string `__null__` in the key space only (not written into rows).
@@ -157,6 +158,30 @@ Filter ops: `eq ne gt gte lt lte in contains is_null not_null`
 Agg fns: `count sum mean min max median std`  
 Limit range: `1..5000` (default `DSH_ANALYZE_DEFAULT_ROW_LIMIT`).  
 `--spec` may be inline JSON or a workspace-relative file path.
+
+Spec key shapes (enforced by the CLI and by tool-layer `validateAggSpec`):
+
+- `filter` must be an **array** of predicate objects — positive:
+  `"filter": [{"column":"amount","op":"gt","value":3000}]`; negative: a bare
+  object `{"filter": {"column":"amount","op":"gt","value":3000}}` (or a
+  string) is rejected with `analysis/invalid-args: filter must be an array`,
+  never applied as "no filter".
+- A filter item needs a `column` string
+  (`analysis/invalid-args: filter column required`). Its `value` is a scalar
+  (string / number / boolean), required for every op except `is_null` /
+  `not_null`. `op: "in"` also accepts an
+  **array of scalars** — every member matches (OR); a single scalar counts as
+  a one-member set and `[]` matches nothing. Arrays for other ops,
+  non-scalar members, and missing values fail with
+  `analysis/invalid-args: filter value …` — never a silent first-element
+  pick or null default.
+- `select` / `mutate` / `groupBy` / `aggs` / `orderBy` must be arrays;
+  `orderBy` items need a string `column` and an optional boolean `desc`
+  (`analysis/invalid-args: orderBy desc must be boolean` otherwise);
+  `limit` must be an integer `1..5000`. Wrong shapes fail with
+  `analysis/invalid-args`.
+- Unknown top-level spec keys are rejected
+  (`analysis/invalid-args: unknown spec key …`), never silently dropped.
 
 Pipeline order (v0.1.2):
 
@@ -226,8 +251,10 @@ Buckets:
 
 `parseFailCount` is omitted or `0` when there is no time-period grouping or no failures.
 
-When `--out` is set, a new dataset is persisted and `outDatasetId` is set;
-inline `rows` may be empty with `truncated: true` (budget 20 rows).
+`outDatasetId` is `string | null` — `null` when `--out` is not given (inline
+result only), else the new dataset id. When `--out` is set, a new dataset is
+persisted and `outDatasetId` is set; inline `rows` may be empty with
+`truncated: true` (budget 20 rows).
 
 ### `join`
 
@@ -334,6 +361,7 @@ Flags: `--dataset-id` (required), `--columns a,b` (required, 1–32 numeric-capa
 - Methods: `iqr` bounds `Q1-k·IQR` / `Q3+k·IQR`; `zscore` uses sample std; `mad` uses `1.4826·MAD` around Q50.
 - Degenerate cases (`IQR==0`, `std==0`, `MAD==0`) report the matching `degenerate*` flag and no outliers.
 - Only cells where `as_f64()` succeeds count as numeric; nulls/non-numeric are excluded from bounds.
+- `outDatasetId` is `string | null` — `null` when `--out` is not given, else the new dataset id.
 - `--out`: persists rows that are outliers in **any** listed column (`producedBy: "outliers"`, `sourceKind: "outliers"`). Response never returns full outlier rows; use `head`/`agg` on `outDatasetId`. Limit → exit 3, nothing written.
 
 ### `series`
@@ -382,6 +410,11 @@ Flags: `--dataset-id` (required), `--order-by <col>` (required), `--ops <json-or
 {"ok":true,"datasets":[{"datasetId":"ds_…","rowCount":N,"columnCount":N,"label":null,"producedBy":"ingest","parentDatasetId":null,"sourceKind":"csv"}]}
 ```
 
+- `datasets[].label` is `string | null` — `null` when the dataset carries no
+  label (created without `--label` / `--out`).
+- `datasets[].parentDatasetId` is `string | null` — `null` for datasets with
+  no parent (plain ingests); `sourceKind` is always a string.
+
 ### `export`
 
 Flags: `--dataset-id` (required), `--output <path>` (required)
@@ -424,8 +457,10 @@ The DSH plugin registers the same operations as tools:
 | `dataset_series` | `series` | `orderBy` required; `ops` array 1–8 of lag\|lead\|diff\|pct_change\|rolling; always writes new dataset |
 
 `transform_agg` `spec` string gains optional `mutate` and time-period
-`groupBy` objects (see §4 `agg`). Tool-layer `validateAggSpec` must reject
-illegal mutate expressions with `analysis/invalid-args` before spawn.
+`groupBy` objects (see §4 `agg`). `filter` must be an array of predicate
+objects (a bare object / string filter is rejected). Tool-layer
+`validateAggSpec` must reject illegal mutate expressions, non-array `filter`,
+and unknown top-level spec keys with `analysis/invalid-args` before spawn.
 
 Tool-layer extra guards:
 

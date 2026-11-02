@@ -535,11 +535,35 @@ test('validateAggSpec rejects out-of-range limit and bad ops', () => {
   assert.throws(() => validateAggSpec('[]', limits), /must be object/)
   assert.throws(() => validateAggSpec(JSON.stringify({ limit: 0 }), limits), /1\.\./)
   assert.throws(() => validateAggSpec(JSON.stringify({ limit: limits.maxAggLimit + 1 }), limits), /1\.\./)
-  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 'x' }), limits), /1\.\./)
+  assert.throws(() => validateAggSpec(JSON.stringify({ limit: 'x' }), limits), /limit must be a number/)
   assert.throws(
     () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'regex' }] }), limits),
     /bad filter op/,
   )
+  // filter value shapes: required for non-null ops, arrays only for `in`
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'eq' }] }), limits),
+    /filter value required for op eq/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ op: 'eq', value: 1 }] }), limits),
+    /filter column required/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'eq', value: [1, 2] }] }), limits),
+    /must not be an array/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'eq', value: { x: 1 } }] }), limits),
+    /bad filter value/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'in', value: [1, null] }] }), limits),
+    /bad filter value/,
+  )
+  validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'in', value: [1, 2] }] }), limits)
+  validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'in', value: 'x' }] }), limits)
+  validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'is_null' }] }), limits)
   assert.throws(
     () => validateAggSpec(JSON.stringify({ aggs: [{ fn: 'variance', column: 'a' }] }), limits),
     /bad agg fn/,
@@ -1113,6 +1137,28 @@ test('dataset_series order-by nulls last + pct_change zero prev', async () => {
       [2, 20, 10, 1],
       [null, 99, 20, 3.95],
     ])
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('transform_agg in filter matches every member via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'in.csv'), 'amount\n100\n3000\n5000\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ingest = await defs.dataset_ingest.execute({ path: 'data/in.csv', format: 'csv' })
+    const res = await defs.transform_agg.execute({
+      datasetId: ingest.datasetId,
+      spec: JSON.stringify({ filter: [{ column: 'amount', op: 'in', value: [100, 3000] }] }),
+    })
+    assert.equal(res.rowCount, 2)
+    const strRes = await defs.transform_agg.execute({
+      datasetId: ingest.datasetId,
+      spec: JSON.stringify({ filter: [{ column: 'amount', op: 'in', value: ['100', '5000'] }] }),
+    })
+    assert.equal(strRes.rowCount, 2)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

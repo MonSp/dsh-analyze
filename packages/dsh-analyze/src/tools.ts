@@ -164,12 +164,41 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     throw err
   }
   const obj = parsed as Record<string, unknown>
-  if (obj.limit !== undefined) {
-    const n = Number(obj.limit)
-    if (!Number.isFinite(n) || n < 1 || n > limits.maxAggLimit) {
-      const err = new Error(`analysis/invalid-args: limit must be 1..${limits.maxAggLimit}`) as Error & { code?: string }
+  const knownSpecKeys = new Set(['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy', 'limit'])
+  for (const key of Object.keys(obj)) {
+    if (!knownSpecKeys.has(key)) {
+      const err = new Error(`analysis/invalid-args: unknown spec key ${key}`) as Error & { code?: string }
       err.code = 'analysis/invalid-args'
       throw err
+    }
+  }
+  for (const key of ['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy']) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) {
+      const err = new Error(`analysis/invalid-args: ${key} must be an array`) as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+  }
+  if (obj.limit !== undefined) {
+    const n = obj.limit
+    if (typeof n !== 'number' || !Number.isFinite(n)) {
+      const err = new Error('analysis/invalid-args: limit must be a number') as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+    if (!Number.isInteger(n) || n < 1 || n > limits.maxAggLimit) {
+      const err = new Error(`analysis/invalid-args: limit must be an integer 1..${limits.maxAggLimit}`) as Error & { code?: string }
+      err.code = 'analysis/invalid-args'
+      throw err
+    }
+  }
+  if (Array.isArray(obj.select)) {
+    for (const s of obj.select as unknown[]) {
+      if (typeof s !== 'string') {
+        const err = new Error('analysis/invalid-args: select entries must be strings') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
     }
   }
   if (Array.isArray(obj.filter)) {
@@ -177,6 +206,34 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     for (const f of obj.filter as Array<Record<string, unknown>>) {
       if (!f || typeof f !== 'object' || typeof f.op !== 'string' || !ops.has(f.op)) {
         const err = new Error('analysis/invalid-args: bad filter op') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      if (typeof f.column !== 'string' || !f.column) {
+        const err = new Error('analysis/invalid-args: filter column required') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      if (f.op === 'is_null' || f.op === 'not_null') continue // value ignored by the CLI
+      if (!('value' in f)) {
+        const err = new Error(`analysis/invalid-args: filter value required for op ${f.op}`) as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      const v = f.value
+      if (Array.isArray(v)) {
+        if (f.op !== 'in') {
+          const err = new Error(`analysis/invalid-args: filter value must not be an array for op ${f.op}`) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if ((v as unknown[]).some((e) => typeof e !== 'string' && typeof e !== 'number' && typeof e !== 'boolean')) {
+          const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+      } else if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+        const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
         err.code = 'analysis/invalid-args'
         throw err
       }
@@ -226,6 +283,21 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     for (const a of obj.aggs as Array<Record<string, unknown>>) {
       if (!a || typeof a !== 'object' || typeof a.fn !== 'string' || !fns.has(a.fn)) {
         const err = new Error('analysis/invalid-args: bad agg fn') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+    }
+  }
+  if (Array.isArray(obj.orderBy)) {
+    for (const o of obj.orderBy as unknown[]) {
+      const co = o as Record<string, unknown> | null
+      if (!co || typeof co !== 'object' || Array.isArray(co) || typeof co.column !== 'string') {
+        const err = new Error('analysis/invalid-args: orderBy entries need a column name') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      if (co.desc !== undefined && typeof co.desc !== 'boolean') {
+        const err = new Error('analysis/invalid-args: orderBy desc must be boolean') as Error & { code?: string }
         err.code = 'analysis/invalid-args'
         throw err
       }
@@ -469,8 +541,10 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                   datasetId: { type: 'string' },
                   rowCount: { type: 'number' },
                   columnCount: { type: 'number' },
-                  label: { type: ['string', 'null'] },
+                  label: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   producedBy: { type: 'string' },
+                  parentDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  sourceKind: { type: 'string' },
                 },
                 additionalProperties: true,
               },
@@ -674,10 +748,16 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             type: 'string',
             description:
               'JSON string: { select?, filter?, mutate?, groupBy?, aggs?, orderBy?, limit? }. ' +
+              'filter MUST be an array of predicate objects, e.g. ' +
+              '[{"column":"amount","op":"gt","value":3000}]; a bare object filter ' +
+              '(e.g. {"filter":{"column":"amount","op":"gt","value":3000}}) or a string filter ' +
+              'is rejected with analysis/invalid-args. ' +
               'filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
+              'value: scalar (op in also accepts an array of scalars; every member matches). ' +
               'agg fns: count/sum/mean/min/max/median/std. ' +
               'mutate: [{as,expr}] whitelist arithmetic only (no functions). ' +
-              'groupBy entries: column name or {dateColumn,period:day|week|month}.',
+              'groupBy entries: column name or {dateColumn,period:day|week|month}. ' +
+              'Unknown top-level spec keys are rejected.',
           },
           outLabel: {
             type: 'string',
@@ -692,7 +772,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           type: 'object',
           properties: {
             datasetId: { type: 'string' },
-            outDatasetId: { type: 'string' },
+            outDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             rowCount: { type: 'number' },
             columns: { type: 'array', items: { type: 'string' } },
             rows: { type: 'array', items: { type: 'array' } },
@@ -831,7 +911,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                 method: { type: 'string' },
                 n: { type: 'number' },
                 seed: { type: 'number' },
-                stratifyBy: { type: ['string', 'null'] },
+                stratifyBy: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                 population: { type: 'number' },
               },
             },
@@ -1070,6 +1150,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: { type: 'string' },
             rowCount: { type: 'number' },
             mode: { type: 'string' },
+            keyColumns: {
+              oneOf: [
+                { type: 'array', items: { type: 'string' } },
+                { type: 'null' },
+              ],
+            },
             duplicateRowCount: { type: 'number' },
             duplicateRowRate: { type: 'number' },
             samples: { type: 'array', items: { type: 'object', additionalProperties: true } },
@@ -1160,7 +1246,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             rowCount: { type: 'number' },
             method: { type: 'string' },
             k: { type: 'number' },
-            outDatasetId: { type: ['string', 'null'] },
+            outDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             columns: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'method', 'columns'],

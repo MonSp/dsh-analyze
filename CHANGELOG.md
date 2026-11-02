@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Tool schemas: nullable outputs (`outDatasetId` / `stratifyBy` / `label`) use
+  `oneOf: [string, null]` instead of JSON Schema type arrays / plain `string`,
+  so tools register on DSH hosts and CLI `null` values pass output validation.
+  `dataset_list` now declares `parentDatasetId` (`string | null`) and
+  `sourceKind` alongside `label`.
+- `agg` spec parsing: non-array `filter`, wrong-shape `select` / `mutate` /
+  `groupBy` / `aggs` / `orderBy` / `limit`, and unknown top-level keys are
+  rejected (`analysis/invalid-args`, CLI exit 2) instead of silently dropped;
+  nested same-name keys no longer shadow top-level fields, so key order cannot
+  change results.
+- `agg` `limit` must be an integer `1..5000` at parse time (was silently
+  clamped to the row count). Type errors now report `limit must be a number`
+  and range errors `limit must be an integer 1..5000`, consistently on both
+  the tool layer and the CLI. Tool-layer `validateAggSpec` also checks
+  `select` entries and `orderBy` items before spawn.
+- `filter` value shapes: `value` is required for every op except `is_null` /
+  `not_null` (was a silent null default); only `op: "in"` accepts an array of
+  scalars — all members now match (previously only the first was kept, and
+  numeric members matched nothing). Arrays for other ops and non-scalar
+  values are rejected. `extract_array` bracket matching is string-aware, so
+  `select` / `in` strings containing `[` or `]` parse intact.
+- Number literals use one lexer across `limit`, filter `value`, and `in`
+  members: exponents (`2e1`, `3e3`) parse as JSON numbers everywhere, and
+  trailing junk (`2abc`) is rejected instead of silently reading a prefix.
+- Item arrays (`filter` / `aggs` / `orderBy` / `mutate`) and `select` string
+  arrays are escape-aware: `\"` inside a string no longer swallows later
+  items or truncates names.
+- `validateAggSpec` requires a filter `column` before spawn; CLI-side
+  `orderBy.desc` must be a boolean (was silently `false`); `dataset_dedup`
+  declares `keyColumns` (`string[] | null`) in its output schema.
+
 ## 0.1.5
 
 Time-series increment (lag / lead / diff / pct_change / rolling).
