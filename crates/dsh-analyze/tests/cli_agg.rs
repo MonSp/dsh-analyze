@@ -29,12 +29,12 @@ fn temp_workspace() -> PathBuf {
 
 const ID: &str = "ds_aabbccdd11223344";
 
-fn ingest(ws: &Path) {
-    fs::write(ws.join("data").join("a.csv"), "amount\n100\n3000\n5000\n").unwrap();
+fn ingest_csv(ws: &Path, file: &str, body: &str, id: &str) {
+    fs::write(ws.join("data").join(file), body).unwrap();
     let out = bin()
         .arg("--workspace")
         .arg(ws)
-        .args(["ingest", "--input", "data/a.csv", "--dataset-id", ID])
+        .args(["ingest", "--input", &format!("data/{file}"), "--dataset-id", id])
         .output()
         .expect("spawn dsh-analyze");
     assert!(
@@ -42,6 +42,10 @@ fn ingest(ws: &Path) {
         "ingest failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn ingest(ws: &Path) {
+    ingest_csv(ws, "a.csv", "amount\n100\n3000\n5000\n", ID);
 }
 
 fn run_agg(ws: &Path, spec: &str) -> Output {
@@ -149,4 +153,57 @@ fn agg_nested_keys_never_shadow_top_level() {
     );
     let line = String::from_utf8_lossy(&out.stdout);
     assert!(line.contains("\"rowCount\":1"), "stdout={line}");
+}
+
+/// `in` matches every listed member, not just the first (PR #6 review item).
+#[test]
+fn agg_filter_in_matches_all_values() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    for spec in [
+        r#"{"filter":[{"op":"in","column":"amount","value":[100,3000]}]}"#,
+        r#"{"filter":[{"op":"in","column":"amount","value":["100","3000"]}]}"#,
+    ] {
+        let out = run_agg(&ws, spec);
+        assert!(
+            out.status.success(),
+            "spec {spec} must succeed, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.contains("\"rowCount\":2"), "spec {spec} stdout={line}");
+    }
+}
+
+/// Bad filter value shapes exit 2 instead of silently defaulting.
+#[test]
+fn agg_filter_value_shapes_rejected_exit_2() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    for spec in [
+        r#"{"filter":[{"op":"eq","column":"amount","value":[1,2]}]}"#,
+        r#"{"filter":[{"op":"eq","column":"amount"}]}"#,
+        r#"{"filter":[{"op":"eq","column":"amount","value":{"x":1}}]}"#,
+    ] {
+        let out = run_agg(&ws, spec);
+        assert_eq!(out.status.code(), Some(2), "spec {spec} must exit 2");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("filter value"), "stderr={err}");
+    }
+}
+
+/// Column names containing `]` survive array extraction (string-aware brackets).
+#[test]
+fn agg_select_column_with_bracket() {
+    let ws = temp_workspace();
+    ingest_csv(&ws, "br.csv", "A]B\n1\n2\n3\n", ID);
+    let out = run_agg(&ws, r#"{"select":["A]B"]}"#);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(line.contains("\"rowCount\":3"), "stdout={line}");
+    assert!(line.contains("A]B"), "stdout={line}");
 }

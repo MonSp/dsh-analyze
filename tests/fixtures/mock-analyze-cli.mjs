@@ -288,6 +288,7 @@ async function main() {
           case 'gte': return Number(cell) >= Number(f.value)
           case 'lt': return Number(cell) < Number(f.value)
           case 'lte': return Number(cell) <= Number(f.value)
+          case 'in': return (Array.isArray(f.value) ? f.value : [f.value]).some(v => cell == v)
           case 'contains': return String(cell ?? '').includes(String(f.value))
           default: fail(2, `analysis/invalid-args: bad op ${f.op}`)
         }

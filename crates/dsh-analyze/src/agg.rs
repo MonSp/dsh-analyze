@@ -11,6 +11,8 @@ pub struct Filter {
     pub op: String,
     pub column: String,
     pub value: Value,
+    /// Set members for `op == "in"` (possibly empty); empty for every other op.
+    pub members: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,10 +117,7 @@ pub fn run_agg(
                         _ => false,
                     }
                 }
-                "in" => match &f.value {
-                    Value::Str(_) => values_eq(&cell, &f.value),
-                    _ => false,
-                },
+                "in" => f.members.iter().any(|m| values_eq(&cell, m)),
                 "contains" => match (&cell, &f.value) {
                     (Value::Str(a), Value::Str(b)) => a.contains(b.as_str()),
                     _ => false,
@@ -597,6 +596,7 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             if !validate_op(&op) {
                 return Err(format!("analysis/invalid-args: bad filter op {op}"));
             }
+            let mut in_members: Option<Vec<Value>> = None;
             let value = if op == "is_null" || op == "not_null" {
                 Value::Null
             } else if let Some(v) = extract_number(&obj, "value")? {
@@ -606,12 +606,26 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
             } else if let Some(v) = extract_string_field(&obj, "value")? {
                 Value::Str(v)
             } else if let Some(arr) = extract_array(&obj, "value")? {
-                let items = parse_string_array(&arr)?;
-                Value::Str(items.first().cloned().unwrap_or_default())
-            } else {
+                if op != "in" {
+                    return Err(format!(
+                        "analysis/invalid-args: filter value must not be an array for op {op}"
+                    ));
+                }
+                in_members = Some(parse_value_array(&arr)?);
                 Value::Null
+            } else if find_key(&obj, "\"value\"").is_some() {
+                return Err("analysis/invalid-args: bad filter value".into());
+            } else {
+                return Err(format!(
+                    "analysis/invalid-args: filter value required for op {op}"
+                ));
             };
-            spec.filter.push(Filter { op, column, value });
+            let members = match in_members {
+                Some(m) => m,
+                None if op == "in" => vec![value.clone()],
+                None => Vec::new(),
+            };
+            spec.filter.push(Filter { op, column, value, members });
         }
     } else if has("filter") {
         return Err("analysis/invalid-args: filter must be an array".into());
@@ -691,9 +705,24 @@ fn extract_array(json: &str, key: &str) -> Result<Option<String>, String> {
     if !after.starts_with('[') {
         return Ok(None);
     }
+    // String-aware bracket matching: `[` / `]` inside string elements must not
+    // truncate the array (e.g. select ["A]B"]).
     let mut depth = 0;
+    let mut in_str = false;
+    let mut esc = false;
     for (i, ch) in after.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_str = true,
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -929,6 +958,87 @@ fn parse_string_array(arr: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Parse a JSON array of scalar filter values (string / number / bool) for
+/// `op: "in"`. Non-scalar elements are rejected instead of silently dropped.
+fn parse_value_array(arr: &str) -> Result<Vec<Value>, String> {
+    let inner = arr
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| "analysis/invalid-args: bad array".to_string())?;
+    let mut out = Vec::new();
+    let mut rest = inner;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(t) = rest.strip_prefix(',') {
+            rest = t;
+            continue;
+        }
+        if rest.starts_with('"') {
+            let mut s = String::new();
+            let mut closed = false;
+            let mut esc = false;
+            let mut consumed = 1usize;
+            for (i, ch) in rest[1..].char_indices() {
+                let abs = 1 + i;
+                if esc {
+                    s.push(ch);
+                    esc = false;
+                    consumed = abs + ch.len_utf8();
+                    continue;
+                }
+                match ch {
+                    '\\' => {
+                        esc = true;
+                        consumed = abs + 1;
+                    }
+                    '"' => {
+                        closed = true;
+                        consumed = abs + 1;
+                        break;
+                    }
+                    _ => {
+                        s.push(ch);
+                        consumed = abs + ch.len_utf8();
+                    }
+                }
+            }
+            if !closed {
+                return Err("analysis/invalid-args: unterminated string".into());
+            }
+            out.push(Value::Str(s));
+            rest = &rest[consumed..];
+            continue;
+        }
+        if rest.starts_with("true") {
+            out.push(Value::Bool(true));
+            rest = &rest[4..];
+            continue;
+        }
+        if rest.starts_with("false") {
+            out.push(Value::Bool(false));
+            rest = &rest[5..];
+            continue;
+        }
+        let tok: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+            .collect();
+        if tok.is_empty() {
+            return Err("analysis/invalid-args: bad filter value".into());
+        }
+        let n: f64 = tok
+            .parse()
+            .map_err(|_| format!("analysis/invalid-args: bad filter value {tok}"))?;
+        out.push(Value::F64(n));
+        rest = &rest[tok.len()..];
+    }
+    Ok(out)
+}
+
 fn split_top_objects(arr: &str) -> Result<Vec<String>, String> {
     let inner = arr
         .trim()
@@ -1113,6 +1223,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.select.as_deref(), Some(&["region".to_string()][..]));
+    }
+
+    /// `in` matches every listed member (OR), not just the first (PR #6 review item).
+    #[test]
+    fn filter_in_matches_all_members() {
+        // all three rows: regions A and B are both members
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":["A","B"]}]}"#)
+                .unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 3);
+        // numeric members: hits 1 and 3 match, hits 2 does not
+        let spec = parse_spec_json(r#"{"filter":[{"op":"in","column":"hits","value":[1,3]}]}"#)
+            .unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 2);
+        // scalar form is a one-member set
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":"B"}]}"#).unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 1);
+        // empty member set matches nothing (literal empty set, not a null match)
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"region","value":[]}]}"#).unwrap();
+        assert_eq!(run_agg(&table(), &spec, 1000, 5000).unwrap().table.rows.len(), 0);
+    }
+
+    /// filter value shapes: arrays only for `in`, value required for the other
+    /// ops, non-scalar values rejected — never a silent default.
+    #[test]
+    fn filter_value_shapes_enforced() {
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":[1,2]}]}"#).unwrap_err();
+        assert!(err.contains("filter value must not be an array"));
+        let err = parse_spec_json(r#"{"filter":[{"op":"eq","column":"a"}]}"#).unwrap_err();
+        assert!(err.contains("filter value required for op eq"));
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"eq","column":"a","value":{"x":1}}]}"#).unwrap_err();
+        assert!(err.contains("bad filter value"));
+        let err =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"a","value":[1,null]}]}"#)
+                .unwrap_err();
+        assert!(err.contains("bad filter value"));
+        // is_null / not_null need no value
+        assert!(parse_spec_json(r#"{"filter":[{"op":"is_null","column":"a"}]}"#).is_ok());
+        assert!(parse_spec_json(r#"{"filter":[{"op":"not_null","column":"a"}]}"#).is_ok());
+    }
+
+    /// Bracket matching is string-aware: `[` / `]` inside string elements must
+    /// not truncate the array (PR #6 review item).
+    #[test]
+    fn extract_array_string_brackets() {
+        let spec = parse_spec_json(r#"{"select":["A]B","C"]}"#).unwrap();
+        assert_eq!(
+            spec.select.as_deref(),
+            Some(&["A]B".to_string(), "C".to_string()][..])
+        );
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"a","value":["x]y","z"]}]}"#)
+                .unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::Str("x]y".into()), Value::Str("z".into())]);
     }
 
     #[test]

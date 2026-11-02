@@ -209,6 +209,29 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
         err.code = 'analysis/invalid-args'
         throw err
       }
+      if (f.op === 'is_null' || f.op === 'not_null') continue // value ignored by the CLI
+      if (!('value' in f)) {
+        const err = new Error(`analysis/invalid-args: filter value required for op ${f.op}`) as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
+      const v = f.value
+      if (Array.isArray(v)) {
+        if (f.op !== 'in') {
+          const err = new Error(`analysis/invalid-args: filter value must not be an array for op ${f.op}`) as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+        if ((v as unknown[]).some((e) => typeof e !== 'string' && typeof e !== 'number' && typeof e !== 'boolean')) {
+          const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
+          err.code = 'analysis/invalid-args'
+          throw err
+        }
+      } else if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+        const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
     }
   }
   if (Array.isArray(obj.mutate)) {
@@ -725,6 +748,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               '(e.g. {"filter":{"column":"amount","op":"gt","value":3000}}) or a string filter ' +
               'is rejected with analysis/invalid-args. ' +
               'filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
+              'value: scalar (op in also accepts an array of scalars; every member matches). ' +
               'agg fns: count/sum/mean/min/max/median/std. ' +
               'mutate: [{as,expr}] whitelist arithmetic only (no functions). ' +
               'groupBy entries: column name or {dateColumn,period:day|week|month}. ' +

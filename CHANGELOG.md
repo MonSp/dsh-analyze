@@ -19,6 +19,12 @@
   and range errors `limit must be an integer 1..5000`, consistently on both
   the tool layer and the CLI. Tool-layer `validateAggSpec` also checks
   `select` entries and `orderBy` items before spawn.
+- `filter` value shapes: `value` is required for every op except `is_null` /
+  `not_null` (was a silent null default); only `op: "in"` accepts an array of
+  scalars — all members now match (previously only the first was kept, and
+  numeric members matched nothing). Arrays for other ops and non-scalar
+  values are rejected. `extract_array` bracket matching is string-aware, so
+  `select` / `in` strings containing `[` or `]` parse intact.
 
 ## 0.1.5
 
