@@ -209,6 +209,11 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
         err.code = 'analysis/invalid-args'
         throw err
       }
+      if (typeof f.column !== 'string' || !f.column) {
+        const err = new Error('analysis/invalid-args: filter column required') as Error & { code?: string }
+        err.code = 'analysis/invalid-args'
+        throw err
+      }
       if (f.op === 'is_null' || f.op === 'not_null') continue // value ignored by the CLI
       if (!('value' in f)) {
         const err = new Error(`analysis/invalid-args: filter value required for op ${f.op}`) as Error & { code?: string }
@@ -1145,6 +1150,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: { type: 'string' },
             rowCount: { type: 'number' },
             mode: { type: 'string' },
+            keyColumns: {
+              oneOf: [
+                { type: 'array', items: { type: 'string' } },
+                { type: 'null' },
+              ],
+            },
             duplicateRowCount: { type: 'number' },
             duplicateRowRate: { type: 'number' },
             samples: { type: 'array', items: { type: 'object', additionalProperties: true } },

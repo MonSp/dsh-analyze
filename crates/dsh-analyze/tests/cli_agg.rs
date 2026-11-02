@@ -207,3 +207,56 @@ fn agg_select_column_with_bracket() {
     assert!(line.contains("\"rowCount\":3"), "stdout={line}");
     assert!(line.contains("A]B"), "stdout={line}");
 }
+
+/// Number literals parse identically on every path; trailing junk errors.
+#[test]
+fn agg_number_lexing_consistent() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    // 2e1 = 20 (a silent prefix read of 2 would truncate to rowCount 2)
+    let out = run_agg(&ws, r#"{"limit":2e1}"#);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"rowCount\":3"),
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // 3e3 = 3000: only 5000 survives (a prefix read of 3 passes all rows)
+    let out = run_agg(&ws, r#"{"filter":[{"op":"gt","column":"amount","value":3e3}]}"#);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"rowCount\":1"));
+    // in scalar 1e2 = 100: one row (a prefix read of 1 matches nothing)
+    let out = run_agg(&ws, r#"{"filter":[{"op":"in","column":"amount","value":1e2}]}"#);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"rowCount\":1"));
+    // trailing junk is rejected instead of reading the prefix
+    let out = run_agg(&ws, r#"{"limit":2abc}"#);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bad number"), "stderr={err}");
+}
+
+/// Escaped quotes inside a filter item must not swallow later filters
+/// (the whole table used to come back with ok:true).
+#[test]
+fn agg_escaped_quotes_keep_all_filters() {
+    let ws = temp_workspace();
+    ingest(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"filter":[{"op":"ne","column":"amount","value":"x\"y"},{"op":"gt","column":"amount","value":3000}]}"#,
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // first filter keeps all rows, second keeps only 5000 — if it were
+    // swallowed the response would return all 3 rows
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(line.contains("\"rowCount\":1"), "stdout={line}");
+}

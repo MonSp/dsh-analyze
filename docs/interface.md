@@ -166,14 +166,18 @@ Spec key shapes (enforced by the CLI and by tool-layer `validateAggSpec`):
   object `{"filter": {"column":"amount","op":"gt","value":3000}}` (or a
   string) is rejected with `analysis/invalid-args: filter must be an array`,
   never applied as "no filter".
-- A filter item's `value` is a scalar (string / number / boolean), required
-  for every op except `is_null` / `not_null`. `op: "in"` also accepts an
+- A filter item needs a `column` string
+  (`analysis/invalid-args: filter column required`). Its `value` is a scalar
+  (string / number / boolean), required for every op except `is_null` /
+  `not_null`. `op: "in"` also accepts an
   **array of scalars** — every member matches (OR); a single scalar counts as
   a one-member set and `[]` matches nothing. Arrays for other ops,
   non-scalar members, and missing values fail with
   `analysis/invalid-args: filter value …` — never a silent first-element
   pick or null default.
 - `select` / `mutate` / `groupBy` / `aggs` / `orderBy` must be arrays;
+  `orderBy` items need a string `column` and an optional boolean `desc`
+  (`analysis/invalid-args: orderBy desc must be boolean` otherwise);
   `limit` must be an integer `1..5000`. Wrong shapes fail with
   `analysis/invalid-args`.
 - Unknown top-level spec keys are rejected

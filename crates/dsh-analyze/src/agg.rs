@@ -652,7 +652,13 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
         for obj in split_top_objects(&arr)? {
             let column = extract_string_field(&obj, "column")?
                 .ok_or_else(|| "analysis/invalid-args: orderBy column required".to_string())?;
-            let desc = extract_bool(&obj, "desc")?.unwrap_or(false);
+            let desc = if find_key(&obj, "\"desc\"").is_some() {
+                extract_bool(&obj, "desc")?.ok_or_else(|| {
+                    "analysis/invalid-args: orderBy desc must be boolean".to_string()
+                })?
+            } else {
+                false
+            };
             spec.order_by.push(OrderBy { column, desc });
         }
     } else if has("orderBy") {
@@ -736,6 +742,35 @@ fn extract_array(json: &str, key: &str) -> Result<Option<String>, String> {
     Err("analysis/invalid-args: unterminated array".into())
 }
 
+/// Lex a JSON-style number at the start of `s` (optional sign, digits,
+/// fraction, `e` / `E` exponent). Returns `Ok(None)` when `s` does not start
+/// with a number at all, `Err` when a number token is malformed or followed
+/// by junk (`2abc`, `2e`) — callers must never silently read a prefix like
+/// `2` from `2e1`.
+fn lex_number(s: &str) -> Result<Option<(f64, &str)>, String> {
+    let tok: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+        .collect();
+    if tok.is_empty() {
+        return Ok(None);
+    }
+    let after = &s[tok.len()..];
+    // The token must end at a value boundary: end of input, whitespace, or a
+    // structural character that can follow a value.
+    let boundary_ok = match after.chars().next() {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, ',' | '}' | ']'),
+    };
+    if !boundary_ok {
+        return Err("analysis/invalid-args: bad number".into());
+    }
+    let n: f64 = tok
+        .parse()
+        .map_err(|_| format!("analysis/invalid-args: bad number {tok}"))?;
+    Ok(Some((n, after)))
+}
+
 fn extract_number(json: &str, key: &str) -> Result<Option<f64>, String> {
     let needle = format!("\"{key}\"");
     let Some(idx) = find_key(json, &needle) else {
@@ -746,17 +781,7 @@ fn extract_number(json: &str, key: &str) -> Result<Option<f64>, String> {
         return Ok(None);
     }
     let after = after[1..].trim_start();
-    let digits: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    if digits.is_empty() {
-        return Ok(None);
-    }
-    digits
-        .parse()
-        .map(Some)
-        .map_err(|_| "analysis/invalid-args: bad number".into())
+    Ok(lex_number(after)?.map(|(n, _)| n))
 }
 
 fn extract_bool(json: &str, key: &str) -> Result<Option<bool>, String> {
@@ -940,6 +965,14 @@ fn parse_string_array(arr: &str) -> Result<Vec<String>, String> {
             chars.next();
             let mut s = String::new();
             while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    // Keep escaped characters (e.g. `\"` / `\\`) intact so a
+                    // quote inside a string element does not end it early.
+                    if let Some(n) = chars.next() {
+                        s.push(n);
+                    }
+                    continue;
+                }
                 if ch == '"' {
                     break;
                 }
@@ -1023,18 +1056,13 @@ fn parse_value_array(arr: &str) -> Result<Vec<Value>, String> {
             rest = &rest[5..];
             continue;
         }
-        let tok: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
-            .collect();
-        if tok.is_empty() {
-            return Err("analysis/invalid-args: bad filter value".into());
+        match lex_number(rest)? {
+            Some((n, after)) => {
+                out.push(Value::F64(n));
+                rest = after;
+            }
+            None => return Err("analysis/invalid-args: bad filter value".into()),
         }
-        let n: f64 = tok
-            .parse()
-            .map_err(|_| format!("analysis/invalid-args: bad filter value {tok}"))?;
-        out.push(Value::F64(n));
-        rest = &rest[tok.len()..];
     }
     Ok(out)
 }
@@ -1049,10 +1077,15 @@ fn split_top_objects(arr: &str) -> Result<Vec<String>, String> {
     let mut depth = 0;
     let mut cur = String::new();
     let mut in_str = false;
+    let mut esc = false;
     for ch in inner.chars() {
         if in_str {
             cur.push(ch);
-            if ch == '"' {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
                 in_str = false;
             }
             continue;
@@ -1281,6 +1314,58 @@ mod tests {
             parse_spec_json(r#"{"filter":[{"op":"in","column":"a","value":["x]y","z"]}]}"#)
                 .unwrap();
         assert_eq!(spec.filter[0].members, vec![Value::Str("x]y".into()), Value::Str("z".into())]);
+    }
+
+    /// One number lexer for every path: exponents parse as JSON numbers
+    /// everywhere, trailing junk is rejected — never a silent prefix.
+    #[test]
+    fn number_lexing_consistent() {
+        assert_eq!(parse_spec_json(r#"{"limit":2e1}"#).unwrap().limit, Some(20));
+        assert_eq!(parse_spec_json(r#"{"limit":1e3}"#).unwrap().limit, Some(1000));
+        let err = parse_spec_json(r#"{"limit":2abc}"#).unwrap_err();
+        assert!(err.contains("bad number"), "err={err}");
+        let err = parse_spec_json(r#"{"limit":2e}"#).unwrap_err();
+        assert!(err.contains("bad number"), "err={err}");
+
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"gt","column":"amount","value":3e3}]}"#).unwrap();
+        assert_eq!(spec.filter[0].value, Value::F64(3000.0));
+
+        // scalar and array members of `in` read the same literal identically
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"amount","value":2e3}]}"#).unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::F64(2000.0)]);
+        let spec =
+            parse_spec_json(r#"{"filter":[{"op":"in","column":"amount","value":[2e3]}]}"#)
+                .unwrap();
+        assert_eq!(spec.filter[0].members, vec![Value::F64(2000.0)]);
+    }
+
+    /// Escaped quotes inside item strings must not swallow later items or
+    /// truncate string-array elements.
+    #[test]
+    fn escaped_quotes_in_item_strings() {
+        let spec = parse_spec_json(
+            r#"{"filter":[{"op":"ne","column":"amount","value":"x\"y"},{"op":"gt","column":"amount","value":2000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.filter.len(), 2);
+        assert_eq!(spec.filter[0].value, Value::Str("x\"y".into()));
+        assert_eq!(spec.filter[1].op, "gt");
+        assert_eq!(spec.filter[1].value, Value::F64(2000.0));
+        // select elements keep escaped quotes intact
+        let spec = parse_spec_json(r#"{"select":["a\"b"]}"#).unwrap();
+        assert_eq!(spec.select.as_deref(), Some(&["a\"b".to_string()][..]));
+    }
+
+    /// `desc` must be a boolean when present (same text as the tool layer).
+    #[test]
+    fn order_by_desc_strict() {
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a","desc":true}]}"#).is_ok());
+        assert!(parse_spec_json(r#"{"orderBy":[{"column":"a"}]}"#).is_ok());
+        let err =
+            parse_spec_json(r#"{"orderBy":[{"column":"a","desc":"true"}]}"#).unwrap_err();
+        assert!(err.contains("orderBy desc must be boolean"), "err={err}");
     }
 
     #[test]

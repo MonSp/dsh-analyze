@@ -25,6 +25,15 @@
   numeric members matched nothing). Arrays for other ops and non-scalar
   values are rejected. `extract_array` bracket matching is string-aware, so
   `select` / `in` strings containing `[` or `]` parse intact.
+- Number literals use one lexer across `limit`, filter `value`, and `in`
+  members: exponents (`2e1`, `3e3`) parse as JSON numbers everywhere, and
+  trailing junk (`2abc`) is rejected instead of silently reading a prefix.
+- Item arrays (`filter` / `aggs` / `orderBy` / `mutate`) and `select` string
+  arrays are escape-aware: `\"` inside a string no longer swallows later
+  items or truncates names.
+- `validateAggSpec` requires a filter `column` before spawn; CLI-side
+  `orderBy.desc` must be a boolean (was silently `false`); `dataset_dedup`
+  declares `keyColumns` (`string[] | null`) in its output schema.
 
 ## 0.1.5
 

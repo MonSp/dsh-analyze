@@ -546,6 +546,10 @@ test('validateAggSpec rejects out-of-range limit and bad ops', () => {
     /filter value required for op eq/,
   )
   assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: [{ op: 'eq', value: 1 }] }), limits),
+    /filter column required/,
+  )
+  assert.throws(
     () => validateAggSpec(JSON.stringify({ filter: [{ column: 'a', op: 'eq', value: [1, 2] }] }), limits),
     /must not be an array/,
   )

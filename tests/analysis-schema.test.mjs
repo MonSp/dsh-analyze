@@ -134,6 +134,12 @@ test('BUG-1/2: nullable output fields are declared oneOf [string, null]', () => 
       NULLABLE_STRING,
     )
     assert.deepEqual(
+      defs.dataset_dedup.output.schema.properties.keyColumns,
+      {
+        oneOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }],
+      },
+    )
+    assert.deepEqual(
       defs.transform_agg.output.schema.properties.outDatasetId,
       NULLABLE_STRING,
     )
@@ -189,6 +195,11 @@ test('BUG-2: CLI null outputs pass output schema validation', async () => {
     })
     assert.equal(out.outDatasetId, null)
     validateSchema(out, defs.dataset_outliers.output.schema)
+
+    // dataset_dedup exact mode -> keyColumns === null
+    const dedup = await defs.dataset_dedup.execute({ datasetId: first.datasetId })
+    assert.equal(dedup.keyColumns, null)
+    validateSchema(dedup, defs.dataset_dedup.output.schema)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }
