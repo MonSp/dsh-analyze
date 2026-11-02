@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.6
+
+Tool-layer contract hardening: DSH-host-compatible nullable output schemas
+and strict `agg`-spec parsing, from the v0.1.4/v0.1.5 联调 defect list plus
+two rounds of review follow-ups.
 
 ### Fixed
 
@@ -34,6 +38,12 @@
 - `validateAggSpec` requires a filter `column` before spawn; CLI-side
   `orderBy.desc` must be a boolean (was silently `false`); `dataset_dedup`
   declares `keyColumns` (`string[] | null`) in its output schema.
+
+### Changed
+
+- Version and `version` capabilities: `0.1.6` (no new tools).
+- Public contract updated in `docs/interface.md` (v0.1.6).
+- Package version `dsh-analyze@0.1.6`.
 
 ## 0.1.5
 

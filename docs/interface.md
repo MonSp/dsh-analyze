@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.5)
+# dsh-analyze interface specification (v0.1.6)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.5` |
+| Version | `0.1.6` |
 
 ## 2. Invocation
 
@@ -57,7 +57,7 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.5","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series"]}
+{"ok":true,"version":"0.1.6","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series"]}
 ```
 
 Capability tokens: the v0.1.4 set plus `series` (appended, never inserted

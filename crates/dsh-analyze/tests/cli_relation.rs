@@ -439,7 +439,7 @@ fn version_capabilities_include_corr_crosstab() {
         assert!(out.status.success(), "version failed");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(out.contains("\"0.1.5\""), "got: {out}");
+    assert!(out.contains("\"0.1.6\""), "got: {out}");
     for tok in [
         "\"ingest\"",
         "\"head\"",

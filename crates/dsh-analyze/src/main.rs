@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use cli::fail;
 
 const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\",\"corr\",\"crosstab\",\"series\"";
-const VERSION: &str = "0.1.5";
+const VERSION: &str = "0.1.6";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
