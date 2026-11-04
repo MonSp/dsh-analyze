@@ -8,6 +8,31 @@ pub struct UtcParts {
     pub day: u32,
 }
 
+/// Civil date+time from a format-driven parse (`to_date`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CivilTime {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+impl CivilTime {
+    /// ISO-8601 UTC text: date-only when the format carried no time directives.
+    pub fn to_iso(&self, with_time: bool) -> String {
+        if with_time {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                self.year, self.month, self.day, self.hour, self.minute, self.second
+            )
+        } else {
+            format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Period {
     Day,
@@ -34,27 +59,37 @@ impl Period {
     }
 }
 
-/// Parse `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`.
-/// Returns UTC calendar date after applying offset when present.
+/// Parse a timestamp into its UTC calendar date.
+/// Accepted shapes (UTC): `%Y-%m-%d`, `%Y-%m-%dT%H:%M:%S` (with `Z` / offset),
+/// `%Y/%m/%d`, `%Y/%m/%d %H:%M:%S`, `%Y%m%d`.
 pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
     let t = s.trim();
-    if t.len() < 10 {
+    if t.is_empty() {
+        return None;
+    }
+    // %Y%m%d — exactly 8 digits
+    if t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit()) {
+        let year: i32 = t.get(0..4)?.parse().ok()?;
+        let month: u32 = t.get(4..6)?.parse().ok()?;
+        let day: u32 = t.get(6..8)?.parse().ok()?;
+        return valid_date(year, month, day);
+    }
+    if t.len() < 8 {
         return None;
     }
     let bytes = t.as_bytes();
-    // date part
-    let year: i32 = t.get(0..4)?.parse().ok()?;
-    if bytes[4] != b'-' {
+    // %Y-%m-%d / %Y/%m/%d with optional time
+    let sep = bytes.get(4).copied()?;
+    if sep != b'-' && sep != b'/' {
         return None;
     }
+    let year: i32 = t.get(0..4)?.parse().ok()?;
     let month: u32 = t.get(5..7)?.parse().ok()?;
-    if bytes[7] != b'-' {
+    if bytes.get(7).copied()? != sep {
         return None;
     }
     let day: u32 = t.get(8..10)?.parse().ok()?;
-    if month == 0 || month > 12 || day == 0 || day > 31 {
-        return None;
-    }
+    valid_date(year, month, day)?;
     // optional time
     let rest = t.get(10..)?;
     if rest.is_empty() {
@@ -80,15 +115,13 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
         let sec_str = sec_part.split('.').next().unwrap_or("0");
         let _sec: i64 = sec_str.parse().ok()?;
     }
-    // local = UTC + offset  ⇒  UTC minutes from midnight = local - offset
+    // local = UTC + offset  →  UTC minutes from midnight = local - offset
     let total_min = hour * 60 + minute - offset;
     // shift date by offset-adjusted day delta (already relative to UTC midnight)
     let mut y = year;
     let mut m = month as i32;
     let mut d = day as i32;
     let mut day_delta = total_min.div_euclid(24 * 60);
-    let _ = hour;
-    let _ = minute;
     while day_delta != 0 {
         if day_delta > 0 {
             d += 1;
@@ -119,6 +152,125 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
         month: m as u32,
         day: d as u32,
     })
+}
+
+fn valid_date(year: i32, month: u32, day: u32) -> Option<UtcParts> {
+    if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month as i32) as u32 {
+        return None;
+    }
+    Some(UtcParts { year, month, day })
+}
+
+/// Validate a `to_date` format string: only `%Y %m %d %H %M %S` directives
+/// plus literal separators. Returns whether the format carries a time part.
+pub fn validate_date_fmt(fmt: &str) -> Result<bool, String> {
+    let mut has_time = false;
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        match chars.next() {
+            Some('Y') | Some('m') | Some('d') => {}
+            Some('H') | Some('M') | Some('S') => has_time = true,
+            other => {
+                let shown = match other {
+                    Some(o) => format!("%{o}"),
+                    None => "%".to_string(),
+                };
+                return Err(format!(
+                    "analysis/invalid-args: bad date format directive {shown}"
+                ));
+            }
+        }
+    }
+    Ok(has_time)
+}
+
+/// Parse `s` against a `to_date` format (`%Y %m %d %H %M %S` + literals).
+/// The whole string must be consumed. Unspecified time fields default to 0.
+pub fn parse_with_fmt(s: &str, fmt: &str) -> Option<CivilTime> {
+    let sc: Vec<char> = s.chars().collect();
+    let fc: Vec<char> = fmt.chars().collect();
+    let mut si = 0usize;
+    let mut year: Option<i32> = None;
+    let mut month: u32 = 1;
+    let mut day: u32 = 1;
+    let mut hour: u32 = 0;
+    let mut minute: u32 = 0;
+    let mut second: u32 = 0;
+    let mut fi = 0usize;
+    while fi < fc.len() {
+        if fc[fi] == '%' {
+            fi += 1;
+            let dir = *fc.get(fi)?;
+            fi += 1;
+            match dir {
+                'Y' => {
+                    let v = take_digits(&sc, &mut si, 4)?;
+                    year = Some(v.parse().ok()?);
+                }
+                'm' => {
+                    let v = take_digits(&sc, &mut si, 2)?;
+                    month = v.parse().ok()?;
+                }
+                'd' => {
+                    let v = take_digits(&sc, &mut si, 2)?;
+                    day = v.parse().ok()?;
+                }
+                'H' => {
+                    let v = take_digits(&sc, &mut si, 2)?;
+                    hour = v.parse().ok()?;
+                }
+                'M' => {
+                    let v = take_digits(&sc, &mut si, 2)?;
+                    minute = v.parse().ok()?;
+                }
+                'S' => {
+                    let v = take_digits(&sc, &mut si, 2)?;
+                    second = v.parse().ok()?;
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        if si >= sc.len() || sc[si] != fc[fi] {
+            return None;
+        }
+        si += 1;
+        fi += 1;
+    }
+    if si != sc.len() {
+        return None;
+    }
+    let year = year?;
+    if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month as i32) as u32 {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(CivilTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
+fn take_digits(sc: &[char], si: &mut usize, n: usize) -> Option<String> {
+    let mut out = String::with_capacity(n);
+    for _ in 0..n {
+        let c = *sc.get(*si)?;
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        out.push(c);
+        *si += 1;
+    }
+    Some(out)
 }
 
 /// Split trailing `Z` / `±HH:MM` / `±HHMM` off the time string.
@@ -192,10 +344,7 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 /// ISO week: Monday of the week containing this date.
 fn monday_of_week(p: UtcParts) -> UtcParts {
     let days = days_from_civil(p.year, p.month, p.day);
-    // 1970-01-01 was Thursday; weekday 0=Mon..6=Sun for days_from_civil epoch 1970-03-01 style.
-    // Hinnant: day 0 = 1970-01-00 = 1969-12-31 which was Thursday.
-    // days_from_civil(1970,1,1) = 0 → Thursday. We want Monday-based:
-    // (weekday_from_epoch + 3) % 7 gives Mon=0 for Thursday=3.
+    // days_from_civil(1970,1,1) = 0 → Thursday. (wd + 3) % 7 gives Mon=0.
     let wd = ((days % 7) + 7 + 3) % 7; // Mon=0
     let back = wd; // days back to Monday
     let (y, m, d) = civil_from_days(days - back);
@@ -279,5 +428,41 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_timestamp_utc_date("not-a-date").is_none());
         assert!(parse_timestamp_utc_date("2024-13-01").is_none());
+    }
+
+    #[test]
+    fn parses_slash_and_compact_forms() {
+        let p = parse_timestamp_utc_date("2026/10/02").unwrap();
+        assert_eq!(p, UtcParts { year: 2026, month: 10, day: 2 });
+        let p = parse_timestamp_utc_date("2026/10/02 13:45:01").unwrap();
+        assert_eq!(p, UtcParts { year: 2026, month: 10, day: 2 });
+        let p = parse_timestamp_utc_date("20261002").unwrap();
+        assert_eq!(p, UtcParts { year: 2026, month: 10, day: 2 });
+        assert!(parse_timestamp_utc_date("2026/13/02").is_none());
+        assert!(parse_timestamp_utc_date("2026100").is_none());
+        assert!(parse_timestamp_utc_date("2026-10-02T10:00:00").is_some());
+    }
+
+    #[test]
+    fn fmt_validation() {
+        assert!(!validate_date_fmt("%Y/%m/%d").unwrap());
+        assert!(!validate_date_fmt("%Y-%m-%d").unwrap());
+        assert!(validate_date_fmt("%Y-%m-%dT%H:%M:%S").unwrap());
+        assert!(validate_date_fmt("%Y%m%d").is_ok());
+        assert!(validate_date_fmt("%F").is_err());
+        assert!(validate_date_fmt("%y").is_err());
+        assert!(validate_date_fmt("%").is_err());
+    }
+
+    #[test]
+    fn fmt_parse_roundtrip() {
+        let t = parse_with_fmt("2026/10/02", "%Y/%m/%d").unwrap();
+        assert_eq!(t.to_iso(false), "2026-10-02");
+        let t = parse_with_fmt("2026/10/02 13:45:01", "%Y/%m/%d %H:%M:%S").unwrap();
+        assert_eq!(t.to_iso(true), "2026-10-02T13:45:01");
+        let t = parse_with_fmt("2026-10-02", "%Y-%m-%d").unwrap();
+        assert_eq!(t.to_iso(false), "2026-10-02");
+        assert!(parse_with_fmt("2026-10-02", "%Y/%m/%d").is_none());
+        assert!(parse_with_fmt("2026/10/02x", "%Y/%m/%d").is_none());
     }
 }

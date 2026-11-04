@@ -255,8 +255,374 @@ fn agg_escaped_quotes_keep_all_filters() {
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // first filter keeps all rows, second keeps only 5000 — if it were
-    // swallowed the response would return all 3 rows
+    // first filter keeps all rows, second keeps only 5000
+    // (if it were swallowed the response would return all 3 rows)
     let line = String::from_utf8_lossy(&out.stdout);
     assert!(line.contains("\"rowCount\":1"), "stdout={line}");
+}
+
+// ---- v0.2.0 requirement regressions ---------------------------------------
+
+const RICH: &str = "region,amount,day\n\
+east,100,2026-10-01\n\
+east,3000,2026/10/02\n\
+west,5000,20261003\n\
+west,7000,not-a-date\n\
+east,200,2026-10-01\n";
+
+fn ingest_rich(ws: &Path) {
+    ingest_csv(ws, "rich.csv", RICH, ID);
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+// R-1: mutate arithmetic type-checks before eval; bad types exit 2.
+
+#[test]
+fn r1_numeric_mutate_still_works() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"mutate":[{"as":"dbl","expr":"amount * 2"}],"select":["dbl"],"orderBy":[{"column":"dbl"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"rowCount\":5"), "stdout={line}");
+    assert!(line.contains("200"), "stdout={line}");
+}
+
+#[test]
+fn r1_mutate_type_error_exits_2() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"x","expr":"region + 1"}]}"#);
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("analysis/invalid-args: mutate x: cannot add number to string"),
+        "stderr={err}"
+    );
+    assert!(!stdout_of(&out).contains("\"ok\":true"));
+}
+
+#[test]
+fn r1_negate_and_other_verbs() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"x","expr":"-region"}]}"#);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("cannot negate string"));
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"x","expr":"amount * region"}]}"#);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("cannot multiply number by string"));
+}
+
+// R-3: --spec never leaks OS error text.
+
+#[test]
+fn r3_spec_from_workspace_file() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    fs::write(
+        ws.join("data").join("spec.json"),
+        r#"{"aggs":[{"fn":"count","as":"n"}]}"#,
+    )
+    .unwrap();
+    let out = run_agg(&ws, "data/spec.json");
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("\"rowCount\":1"));
+}
+
+#[test]
+fn r3_spec_bad_input_stable_message() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    for bad in ["a:b:c", "diff:amount:d", "not json"] {
+        let out = run_agg(&ws, bad);
+        assert_eq!(out.status.code(), Some(2), "input {bad} must exit 2");
+        let err = stderr_of(&out);
+        assert!(
+            err.contains("--spec must be JSON object or a workspace path"),
+            "input={bad} stderr={err}"
+        );
+        assert!(!err.contains("os error"), "input={bad} stderr={err}");
+    }
+}
+
+#[test]
+fn r3_spec_missing_file_stable_reason() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, "data/nope.json");
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("cannot read spec file: file not found"),
+        "stderr={err}"
+    );
+    assert!(!err.contains("os error"), "stderr={err}");
+}
+
+// R-4: new date formats parse; parseFailSample is actionable.
+
+#[test]
+fn r4_slash_and_compact_dates_bucket() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"day","period":"month"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"day_month"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"2026-10\""), "stdout={line}");
+    assert!(line.contains("[\"2026-10\",4]"), "stdout={line}");
+}
+
+#[test]
+fn r4_parse_fail_sample_visible() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"day","period":"day"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"parseFailCount\":1"), "stdout={line}");
+    assert!(
+        line.contains("\"parseFailSample\":[\"not-a-date\"]"),
+        "stdout={line}"
+    );
+}
+
+// R-20: agg response warnings[] for runtime Nulls.
+
+#[test]
+fn r20_mutate_null_warning() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"q","expr":"amount / 0"}]}"#);
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(
+        line.contains("\"code\":\"mutate-null\"") && line.contains("\"count\":5"),
+        "stdout={line}"
+    );
+}
+
+#[test]
+fn r20_cast_null_warning() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"n","expr":"to_int(day)"}]}"#);
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    // day values: only "20261003" casts to int; the other 4 fail
+    assert!(
+        line.contains("\"code\":\"cast-null\"") && line.contains("\"count\":4"),
+        "stdout={line}"
+    );
+}
+
+#[test]
+fn r20_date_parse_fail_warning_and_no_warnings_when_clean() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"day","period":"day"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(
+        line.contains("\"code\":\"date-parse-fail\"") && line.contains("\"count\":1"),
+        "stdout={line}"
+    );
+    let out = run_agg(&ws, r#"{"aggs":[{"fn":"count","as":"n"}]}"#);
+    assert!(out.status.success());
+    assert!(!stdout_of(&out).contains("\"warnings\""));
+}
+
+// R-5: filter {all|any|not} groups.
+
+#[test]
+fn r5_filter_or_and_not() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"filter":{"any":[{"op":"eq","column":"region","value":"west"},{"op":"eq","column":"amount","value":100}]},"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("[[3]]"), "stdout={}", stdout_of(&out));
+    let out = run_agg(
+        &ws,
+        r#"{"filter":{"all":[{"any":[{"op":"eq","column":"region","value":"east"},{"op":"eq","column":"region","value":"west"}]},{"not":{"column":"amount","op":"gt","value":3000}}]},"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("[[3]]"), "stdout={}", stdout_of(&out));
+    let out = run_agg(
+        &ws,
+        r#"{"filter":{"not":{"column":"region","op":"eq","value":"east"}},"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("[[2]]"), "stdout={}", stdout_of(&out));
+}
+
+#[test]
+fn r5_filter_unknown_shape_and_depth() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(&ws, r#"{"filter":{"xor":[]}}"#);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("filter must be an array or {all|any|not} group"));
+    let mut core = r#"{"column":"amount","op":"gt","value":0}"#.to_string();
+    for _ in 0..9 {
+        core = format!(r#"{{"not":{core}}}"#);
+    }
+    let out = run_agg(&ws, &format!(r#"{{"filter":{core}}}"#));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("filter nesting too deep"));
+}
+
+// R-6: new agg functions.
+
+#[test]
+fn r6_new_agg_fns_positive() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"aggs":[{"fn":"count_distinct","column":"region","as":"nr"},{"fn":"percentile","column":"amount","p":0.95,"as":"p95"},{"fn":"first","column":"amount","as":"f"},{"fn":"last","column":"amount","as":"l"},{"fn":"count_if","where":{"column":"amount","op":"gt","value":1000},"as":"big"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"nr\""), "stdout={line}");
+    // rows carry values positionally: [nr, p95, f, l, big] = [2, 7000, 100, 200, 3]
+    assert!(line.contains("[2,7000,100,200,3]"), "stdout={line}");
+}
+
+#[test]
+fn r6_new_agg_fns_bad_params() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    for spec in [
+        r#"{"aggs":[{"fn":"percentile","column":"amount","as":"p"}]}"#,
+        r#"{"aggs":[{"fn":"percentile","column":"amount","p":1.5,"as":"p"}]}"#,
+        r#"{"aggs":[{"fn":"count_if","column":"amount","where":{"column":"amount","op":"gt","value":1},"as":"c"}]}"#,
+        r#"{"aggs":[{"fn":"count_distinct","as":"nr"}]}"#,
+    ] {
+        let out = run_agg(&ws, spec);
+        assert_eq!(out.status.code(), Some(2), "spec {spec} must exit 2");
+        assert!(
+            stderr_of(&out).contains("analysis/invalid-args"),
+            "spec {spec} stderr={}",
+            stderr_of(&out)
+        );
+    }
+}
+
+// R-7: having filters result columns after aggregation.
+
+#[test]
+fn r7_having_positive_and_unknown_column() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":["region"],"aggs":[{"fn":"count","as":"n"}],"having":[{"column":"n","op":"gt","value":2}],"orderBy":[{"column":"region"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"rowCount\":1"), "stdout={line}");
+    assert!(line.contains("\"east\""), "stdout={line}");
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":["region"],"aggs":[{"fn":"count","as":"n"}],"having":[{"column":"nope","op":"gt","value":1}]}"#,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("unknown column nope"));
+}
+
+// R-9: select rename + whitelist casts.
+
+#[test]
+fn r9_select_rename_and_to_date_group() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"select":[{"column":"region","as":"r"},{"column":"amount","as":"a"}],"limit":1}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"columns\":[\"r\",\"a\"]"), "stdout={line}");
+    let out = run_agg(
+        &ws,
+        r#"{"mutate":[{"as":"d","expr":"to_date(\"2026/10/02\", \"%Y/%m/%d\")"}],"groupBy":[{"dateColumn":"d","period":"month"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"2026-10\""), "stdout={line}");
+}
+
+#[test]
+fn r9_select_duplicate_and_to_date_type_error() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"select":[{"column":"region","as":"x"},{"column":"amount","as":"x"}]}"#,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("duplicate select name"));
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"d","expr":"to_date(amount, \"%Y\")"}]}"#);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("to_date value must be string"));
+    let out = run_agg(&ws, r#"{"mutate":[{"as":"d","expr":"to_date(day, \"%F\")"}]}"#);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("bad date format directive"));
+}
+
+// R-15: topKPerGroup.
+
+#[test]
+fn r15_top_k_per_group_positive() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"topKPerGroup":{"by":["region"],"k":1,"orderBy":{"column":"amount","desc":true}},"select":["region","amount"],"orderBy":[{"column":"region"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"rowCount\":2"), "stdout={line}");
+    assert!(line.contains("[\"east\",3000]"), "stdout={line}");
+    assert!(line.contains("[\"west\",7000]"), "stdout={line}");
+}
+
+#[test]
+fn r15_top_k_out_of_range() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    for spec in [
+        r#"{"topKPerGroup":{"by":["region"],"k":0}}"#,
+        r#"{"topKPerGroup":{"by":["region"],"k":1001}}"#,
+        r#"{"topKPerGroup":{"by":[],"k":1}}"#,
+    ] {
+        let out = run_agg(&ws, spec);
+        assert_eq!(out.status.code(), Some(2), "spec {spec} must exit 2");
+        assert!(
+            stderr_of(&out).contains("analysis/invalid-args"),
+            "spec {spec}"
+        );
+    }
 }

@@ -16,19 +16,8 @@ pub(crate) fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --spec required"),
     };
-    // Spec may be inline JSON object or a workspace-relative file path (interface spec §4).
-    let spec_text = if spec_raw.trim_start().starts_with('{') {
-        spec_raw
-    } else {
-        let spec_path = ensure_within_workspace(workspace, Path::new(&spec_raw)).map_err(|e| {
-            eprintln!("{e}");
-            2u8
-        })?;
-        fs::read_to_string(&spec_path).map_err(|e| {
-            eprintln!("analysis/invalid-args: cannot read spec file: {e}");
-            2u8
-        })?
-    };
+    // Spec may be inline JSON object or a workspace-relative file path (R-3).
+    let spec_text = resolve_spec(workspace, &spec_raw)?;
     // Windows tools may write a UTF-8 BOM; trim() does not strip U+FEFF.
     let spec_text = spec_text.strip_prefix('\u{feff}').unwrap_or(&spec_text);
     let out = flag_value(args, "--out").map(|s| s.to_string());
@@ -101,14 +90,37 @@ pub(crate) fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         String::new()
     };
 
-    let parse_field = if outcome.parse_fail_count > 0 {
-        format!(",\"parseFailCount\":{}", outcome.parse_fail_count)
-    } else {
-        String::new()
-    };
+    let mut extra = String::new();
+    if outcome.parse_fail_count > 0 {
+        extra.push_str(&format!(
+            ",\"parseFailCount\":{},\"parseFailSample\":[{}]",
+            outcome.parse_fail_count,
+            outcome
+                .parse_fail_sample
+                .iter()
+                .map(|s| json_string(s))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if !outcome.warnings.is_empty() {
+        let entries: Vec<String> = outcome
+            .warnings
+            .iter()
+            .map(|w| {
+                let mut parts = vec![format!("\"code\":{}", json_string(w.code))];
+                if let Some(col) = &w.column {
+                    parts.push(format!("\"column\":{}", json_string(col)));
+                }
+                parts.push(format!("\"count\":{}", w.count));
+                format!("{{{}}}", parts.join(","))
+            })
+            .collect();
+        extra.push_str(&format!(",\"warnings\":[{}]", entries.join(",")));
+    }
 
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"outDatasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"truncated\":{}{parse_field}}}",
+        "{{\"ok\":true,\"datasetId\":{},\"outDatasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"truncated\":{}{extra}}}",
         json_string(&id),
         if out_dataset_id.is_empty() {
             "null".into()
@@ -120,4 +132,58 @@ pub(crate) fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         rows_json,
         if truncated { "true" } else { "false" }
     ))
+}
+
+/// Resolve `--spec` as inline JSON object or a workspace file (R-3).
+/// Never leaks OS error text; non-JSON non-file input gets a stable message.
+fn resolve_spec(workspace: &Path, spec_raw: &str) -> Result<String, u8> {
+    let t = spec_raw.trim_start();
+    if t.starts_with('{') {
+        return Ok(spec_raw.to_string());
+    }
+    if !looks_like_workspace_path(spec_raw) {
+        return fail(
+            2,
+            "analysis/invalid-args: --spec must be JSON object or a workspace path",
+        );
+    }
+    let spec_path = match ensure_within_workspace(workspace, Path::new(spec_raw)) {
+        Ok(p) => p,
+        Err(e) if e.contains("escapes") => {
+            return fail(2, &e);
+        }
+        Err(_) => {
+            // Missing parent dirs / unreadable parents: stable reason, no OS text.
+            return fail(2, "analysis/invalid-args: cannot read spec file: file not found");
+        }
+    };
+    if !spec_path.exists() {
+        return fail(2, "analysis/invalid-args: cannot read spec file: file not found");
+    }
+    match fs::read_to_string(&spec_path) {
+        Ok(text) => Ok(text),
+        Err(_) => fail(2, "analysis/invalid-args: cannot read spec file: file not readable"),
+    }
+}
+
+/// A spec path candidate: no whitespace and no filename-illegal characters
+/// (after an optional `C:\` drive prefix). `a:b:c`, `diff:amount:d`, `not json`
+/// are therefore NOT paths and get the "must be JSON object or a workspace
+/// path" error instead of a leaked OS message.
+fn looks_like_workspace_path(s: &str) -> bool {
+    if s.trim().is_empty() {
+        return false;
+    }
+    let body = if s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
+    {
+        &s[2..]
+    } else {
+        s
+    };
+    !body
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
 }
