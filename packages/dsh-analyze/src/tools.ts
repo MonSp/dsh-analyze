@@ -4,7 +4,7 @@
  */
 
 import type { AnalysisLimits } from './limits.js'
-import { DEFAULT_ANALYSIS_LIMITS, clampHeadN, clampSampleN, clampValuesLimit } from './limits.js'
+import { DEFAULT_ANALYSIS_LIMITS } from './limits.js'
 import { AnalyzeCliError, runAnalyzeCli } from './cli.js'
 import {
   AnalysisPathError,
@@ -86,6 +86,49 @@ function textRender(text: string): Array<{ type: 'text'; text: string }> {
   return [{ type: 'text', text }]
 }
 
+function invalidArgs(message: string): Error & { code?: string } {
+  const err = new Error(`analysis/invalid-args: ${message}`) as Error & { code?: string }
+  err.code = 'analysis/invalid-args'
+  return err
+}
+
+function limitError(message: string): Error & { code?: string } {
+  const err = new Error(`analysis/limit: ${message}`) as Error & { code?: string }
+  err.code = 'analysis/limit'
+  return err
+}
+
+/** Unified `warnings[]` rendering appended to every tool result (R-20). */
+export function renderWarningsBlock(value: unknown): string {
+  const w = (value as { warnings?: unknown }).warnings
+  if (!Array.isArray(w) || w.length === 0) return ''
+  const lines = w.map((entry) => {
+    const e = entry as {
+      code?: unknown
+      message?: unknown
+      column?: unknown
+      count?: unknown
+      field?: unknown
+      requested?: unknown
+      actual?: unknown
+    }
+    let line = `- ${String(e.code ?? 'warning')}`
+    if (typeof e.column === 'string' && e.column) line += `: ${e.column}`
+    if (typeof e.count === 'number') line += ` (${e.count})`
+    if (typeof e.field === 'string' && e.field) {
+      line += ` ${e.field}: requested=${String(e.requested)} actual=${String(e.actual)}`
+    }
+    if (typeof e.message === 'string' && e.message) line += ` — ${e.message}`
+    return line
+  })
+  return `\nwarnings:\n${lines.join('\n')}`
+}
+
+/** Append the unified warnings block to a rendered tool result. */
+function withWarnings(text: string, value: unknown): string {
+  return text + renderWarningsBlock(value)
+}
+
 function failMessage(e: unknown): never {
   if (e instanceof AnalyzeCliError || e instanceof AnalysisPathError) {
     const err = new Error(e.message) as Error & { code?: string }
@@ -98,159 +141,360 @@ function failMessage(e: unknown): never {
   throw err
 }
 
-/** Strict integer 1..=max for quality-tool sample limits (invalid → invalid-args). */
-export function validateSampleLimit(n: unknown, def: number, max: number): number {
-  if (n === undefined || n === null) return def
-  const raw = typeof n === 'number' ? n : Number(n)
-  if (!Number.isInteger(raw) || raw < 1 || raw > max) {
-    const err = new Error(
-      `analysis/invalid-args: sampleLimit must be integer 1..${max}`,
-    ) as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+/**
+ * Positive-integer row-count / limit param: omitted → default; non-integer or
+ * <1 → invalid-args. Values above the CLI cap pass through unclamped so the
+ * CLI can clamp, echo `requestedN`/`requestedLimit`, and warn (`clamp`).
+ */
+export function validatePositiveInt(value: unknown, def: number, name: string): number {
+  if (value === undefined || value === null) return def
+  const raw = typeof value === 'number' ? value : Number(value)
+  if (!Number.isInteger(raw) || raw < 1) {
+    throw invalidArgs(`${name} must be integer >= 1`)
   }
   return raw
 }
 
-/** Whitelist arithmetic expression: identifiers, numbers, + - * /, parens, unary minus. */
+/** Back-compat alias: quality-tool sample limits share the pass-through policy. */
+export function validateSampleLimit(n: unknown, def: number): number {
+  return validatePositiveInt(n, def, 'sampleLimit')
+}
+
+/** Whitelist mutate call: only to_int(e) / to_str(e) / to_date(e, fmt). */
+const MUTATE_CAST_FNS = new Set(['to_int', 'to_str', 'to_date'])
+/** to_date fmt directives: %Y %m %d %H %M %S (literal separators allowed). */
+const FMT_DIRECTIVES = new Set(['Y', 'm', 'd', 'H', 'M', 'S'])
+
+function validateDateFormat(fmt: string): void {
+  for (let i = 0; i < fmt.length; i++) {
+    if (fmt[i] !== '%') continue
+    const directive = fmt[i + 1]
+    if (directive === undefined || !FMT_DIRECTIVES.has(directive)) {
+      throw invalidArgs('to_date fmt has unsupported directive (only %Y %m %d %H %M %S)')
+    }
+    i++
+  }
+}
+
+type MutToken =
+  | { t: 'str'; v: string }
+  | { t: 'id'; v: string }
+  | { t: 'num'; v: string }
+  | { t: 'op'; v: string }
+
+function tokenizeMutateExpr(expr: string): MutToken[] {
+  const tokens: MutToken[] = []
+  let i = 0
+  while (i < expr.length) {
+    const ch = expr[i]!
+    if (/\s/.test(ch)) {
+      i++
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < expr.length && expr[j] !== '"') {
+        if (expr[j] === '\\') j++
+        j++
+      }
+      if (j >= expr.length) throw invalidArgs('mutate expr has illegal characters')
+      tokens.push({ t: 'str', v: expr.slice(i + 1, j) })
+      i = j + 1
+      continue
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i
+      while (j < expr.length && /\w/.test(expr[j]!)) j++
+      tokens.push({ t: 'id', v: expr.slice(i, j) })
+      i = j
+      continue
+    }
+    if (/[0-9]/.test(ch)) {
+      let j = i
+      while (j < expr.length && /[0-9.]/.test(expr[j]!)) j++
+      tokens.push({ t: 'num', v: expr.slice(i, j) })
+      i = j
+      continue
+    }
+    if ('+-*/(),'.includes(ch)) {
+      tokens.push({ t: 'op', v: ch })
+      i++
+      continue
+    }
+    throw invalidArgs('mutate expr has illegal characters')
+  }
+  return tokens
+}
+
+/**
+ * Whitelist arithmetic expression: identifiers, numbers, string literals,
+ * + - * /, parens, unary minus, and to_int/to_str/to_date(e, fmt) calls.
+ */
 export function validateMutateExpr(expr: unknown): string {
   if (typeof expr !== 'string' || !expr.trim() || expr.length > 512) {
-    const err = new Error('analysis/invalid-args: mutate expr must be non-empty string ≤512') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
-  }
-  // Reject anything outside the grammar before spawn (defense in depth; CLI re-checks).
-  if (!/^[A-Za-z0-9_\s+\-*/().]+$/.test(expr)) {
-    const err = new Error('analysis/invalid-args: mutate expr has illegal characters') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
-  }
-  if (/[A-Za-z_]\w*\s*\(/.test(expr)) {
-    const err = new Error('analysis/invalid-args: function calls are not allowed in mutate expr') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+    throw invalidArgs('mutate expr must be non-empty string ≤512')
   }
   if (!/[A-Za-z_]/.test(expr) && !/\d/.test(expr)) {
-    const err = new Error('analysis/invalid-args: mutate expr is empty of operands') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+    throw invalidArgs('mutate expr is empty of operands')
   }
+  const tokens = tokenizeMutateExpr(expr)
+  let pos = 0
+  const peek = (): MutToken | undefined => tokens[pos]
+  const next = (): MutToken | undefined => tokens[pos++]
+
+  const parsePrimary = (): void => {
+    const tok = next()
+    if (!tok) throw invalidArgs('mutate expr has illegal characters')
+    if (tok.t === 'num' || tok.t === 'str') return
+    if (tok.t === 'op' && tok.v === '(') {
+      parseAdd()
+      const close = next()
+      if (!close || close.t !== 'op' || close.v !== ')') {
+        throw invalidArgs('mutate expr has illegal characters')
+      }
+      return
+    }
+    if (tok.t === 'id') {
+      const nxt = peek()
+      if (nxt && nxt.t === 'op' && nxt.v === '(') {
+        if (!MUTATE_CAST_FNS.has(tok.v)) {
+          throw invalidArgs('function calls are not allowed in mutate expr')
+        }
+        next() // consume '('
+        let argc = 0
+        if (!(peek() && peek()!.t === 'op' && peek()!.v === ')')) {
+          parseAdd() // value operand (any expression)
+          argc = 1
+          const sep = peek()
+          if (sep && sep.t === 'op' && sep.v === ',') {
+            if (tok.v !== 'to_date') {
+              throw invalidArgs(`${tok.v}(e) takes 1 argument`)
+            }
+            next()
+            const fmtTok = next()
+            if (!fmtTok || fmtTok.t !== 'str') {
+              throw invalidArgs('to_date fmt must be a string literal')
+            }
+            validateDateFormat(fmtTok.v)
+            argc = 2
+          }
+        }
+        const close = next()
+        if (!close || close.t !== 'op' || close.v !== ')') {
+          throw invalidArgs('mutate expr has illegal characters')
+        }
+        if (tok.v === 'to_date' && argc !== 2) {
+          throw invalidArgs('to_date(e, fmt) takes 2 arguments')
+        }
+        if (tok.v !== 'to_date' && argc !== 1) {
+          throw invalidArgs(`${tok.v}(e) takes 1 argument`)
+        }
+        return
+      }
+      return // plain identifier
+    }
+    if (tok.t === 'op' && tok.v === '-') {
+      parseUnary()
+      return
+    }
+    throw invalidArgs('mutate expr has illegal characters')
+  }
+  const parseUnary = (): void => {
+    const tok = peek()
+    if (tok && tok.t === 'op' && tok.v === '-') {
+      next()
+      parseUnary()
+      return
+    }
+    parsePrimary()
+  }
+  const parseMul = (): void => {
+    parseUnary()
+    for (;;) {
+      const tok = peek()
+      if (tok && tok.t === 'op' && (tok.v === '*' || tok.v === '/')) {
+        next()
+        parseUnary()
+      } else return
+    }
+  }
+  const parseAdd = (): void => {
+    parseMul()
+    for (;;) {
+      const tok = peek()
+      if (tok && tok.t === 'op' && (tok.v === '+' || tok.v === '-')) {
+        next()
+        parseMul()
+      } else return
+    }
+  }
+  parseAdd()
+  if (pos !== tokens.length) throw invalidArgs('mutate expr has illegal characters')
   return expr
+}
+
+const FILTER_OPS = new Set(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'contains', 'is_null', 'not_null'])
+const MAX_FILTER_DEPTH = 8
+
+function validatePredicateEntry(f: Record<string, unknown>, label: string): void {
+  if (!f || typeof f !== 'object' || typeof f.op !== 'string' || !FILTER_OPS.has(f.op)) {
+    throw invalidArgs(`bad ${label} op`)
+  }
+  if (typeof f.column !== 'string' || !f.column) {
+    throw invalidArgs(`${label} column required`)
+  }
+  if (f.op === 'is_null' || f.op === 'not_null') return // value ignored by the CLI
+  if (!('value' in f)) {
+    throw invalidArgs(`${label} value required for op ${f.op}`)
+  }
+  const v = f.value
+  if (Array.isArray(v)) {
+    if (f.op !== 'in') {
+      throw invalidArgs(`${label} value must not be an array for op ${f.op}`)
+    }
+    if ((v as unknown[]).some((e) => typeof e !== 'string' && typeof e !== 'number' && typeof e !== 'boolean')) {
+      throw invalidArgs(`bad ${label} value`)
+    }
+  } else if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+    throw invalidArgs(`bad ${label} value`)
+  }
+}
+
+/**
+ * Predicate tree: predicate | {"all":[item…]} | {"any":[item…]} | {"not":item},
+ * with arrays as implicit AND. Empty all → true, empty any → false. Nesting
+ * depth ≤8 (R-5).
+ */
+function validateFilterNode(node: unknown, label: string, depth: number): void {
+  if (depth > MAX_FILTER_DEPTH) throw invalidArgs(`${label} nesting too deep`)
+  if (Array.isArray(node)) {
+    for (const item of node) validateFilterNode(item, label, depth + 1)
+    return
+  }
+  if (node && typeof node === 'object') {
+    const o = node as Record<string, unknown>
+    const keys = Object.keys(o)
+    const groupKeys = keys.filter((k) => k === 'all' || k === 'any' || k === 'not')
+    if ('op' in o || groupKeys.length === 0) {
+      validatePredicateEntry(o, label)
+      return
+    }
+    if (groupKeys.length !== 1 || keys.length !== 1) {
+      throw invalidArgs(`bad ${label} group`)
+    }
+    const kind = groupKeys[0]!
+    if (kind === 'all' || kind === 'any') {
+      const list = o[kind]
+      if (!Array.isArray(list)) throw invalidArgs(`${label} ${kind} must be an array`)
+      for (const item of list) validateFilterNode(item, label, depth + 1)
+      return
+    }
+    validateFilterNode(o.not, label, depth + 1)
+    return
+  }
+  throw invalidArgs(`bad ${label} op`)
+}
+
+/** Top-level filter/having shape: AND-array or a single {all|any|not} group. */
+function validateFilterTree(root: unknown, label: string): void {
+  if (Array.isArray(root)) {
+    validateFilterNode(root, label, 1)
+    return
+  }
+  if (root && typeof root === 'object') {
+    const o = root as Record<string, unknown>
+    const keys = Object.keys(o)
+    const groupKeys = keys.filter((k) => k === 'all' || k === 'any' || k === 'not')
+    if (groupKeys.length === 1 && keys.length === 1 && !('op' in o)) {
+      validateFilterNode(root, label, 1)
+      return
+    }
+    if (groupKeys.length > 0) {
+      throw invalidArgs(`bad ${label} group`)
+    }
+  }
+  throw invalidArgs(`${label} must be an array or an all/any/not group`)
 }
 
 /** Validate agg spec string before CLI. */
 export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
   if (typeof spec !== 'string' || !spec.trim()) {
-    const err = new Error('analysis/invalid-args: spec is required') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+    throw invalidArgs('spec is required')
   }
   if (spec.length > limits.maxSpecBytes) {
-    const err = new Error('analysis/limit: spec too large') as Error & { code?: string }
-    err.code = 'analysis/limit'
-    throw err
+    throw limitError('spec too large')
   }
   let parsed: unknown
   try {
     parsed = JSON.parse(spec)
   } catch {
-    const err = new Error('analysis/invalid-args: spec must be JSON object string') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+    throw invalidArgs('spec must be JSON object string')
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    const err = new Error('analysis/invalid-args: spec must be object') as Error & { code?: string }
-    err.code = 'analysis/invalid-args'
-    throw err
+    throw invalidArgs('spec must be object')
   }
   const obj = parsed as Record<string, unknown>
-  const knownSpecKeys = new Set(['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy', 'limit'])
+  const knownSpecKeys = new Set([
+    'select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy', 'limit',
+    'having', 'topKPerGroup',
+  ])
   for (const key of Object.keys(obj)) {
     if (!knownSpecKeys.has(key)) {
-      const err = new Error(`analysis/invalid-args: unknown spec key ${key}`) as Error & { code?: string }
-      err.code = 'analysis/invalid-args'
-      throw err
+      throw invalidArgs(`unknown spec key ${key}`)
     }
   }
-  for (const key of ['select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy']) {
+  for (const key of ['select', 'mutate', 'groupBy', 'aggs', 'orderBy']) {
     if (obj[key] !== undefined && !Array.isArray(obj[key])) {
-      const err = new Error(`analysis/invalid-args: ${key} must be an array`) as Error & { code?: string }
-      err.code = 'analysis/invalid-args'
-      throw err
+      throw invalidArgs(`${key} must be an array`)
     }
   }
   if (obj.limit !== undefined) {
     const n = obj.limit
     if (typeof n !== 'number' || !Number.isFinite(n)) {
-      const err = new Error('analysis/invalid-args: limit must be a number') as Error & { code?: string }
-      err.code = 'analysis/invalid-args'
-      throw err
+      throw invalidArgs('limit must be a number')
     }
     if (!Number.isInteger(n) || n < 1 || n > limits.maxAggLimit) {
-      const err = new Error(`analysis/invalid-args: limit must be an integer 1..${limits.maxAggLimit}`) as Error & { code?: string }
-      err.code = 'analysis/invalid-args'
-      throw err
+      throw invalidArgs(`limit must be an integer 1..${limits.maxAggLimit}`)
     }
   }
   if (Array.isArray(obj.select)) {
+    const outNames = new Set<string>()
     for (const s of obj.select as unknown[]) {
-      if (typeof s !== 'string') {
-        const err = new Error('analysis/invalid-args: select entries must be strings') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+      let outName: string
+      if (typeof s === 'string') {
+        outName = s
+      } else if (s && typeof s === 'object' && !Array.isArray(s)) {
+        const so = s as Record<string, unknown>
+        if (typeof so.column !== 'string' || !so.column) {
+          throw invalidArgs('select entry column required')
+        }
+        if (typeof so.as !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(so.as)) {
+          throw invalidArgs('select as must match [A-Za-z_][A-Za-z0-9_]* (<=64)')
+        }
+        outName = so.as
+      } else {
+        throw invalidArgs('select entries must be strings or {column,as}')
       }
+      if (outNames.has(outName)) {
+        throw invalidArgs(`duplicate select name ${outName}`)
+      }
+      outNames.add(outName)
     }
   }
-  if (Array.isArray(obj.filter)) {
-    const ops = new Set(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'contains', 'is_null', 'not_null'])
-    for (const f of obj.filter as Array<Record<string, unknown>>) {
-      if (!f || typeof f !== 'object' || typeof f.op !== 'string' || !ops.has(f.op)) {
-        const err = new Error('analysis/invalid-args: bad filter op') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
-      }
-      if (typeof f.column !== 'string' || !f.column) {
-        const err = new Error('analysis/invalid-args: filter column required') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
-      }
-      if (f.op === 'is_null' || f.op === 'not_null') continue // value ignored by the CLI
-      if (!('value' in f)) {
-        const err = new Error(`analysis/invalid-args: filter value required for op ${f.op}`) as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
-      }
-      const v = f.value
-      if (Array.isArray(v)) {
-        if (f.op !== 'in') {
-          const err = new Error(`analysis/invalid-args: filter value must not be an array for op ${f.op}`) as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
-        }
-        if ((v as unknown[]).some((e) => typeof e !== 'string' && typeof e !== 'number' && typeof e !== 'boolean')) {
-          const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
-        }
-      } else if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
-        const err = new Error('analysis/invalid-args: bad filter value') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
-      }
-    }
+  if (obj.filter !== undefined) {
+    validateFilterTree(obj.filter, 'filter')
+  }
+  if (obj.having !== undefined) {
+    validateFilterTree(obj.having, 'having')
   }
   if (Array.isArray(obj.mutate)) {
     const asNames = new Set<string>()
     for (const m of obj.mutate as Array<Record<string, unknown>>) {
       if (!m || typeof m !== 'object' || typeof m.as !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(m.as)) {
-        const err = new Error('analysis/invalid-args: invalid mutate name') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+        throw invalidArgs('invalid mutate name')
       }
       if (asNames.has(m.as)) {
-        const err = new Error(`analysis/invalid-args: duplicate mutate name ${m.as}`) as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+        throw invalidArgs(`duplicate mutate name ${m.as}`)
       }
       asNames.add(m.as)
       validateMutateExpr(m.expr)
@@ -262,29 +506,75 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
       if (g && typeof g === 'object' && !Array.isArray(g)) {
         const go = g as Record<string, unknown>
         if (typeof go.dateColumn !== 'string' || typeof go.period !== 'string') {
-          const err = new Error('analysis/invalid-args: groupBy object needs dateColumn and period') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs('groupBy object needs dateColumn and period')
         }
         if (!['day', 'week', 'month'].includes(go.period)) {
-          const err = new Error('analysis/invalid-args: period must be day|week|month') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs('period must be day|week|month')
         }
         continue
       }
-      const err = new Error('analysis/invalid-args: groupBy entry must be string or object') as Error & { code?: string }
-      err.code = 'analysis/invalid-args'
-      throw err
+      throw invalidArgs('groupBy entry must be string or object')
     }
   }
   if (Array.isArray(obj.aggs)) {
-    const fns = new Set(['count', 'sum', 'mean', 'min', 'max', 'median', 'std'])
+    const fns = new Set([
+      'count', 'sum', 'mean', 'min', 'max', 'median', 'std',
+      'count_distinct', 'percentile', 'first', 'last', 'count_if',
+    ])
     for (const a of obj.aggs as Array<Record<string, unknown>>) {
       if (!a || typeof a !== 'object' || typeof a.fn !== 'string' || !fns.has(a.fn)) {
-        const err = new Error('analysis/invalid-args: bad agg fn') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+        throw invalidArgs('bad agg fn')
+      }
+      if (a.fn === 'percentile') {
+        const p = a.p
+        if (typeof p !== 'number' || !Number.isFinite(p) || p <= 0 || p >= 1) {
+          throw invalidArgs('percentile requires p in (0,1)')
+        }
+        if (typeof a.column !== 'string' || !a.column) {
+          throw invalidArgs('percentile requires column')
+        }
+      }
+      if (a.fn === 'count_distinct' || a.fn === 'first' || a.fn === 'last') {
+        if (typeof a.column !== 'string' || !a.column) {
+          throw invalidArgs(`${a.fn} requires column`)
+        }
+      }
+      if (a.fn === 'count_if') {
+        if (a.column !== undefined && a.column !== null) {
+          throw invalidArgs('count_if must not specify column')
+        }
+        if (a.where === undefined) {
+          throw invalidArgs('count_if requires where')
+        }
+        validateFilterNode(a.where, 'where', 1)
+      }
+    }
+  }
+  if (obj.topKPerGroup !== undefined) {
+    const t = obj.topKPerGroup
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      throw invalidArgs('topKPerGroup must be an object')
+    }
+    const tk = t as Record<string, unknown>
+    const by = tk.by
+    if (!Array.isArray(by) || by.length < 1 || by.length > 8) {
+      throw invalidArgs('topKPerGroup.by must be 1..8 column names')
+    }
+    if ((by as unknown[]).some((c) => typeof c !== 'string' || !c.trim())) {
+      throw invalidArgs('topKPerGroup.by must be 1..8 column names')
+    }
+    const k = tk.k
+    if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > 1000) {
+      throw invalidArgs('topKPerGroup.k must be integer 1..1000')
+    }
+    if (tk.orderBy !== undefined && tk.orderBy !== null) {
+      const o = tk.orderBy
+      if (!o || typeof o !== 'object' || Array.isArray(o) || typeof (o as Record<string, unknown>).column !== 'string') {
+        throw invalidArgs('topKPerGroup.orderBy needs a column name')
+      }
+      const oo = o as Record<string, unknown>
+      if (oo.desc !== undefined && typeof oo.desc !== 'boolean') {
+        throw invalidArgs('topKPerGroup.orderBy desc must be boolean')
       }
     }
   }
@@ -292,14 +582,10 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
     for (const o of obj.orderBy as unknown[]) {
       const co = o as Record<string, unknown> | null
       if (!co || typeof co !== 'object' || Array.isArray(co) || typeof co.column !== 'string') {
-        const err = new Error('analysis/invalid-args: orderBy entries need a column name') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+        throw invalidArgs('orderBy entries need a column name')
       }
       if (co.desc !== undefined && typeof co.desc !== 'boolean') {
-        const err = new Error('analysis/invalid-args: orderBy desc must be boolean') as Error & { code?: string }
-        err.code = 'analysis/invalid-args'
-        throw err
+        throw invalidArgs('orderBy desc must be boolean')
       }
     }
   }
@@ -327,7 +613,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
   }
 
   const datasetIngstDescription =
-    'Ingest a local workspace file (csv/jsonl) into the analysis dataset store. ' +
+    'Ingest a local workspace file (csv/json/jsonl) into the analysis dataset store. ' +
     'Source path must be under this session analysis root (relative preferred). ' +
     'If the file was produced elsewhere (bash, connector, export), first copy/write it ' +
     'into the session analysis root, then ingest with a relative path. ' +
@@ -349,7 +635,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           },
           format: {
             type: 'string',
-            enum: ['csv', 'jsonl', 'parquet'],
+            enum: ['csv', 'json', 'jsonl', 'parquet'],
             description: 'Source format. Omit to infer from extension.',
           },
           label: { type: 'string', description: 'Optional short label for humans.' },
@@ -375,6 +661,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               },
             },
             bytesOnDisk: { type: 'number' },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'rowCount', 'columnCount', 'columns'],
           additionalProperties: true,
@@ -387,33 +674,28 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columns: Array<{ name: string; dtype: string }>
           }
           const cols = (v.columns ?? []).map(c => `${c.name}:${c.dtype}`).join(', ')
-          return textRender(
+          return textRender(withWarnings(
             `dataset ${v.datasetId} ready (${v.rowCount} rows × ${v.columnCount} cols).\n` +
               `columns: ${cols}\n` +
               'Next: dataset_head / stats_describe / transform_agg. Do not dump full rows into the conversation.',
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
         const a = args as { path: string; format?: string; label?: string }
         if (typeof a.path !== 'string' || a.path.length === 0 || a.path.length > MAX_PATH_LEN) {
-          const err = new Error('analysis/invalid-args: path length invalid') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs('path length invalid')
         }
         if (a.label !== undefined && a.label !== null) {
           if (typeof a.label !== 'string' || a.label.length > MAX_LABEL_LEN) {
-            const err = new Error(`analysis/invalid-args: label must be string ≤ ${MAX_LABEL_LEN}`) as Error & { code?: string }
-            err.code = 'analysis/invalid-args'
-            throw err
+            throw invalidArgs(`label must be string ≤ ${MAX_LABEL_LEN}`)
           }
         }
         const abs = resolveInWorkspace(ws, a.path)
         assertNotSensitiveSource(abs, config.profileRoot)
         if (a.format === 'parquet') {
-          const err = new Error('analysis/limit: parquet not enabled in T0 (use csv/jsonl)') as Error & { code?: string }
-          err.code = 'analysis/limit'
-          throw err
+          throw limitError('parquet not supported yet (planned, see docs/interface.md)')
         }
         const cliArgs = ['ingest', '--input', a.path, '--dataset-id', newDatasetId()]
         if (a.format) cliArgs.push('--format', a.format)
@@ -426,12 +708,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_head: {
       name: 'dataset_head',
       description:
-        'Return up to 20 sample rows and column names for a datasetId. Use for orientation only; not for bulk analysis.',
+        'Return up to 100 sample rows and column names for a datasetId. Use for orientation only; not for bulk analysis. ' +
+        'Response always carries requestedN (as asked) and n (rows actually returned); over-limit requests are clamped by the CLI with a clamp warning.',
       parameters: {
         type: 'object',
         properties: {
           datasetId: { type: 'string' },
-          n: { type: 'number', description: '1–20, default 5' },
+          n: { type: 'number', description: '1–100, default 5. Values above 100 are clamped by the CLI.' },
         },
         required: ['datasetId'],
         additionalProperties: false,
@@ -444,6 +727,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columns: { type: 'array', items: { type: 'string' } },
             rows: { type: 'array', items: { type: 'array' } },
             rowCount: { type: 'number' },
+            requestedN: { type: 'number' },
+            n: { type: 'number' },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'columns', 'rows'],
           additionalProperties: true,
@@ -454,17 +740,22 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             rowCount: number
             columns: string[]
             rows: unknown[][]
+            requestedN?: number
+            n?: number
           }
-          return textRender(
-            `head of ${v.datasetId} (${v.rowCount} total rows)\n` +
+          return textRender(withWarnings(
+            `head of ${v.datasetId} (${v.rowCount} total rows` +
+              (typeof v.requestedN === 'number' ? `, requestedN=${v.requestedN} n=${v.n ?? v.rows?.length}` : '') +
+              ')\n' +
               JSON.stringify({ columns: v.columns, rows: v.rows }, null, 2),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
         const a = args as { datasetId: string; n?: number }
         validateDatasetId(a.datasetId)
-        const n = clampHeadN(a.n, limits)
+        const n = validatePositiveInt(a.n, 5, 'n')
         const result = await run(['head', '--dataset-id', a.datasetId, '--n', String(n)], exec?.signal)
         return result.data
       },
@@ -508,7 +799,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columns: Array<{ name: string; dtype: string }>
           }
           const lines = (v.columns ?? []).map(c => `- ${c.name}: ${c.dtype}`)
-          return textRender(`${v.datasetId}: ${v.rowCount} rows\n${lines.join('\n')}`)
+          return textRender(withWarnings(`${v.datasetId}: ${v.rowCount} rows\n${lines.join('\n')}`, value))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -522,11 +813,26 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_list: {
       name: 'dataset_list',
       description:
-        'List datasets in this session analysis store: datasetId, label, rowCount, columnCount, producedBy. ' +
+        'List datasets in this session analysis store: datasetId, label, rowCount, columnCount, producedBy, createdAt. ' +
+        'Optional filters (AND): labelLike (case-insensitive label substring), producedBy (exact), ' +
+        'since (createdAt >= since, UTC; datasets without createdAt are excluded). ' +
         'Use to discover prior ingests and transform outputs before re-running work.',
       parameters: {
         type: 'object',
-        properties: {},
+        properties: {
+          labelLike: {
+            type: 'string',
+            description: 'Case-insensitive substring match on the label.',
+          },
+          producedBy: {
+            type: 'string',
+            description: 'Exact match on producedBy (e.g. ingest, agg, join).',
+          },
+          since: {
+            type: 'string',
+            description: 'Keep datasets with createdAt >= since (UTC), YYYY-MM-DD[THH:MM:SS].',
+          },
+        },
         additionalProperties: false,
       },
       output: {
@@ -545,10 +851,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                   producedBy: { type: 'string' },
                   parentDatasetId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                   sourceKind: { type: 'string' },
+                  createdAt: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                 },
                 additionalProperties: true,
               },
             },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasets'],
           additionalProperties: true,
@@ -561,22 +869,38 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               columnCount: number
               label?: string | null
               producedBy: string
+              createdAt?: string | null
             }>
           }
           const rows = v.datasets ?? []
           if (rows.length === 0) {
-            return textRender('no datasets in this session store. Use dataset_ingest first.')
+            return textRender(withWarnings('no datasets in this session store. Use dataset_ingest first.', value))
           }
           const lines = rows.map((d) =>
             `- ${d.datasetId}: ${d.rowCount} rows × ${d.columnCount} cols` +
             (d.label ? ` · ${d.label}` : '') +
-            ` (${d.producedBy})`,
+            ` (${d.producedBy})` +
+            (d.createdAt ? ` @ ${d.createdAt}` : ''),
           )
-          return textRender(`datasets (${rows.length}):\n${lines.join('\n')}`)
+          return textRender(withWarnings(`datasets (${rows.length}):\n${lines.join('\n')}`, value))
         },
       },
-      async execute(_args: unknown, exec?: { signal?: AbortSignal }) {
-        const result = await run(['list'], exec?.signal)
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { labelLike?: string; producedBy?: string; since?: string }
+        const cliArgs = ['list']
+        for (const [flag, key] of [
+          ['--label-like', 'labelLike'],
+          ['--produced-by', 'producedBy'],
+          ['--since', 'since'],
+        ] as const) {
+          const raw = a[key]
+          if (raw === undefined || raw === null) continue
+          if (typeof raw !== 'string' || !raw.trim()) {
+            throw invalidArgs(`${key} must be a non-empty string`)
+          }
+          cliArgs.push(flag, raw.trim())
+        }
+        const result = await run(cliArgs, exec?.signal)
         return result.data
       },
     },
@@ -614,10 +938,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
         render(_args: unknown, value: unknown) {
           const v = value as { outputPath: string; rowCount: number; bytes?: number }
-          return textRender(
+          return textRender(withWarnings(
             `exported ${v.rowCount} rows → ${v.outputPath}` +
               (typeof v.bytes === 'number' ? ` (${v.bytes} bytes)` : ''),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -666,7 +991,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
         render(_args: unknown, value: unknown) {
           const v = value as { datasetId: string; removed?: boolean }
-          return textRender(`removed ${v.datasetId}`)
+          return textRender(withWarnings(`removed ${v.datasetId}`, value))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -718,7 +1043,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
         render(_args: unknown, value: unknown) {
           const v = value as { datasetId: string; stats: unknown }
-          return textRender(`describe ${v.datasetId}\n${JSON.stringify(v.stats, null, 2)}`)
+          return textRender(withWarnings(`describe ${v.datasetId}\n${JSON.stringify(v.stats, null, 2)}`, value))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -737,7 +1062,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       name: 'transform_agg',
       description:
         'Filter / project / group-by / aggregate a dataset. ' +
-        'spec may include optional mutate derived columns and time-period groupBy objects. ' +
+        'spec may include mutate derived columns, time-period groupBy objects, having, and topKPerGroup. ' +
+        'Pipeline order: filter → topKPerGroup → mutate → group/agg → having → select → orderBy → limit. ' +
         'Returns at most `limit` rows (default 1000). ' +
         'Set outLabel to persist a new datasetId for further steps.',
       parameters: {
@@ -747,16 +1073,20 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           spec: {
             type: 'string',
             description:
-              'JSON string: { select?, filter?, mutate?, groupBy?, aggs?, orderBy?, limit? }. ' +
-              'filter MUST be an array of predicate objects, e.g. ' +
-              '[{"column":"amount","op":"gt","value":3000}]; a bare object filter ' +
-              '(e.g. {"filter":{"column":"amount","op":"gt","value":3000}}) or a string filter ' +
-              'is rejected with analysis/invalid-args. ' +
-              'filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
+              'JSON string: { select?, filter?, topKPerGroup?, mutate?, groupBy?, aggs?, having?, orderBy?, limit? }. ' +
+              'filter/having are predicate arrays (all-AND) or nested groups ' +
+              '{"all":[…]} | {"any":[…]} | {"not":…} (depth ≤8; empty all=true, empty any=false). ' +
+              'Predicate: {column, op, value?}; filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
               'value: scalar (op in also accepts an array of scalars; every member matches). ' +
-              'agg fns: count/sum/mean/min/max/median/std. ' +
-              'mutate: [{as,expr}] whitelist arithmetic only (no functions). ' +
+              'topKPerGroup: {by:[col…1..8], k:1..1000, orderBy?:{column,desc?}} — keep ≤k rows per group, after filter. ' +
+              'agg fns: count/sum/mean/min/max/median/std/count_distinct/percentile/first/last/count_if. ' +
+              'percentile needs p in (0,1); count_if needs {where:<predicate|group>} and no column; ' +
+              'count_distinct/first/last need column. ' +
+              'mutate: [{as,expr}] whitelist arithmetic + to_int(e)/to_str(e)/to_date(e,fmt) + "string literals"; ' +
+              'to_date fmt supports %Y %m %d %H %M %S directives only. ' +
               'groupBy entries: column name or {dateColumn,period:day|week|month}. ' +
+              'having filters result rows after group/agg (same shape as filter). ' +
+              'select entries: "col" or {column,as} renames. ' +
               'Unknown top-level spec keys are rejected.',
           },
           outLabel: {
@@ -777,6 +1107,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columns: { type: 'array', items: { type: 'string' } },
             rows: { type: 'array', items: { type: 'array' } },
             truncated: { type: 'boolean' },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId'],
           additionalProperties: true,
@@ -790,12 +1121,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             truncated?: boolean
           }
           if (v.truncated || v.outDatasetId) {
-            return textRender(
+            return textRender(withWarnings(
               `agg → ${v.outDatasetId ?? v.datasetId}: ${v.rowCount} rows ` +
                 `(full result stored; use dataset_head or further agg). columns=${(v.columns ?? []).join(',')}`,
-            )
+              value,
+            ))
           }
-          return textRender(JSON.stringify(value, null, 2))
+          return textRender(withWarnings(JSON.stringify(value, null, 2), value))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -813,13 +1145,17 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       name: 'dataset_values',
       description:
         'Top value distribution for one column: nunique, nullCount, top values with counts/ratios. ' +
-        'Use to understand categorical / low-cardinality columns without dumping rows.',
+        'Use to understand categorical / low-cardinality columns without dumping rows. ' +
+        'Response always carries requestedLimit and limit; over-limit requests are clamped by the CLI with a clamp warning.',
       parameters: {
         type: 'object',
         properties: {
           datasetId: { type: 'string' },
           column: { type: 'string', description: 'Column name (required).' },
-          limit: { type: 'number', description: '1–100, default 20. Length of top list only.' },
+          limit: {
+            type: 'number',
+            description: '1–100, default 20. Length of top list only; values above 100 are clamped by the CLI.',
+          },
         },
         required: ['datasetId', 'column'],
         additionalProperties: false,
@@ -832,6 +1168,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             column: { type: 'string' },
             nunique: { type: 'number' },
             nullCount: { type: 'number' },
+            requestedLimit: { type: 'number' },
+            limit: { type: 'number' },
             top: {
               type: 'array',
               items: {
@@ -843,6 +1181,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                 },
               },
             },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'column', 'nunique', 'nullCount', 'top'],
           additionalProperties: true,
@@ -853,27 +1192,32 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             column: string
             nunique: number
             nullCount: number
+            requestedLimit?: number
+            limit?: number
             top: Array<{ value: unknown; count: number; ratio: number }>
           }
           const lines = (v.top ?? []).map(
             t => `  ${JSON.stringify(t.value)} × ${t.count} (${(t.ratio * 100).toFixed(1)}%)`,
           )
-          return textRender(
+          return textRender(withWarnings(
             `values ${v.column} in ${v.datasetId}\n` +
-              `nunique=${v.nunique} nullCount=${v.nullCount}\n` +
+              `nunique=${v.nunique} nullCount=${v.nullCount}` +
+              (typeof v.requestedLimit === 'number'
+                ? ` requestedLimit=${v.requestedLimit} limit=${v.limit ?? ''}`
+                : '') +
+              '\n' +
               (lines.join('\n') || '  (no non-null values)'),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
         const a = args as { datasetId: string; column: string; limit?: number }
         validateDatasetId(a.datasetId)
         if (typeof a.column !== 'string' || !a.column.trim()) {
-          const err = new Error('analysis/invalid-args: column required') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs('column required')
         }
-        const limit = clampValuesLimit(a.limit, limits)
+        const limit = validatePositiveInt(a.limit, 20, 'limit')
         const result = await run(
           ['values', '--dataset-id', a.datasetId, '--column', a.column, '--limit', String(limit)],
           exec?.signal,
@@ -885,13 +1229,14 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_sample: {
       name: 'dataset_sample',
       description:
-        'Deterministic random (or stratified) sample of up to 20 rows. ' +
-        'Same datasetId + n + seed always yields the same rows. Prefer over dataset_head when you need a spread, not the first rows.',
+        'Deterministic random (or stratified) sample of up to 200 rows. ' +
+        'Same datasetId + n + seed always yields the same rows. Prefer over dataset_head when you need a spread, not the first rows. ' +
+        'Response always carries requestedN (as asked) and n (rows actually returned); over-limit requests are clamped by the CLI with a clamp warning.',
       parameters: {
         type: 'object',
         properties: {
           datasetId: { type: 'string' },
-          n: { type: 'number', description: '1–20, default 10' },
+          n: { type: 'number', description: '1–200, default 10. Values above 200 are clamped by the CLI.' },
           seed: { type: 'number', description: 'Unsigned integer seed; default 42 for reproducibility.' },
           stratifyBy: { type: 'string', description: 'Optional column for proportional strata sampling.' },
         },
@@ -905,6 +1250,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: { type: 'string' },
             columns: { type: 'array', items: { type: 'string' } },
             rows: { type: 'array', items: { type: 'array' } },
+            requestedN: { type: 'number' },
+            n: { type: 'number' },
             sampling: {
               type: 'object',
               properties: {
@@ -915,6 +1262,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                 population: { type: 'number' },
               },
             },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'columns', 'rows', 'sampling'],
           additionalProperties: true,
@@ -924,25 +1272,27 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: string
             columns: string[]
             rows: unknown[][]
+            requestedN?: number
+            n?: number
             sampling?: { method?: string; n?: number; seed?: number; population?: number }
           }
-          return textRender(
-            `sample of ${v.datasetId} (${v.rows?.length ?? 0} rows, ` +
-              `${v.sampling?.method ?? 'random'} seed=${v.sampling?.seed ?? '?'} pop=${v.sampling?.population ?? '?'} )\n` +
+          return textRender(withWarnings(
+            `sample of ${v.datasetId} (${v.rows?.length ?? 0} rows` +
+              (typeof v.requestedN === 'number' ? `, requestedN=${v.requestedN} n=${v.n ?? v.rows?.length}` : '') +
+              `, ${v.sampling?.method ?? 'random'} seed=${v.sampling?.seed ?? '?'} pop=${v.sampling?.population ?? '?'} )\n` +
               JSON.stringify({ columns: v.columns, rows: v.rows }, null, 2),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
         const a = args as { datasetId: string; n?: number; seed?: number; stratifyBy?: string }
         validateDatasetId(a.datasetId)
-        const n = clampSampleN(a.n, limits)
+        const n = validatePositiveInt(a.n, 10, 'n')
         const cliArgs = ['sample', '--dataset-id', a.datasetId, '--n', String(n)]
         if (a.seed !== undefined && a.seed !== null) {
           if (!Number.isFinite(a.seed) || a.seed < 0 || !Number.isInteger(a.seed)) {
-            const err = new Error('analysis/invalid-args: seed must be a non-negative integer') as Error & { code?: string }
-            err.code = 'analysis/invalid-args'
-            throw err
+            throw invalidArgs('seed must be a non-negative integer')
           }
           cliArgs.push('--seed', String(a.seed))
         }
@@ -955,7 +1305,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_join: {
       name: 'dataset_join',
       description:
-        'Equi-join two datasets on shared key column(s). Always writes a new datasetId ' +
+        'Equi-join two datasets on key column(s). Entries of `on` are a shared column name ' +
+        'or a `leftKey:rightKey` pair for differently named keys. Always writes a new datasetId ' +
         '(producedBy=join). Returns only the new id + row/column counts — never full rows. ' +
         'how: inner (default), left, anti, semi. anti/semi keep left rows only. Null keys never match.',
       parameters: {
@@ -966,7 +1317,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           on: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Non-empty list of column names present on both sides.',
+            description:
+              'Non-empty list of key entries: a shared column name, or "leftKey:rightKey" to join differently named columns. Max 8 entries.',
           },
           how: {
             type: 'string',
@@ -989,6 +1341,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             leftDatasetId: { type: 'string' },
             rightDatasetId: { type: 'string' },
             how: { type: 'string' },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
           required: ['datasetId', 'rowCount', 'columnCount'],
           additionalProperties: true,
@@ -1000,10 +1353,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columnCount: number
             how?: string
           }
-          return textRender(
+          return textRender(withWarnings(
             `join → ${v.datasetId}: ${v.rowCount} rows × ${v.columnCount} cols (how=${v.how ?? 'inner'}). ` +
               'Inspect with dataset_head / stats_describe / transform_agg.',
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1017,20 +1371,20 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         validateDatasetId(a.leftDatasetId)
         validateDatasetId(a.rightDatasetId)
         if (!Array.isArray(a.on) || a.on.length === 0 || a.on.length > limits.maxJoinOnColumns) {
-          const err = new Error(`analysis/invalid-args: on must be 1..${limits.maxJoinOnColumns} column names`) as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs(`on must be 1..${limits.maxJoinOnColumns} column names`)
         }
-        if (a.on.some(c => typeof c !== 'string' || !c.trim())) {
-          const err = new Error('analysis/invalid-args: on entries must be non-empty strings') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+        for (const c of a.on) {
+          if (typeof c !== 'string' || !c.trim()) {
+            throw invalidArgs('on entries must be non-empty strings')
+          }
+          const parts = c.split(':')
+          if (parts.length > 2 || (parts.length === 2 && (!parts[0] || !parts[1]))) {
+            throw invalidArgs('on pairs must be leftKey:rightKey')
+          }
         }
         const how = a.how ?? 'inner'
         if (how !== 'inner' && how !== 'left' && how !== 'anti' && how !== 'semi') {
-          const err = new Error('analysis/invalid-args: how must be inner|left|anti|semi') as Error & { code?: string }
-          err.code = 'analysis/invalid-args'
-          throw err
+          throw invalidArgs('how must be inner|left|anti|semi')
         }
         const cliArgs = [
           'join',
@@ -1082,7 +1436,6 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: string
             rowCount: number
             columns?: Array<{ name: string; nullRate?: number; typeStability?: string }>
-            warnings?: Array<{ code: string; column?: string }>
             suspectKeys?: Array<{ columns: string[] }>
           }
           const cols = (v.columns ?? [])
@@ -1092,13 +1445,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                 (typeof c.nullRate === 'number' ? ` null=${(c.nullRate * 100).toFixed(2)}%` : ''),
             )
             .join('\n')
-          const warn = (v.warnings ?? []).map(w => `- ${w.code}${w.column ? `: ${w.column}` : ''}`).join('\n')
           const keys = (v.suspectKeys ?? []).map(k => k.columns.join('+')).join(', ')
-          return textRender(
+          return textRender(withWarnings(
             `profile ${v.datasetId}: ${v.rowCount} rows\n${cols}` +
-              (warn ? `\nwarnings:\n${warn}` : '') +
               (keys ? `\nsuspect keys: ${keys}` : ''),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1175,10 +1527,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           }
           const pct =
             typeof v.duplicateRowRate === 'number' ? ` (${(v.duplicateRowRate * 100).toFixed(2)}%)` : ''
-          return textRender(
+          return textRender(withWarnings(
             `dedup ${v.datasetId} mode=${v.mode}: ${v.duplicateRowCount}/${v.rowCount} duplicate rows${pct}` +
               (v.samplesTruncated ? ' [samples truncated]' : ''),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1202,7 +1555,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           }
           cliArgs.push('--key-columns', a.keyColumns.join(','))
         }
-        const sampleLimit = validateSampleLimit(a.sampleLimit, 5, limits.maxSampleRows)
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 5)
         cliArgs.push('--sample-limit', String(sampleLimit))
         const result = await run(cliArgs, exec?.signal)
         return result.data
@@ -1269,10 +1622,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
                   : ''),
             )
             .join('\n')
-          return textRender(
+          return textRender(withWarnings(
             `outliers ${v.datasetId} method=${v.method} k=${v.k ?? '?'}\n${lines}` +
               (v.outDatasetId ? `\n→ ${v.outDatasetId}` : ''),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1322,7 +1676,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           }
           cliArgs.push('--k', String(a.k))
         }
-        const sampleLimit = validateSampleLimit(a.sampleLimit, 10, limits.maxSampleRows)
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 10)
         cliArgs.push('--sample-limit', String(sampleLimit))
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
         const result = await run(cliArgs, exec?.signal)
@@ -1389,12 +1743,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             `- ${p.columns.join('×')}: r=${p.r == null ? 'null' : p.r} n=${p.n}` +
               (p.degenerate ? ' (degenerate)' : ''),
           )
-          return textRender(
+          return textRender(withWarnings(
             `corr ${v.datasetId} method=${v.method ?? 'pearson'} pairwise=${v.pairwise ?? 'complete'}` +
               (v.truncated ? ' [pairs truncated]' : '') +
               '\n' +
               (lines.join('\n') || '  (no pairs)'),
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1524,7 +1879,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           const body = rows
             .map((r, i) => [r, ...(v.matrix?.[i] ?? [])].join('\t'))
             .join('\n')
-          return textRender(
+          return textRender(withWarnings(
             `crosstab ${v.datasetId}: ${v.rowColumn} × ${v.colColumn} ` +
               `(grandTotal=${v.grandTotal ?? '?'} nulls=${v.nullRowCount ?? 0}` +
               (v.truncated ? ', truncated' : '') +
@@ -1532,7 +1887,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               header +
               '\n' +
               body,
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1675,11 +2031,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             orderBy?: string
             opCount?: number
           }
-          return textRender(
+          return textRender(withWarnings(
             `series → ${v.datasetId}: ${v.rowCount} rows × ${v.columnCount} cols ` +
               `(orderBy=${v.orderBy ?? '?'}, ops=${v.opCount ?? '?'}). ` +
               'Inspect with dataset_head / stats_describe / transform_agg.',
-          )
+            value,
+          ))
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
@@ -1816,6 +2173,297 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           JSON.stringify(normalized),
         ]
         if (a.outLabel) cliArgs.push('--out', a.outLabel)
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_union: {
+      name: 'dataset_union',
+      description:
+        'Row-wise union (append) of two datasets into a new datasetId (producedBy=union). ' +
+        'columnsPolicy strict (default) requires identical column-name sets; intersect keeps only shared columns. ' +
+        'Output column order follows the left dataset. Returns the new id + row counts — never full rows.',
+      parameters: {
+        type: 'object',
+        properties: {
+          leftDatasetId: { type: 'string' },
+          rightDatasetId: { type: 'string' },
+          columnsPolicy: {
+            type: 'string',
+            enum: ['strict', 'intersect'],
+            description: 'Default strict: both sides must have the same column-name set. intersect keeps shared columns only.',
+          },
+          label: { type: 'string', description: 'Optional label stored on the new dataset.' },
+        },
+        required: ['leftDatasetId', 'rightDatasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            leftRows: { type: 'number' },
+            rightRows: { type: 'number' },
+            columns: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  dtype: { type: 'string' },
+                },
+              },
+            },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          required: ['datasetId', 'rowCount', 'leftRows', 'rightRows', 'columns'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            leftRows: number
+            rightRows: number
+            columns?: Array<{ name: string }>
+          }
+          return textRender(withWarnings(
+            `union → ${v.datasetId}: ${v.rowCount} rows × ${(v.columns ?? []).length} cols ` +
+              `(left=${v.leftRows}, right=${v.rightRows}). ` +
+              'Inspect with dataset_head / stats_describe / transform_agg.',
+            value,
+          ))
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          leftDatasetId: string
+          rightDatasetId: string
+          columnsPolicy?: string
+          label?: string
+        }
+        validateDatasetId(a.leftDatasetId)
+        validateDatasetId(a.rightDatasetId)
+        const cliArgs = ['union', '--left', a.leftDatasetId, '--right', a.rightDatasetId]
+        if (a.columnsPolicy !== undefined && a.columnsPolicy !== null) {
+          if (a.columnsPolicy !== 'strict' && a.columnsPolicy !== 'intersect') {
+            throw invalidArgs('columnsPolicy must be strict|intersect')
+          }
+          cliArgs.push('--columns-policy', a.columnsPolicy)
+        }
+        if (a.label !== undefined && a.label !== null) {
+          if (typeof a.label !== 'string' || a.label.length > MAX_LABEL_LEN) {
+            throw invalidArgs(`label must be string ≤ ${MAX_LABEL_LEN}`)
+          }
+          cliArgs.push('--out', a.label)
+        }
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_diff: {
+      name: 'dataset_diff',
+      description:
+        'Compare two datasets: rows only in left, only in right, or changed under matching keys. ' +
+        'on entries are shared column names or "leftKey:rightKey" pairs (max 8); omit on to compare ' +
+        'rows as a multiset over shared columns (changed is then 0). Null keys never match. ' +
+        'Returns counts + small samples — never full row sets.',
+      parameters: {
+        type: 'object',
+        properties: {
+          leftDatasetId: { type: 'string' },
+          rightDatasetId: { type: 'string' },
+          on: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional key entries: shared column name or "leftKey:rightKey" (max 8). Omit for multiset comparison over shared columns.',
+          },
+          sampleLimit: {
+            type: 'number',
+            description: '1–20 sample rows per category (default 5). Values above 20 are clamped by the CLI.',
+          },
+        },
+        required: ['leftDatasetId', 'rightDatasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            onlyLeft: { type: 'number' },
+            onlyRight: { type: 'number' },
+            changed: { type: 'number' },
+            samples: {
+              type: 'object',
+              properties: {
+                onlyLeft: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                onlyRight: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                changed: { type: 'array', items: { type: 'object', additionalProperties: true } },
+              },
+            },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          required: ['onlyLeft', 'onlyRight', 'changed', 'samples'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            onlyLeft: number
+            onlyRight: number
+            changed: number
+            samples?: { onlyLeft?: unknown[]; onlyRight?: unknown[]; changed?: unknown[] }
+          }
+          return textRender(withWarnings(
+            `diff: onlyLeft=${v.onlyLeft} onlyRight=${v.onlyRight} changed=${v.changed}\n` +
+              `samples: onlyLeft=${v.samples?.onlyLeft?.length ?? 0} ` +
+              `onlyRight=${v.samples?.onlyRight?.length ?? 0} ` +
+              `changed=${v.samples?.changed?.length ?? 0}`,
+            value,
+          ))
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          leftDatasetId: string
+          rightDatasetId: string
+          on?: string[]
+          sampleLimit?: number
+        }
+        validateDatasetId(a.leftDatasetId)
+        validateDatasetId(a.rightDatasetId)
+        const cliArgs = ['diff', '--left', a.leftDatasetId, '--right', a.rightDatasetId]
+        if (a.on !== undefined && a.on !== null) {
+          if (!Array.isArray(a.on) || a.on.length === 0 || a.on.length > limits.maxJoinOnColumns) {
+            throw invalidArgs(`on must be 1..${limits.maxJoinOnColumns} key entries`)
+          }
+          for (const c of a.on) {
+            if (typeof c !== 'string' || !c.trim()) {
+              throw invalidArgs('on entries must be non-empty strings')
+            }
+            const parts = c.split(':')
+            if (parts.length > 2 || (parts.length === 2 && (!parts[0] || !parts[1]))) {
+              throw invalidArgs('on pairs must be leftKey:rightKey')
+            }
+          }
+          cliArgs.push('--on', a.on.join(','))
+        }
+        const sampleLimit = validateSampleLimit(a.sampleLimit, 5)
+        cliArgs.push('--sample-limit', String(sampleLimit))
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
+    dataset_pivot: {
+      name: 'dataset_pivot',
+      description:
+        'Pivot a dataset to a wide table: rows = index column combinations (input order), ' +
+        'columns = distinct values of the `columns` field (first-seen order, ≤50), ' +
+        'cells = the `values` column aggregated with `agg` over each (index, pivot-value) group ' +
+        '(missing cells are null). Writes a new datasetId (producedBy=pivot) and returns only the summary.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          index: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '1..16 index column names (row identity of the wide table).',
+          },
+          columns: { type: 'string', description: 'Column whose distinct values become output columns.' },
+          values: { type: 'string', description: 'Column to aggregate into the cells.' },
+          agg: {
+            type: 'string',
+            enum: ['sum', 'mean', 'min', 'max', 'count'],
+            description: 'Cell aggregation function.',
+          },
+          label: { type: 'string', description: 'Optional label stored on the new dataset.' },
+        },
+        required: ['datasetId', 'index', 'columns', 'values', 'agg'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            datasetId: { type: 'string' },
+            rowCount: { type: 'number' },
+            columns: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  dtype: { type: 'string' },
+                },
+              },
+            },
+            indexColumns: { type: 'array', items: { type: 'string' } },
+            pivotColumn: { type: 'string' },
+            warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+          required: ['datasetId', 'rowCount', 'columns', 'indexColumns', 'pivotColumn'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            datasetId: string
+            rowCount: number
+            columns?: Array<{ name: string }>
+            indexColumns?: string[]
+            pivotColumn?: string
+          }
+          return textRender(withWarnings(
+            `pivot → ${v.datasetId}: ${v.rowCount} rows × ${(v.columns ?? []).length} cols ` +
+              `(index=${(v.indexColumns ?? []).join('+')}, pivot=${v.pivotColumn ?? '?'}). ` +
+              'Inspect with dataset_head / stats_describe / transform_agg.',
+            value,
+          ))
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as {
+          datasetId: string
+          index: string[]
+          columns: string
+          values: string
+          agg: string
+          label?: string
+        }
+        validateDatasetId(a.datasetId)
+        if (!Array.isArray(a.index) || a.index.length === 0 || a.index.length > limits.maxKeyColumns) {
+          throw invalidArgs(`index must be 1..${limits.maxKeyColumns} column names`)
+        }
+        if (a.index.some((c) => typeof c !== 'string' || !c.trim())) {
+          throw invalidArgs('index entries must be non-empty strings')
+        }
+        for (const key of ['columns', 'values', 'agg'] as const) {
+          if (typeof a[key] !== 'string' || !a[key].trim()) {
+            throw invalidArgs(`${key} required`)
+          }
+        }
+        if (a.agg !== 'sum' && a.agg !== 'mean' && a.agg !== 'min' && a.agg !== 'max' && a.agg !== 'count') {
+          throw invalidArgs('agg must be sum|mean|min|max|count')
+        }
+        const cliArgs = [
+          'pivot',
+          '--dataset-id', a.datasetId,
+          '--index', a.index.map((c) => c.trim()).join(','),
+          '--columns', a.columns.trim(),
+          '--values', a.values.trim(),
+          '--agg', a.agg,
+        ]
+        if (a.label !== undefined && a.label !== null) {
+          if (typeof a.label !== 'string' || a.label.length > MAX_LABEL_LEN) {
+            throw invalidArgs(`label must be string ≤ ${MAX_LABEL_LEN}`)
+          }
+          cliArgs.push('--out', a.label)
+        }
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },

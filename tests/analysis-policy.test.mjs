@@ -54,7 +54,7 @@ test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the frozen v0.1.5 surface', () => {
+test('ANALYSIS_TOOL_NAMES is the v0.2.0 surface (v0.1.5 + union/diff/pivot)', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -73,6 +73,9 @@ test('ANALYSIS_TOOL_NAMES is the frozen v0.1.5 surface', () => {
     'dataset_corr',
     'dataset_crosstab',
     'dataset_series',
+    'dataset_union',
+    'dataset_diff',
+    'dataset_pivot',
   ])
 })
 
@@ -92,6 +95,21 @@ test('v0.1.4 relation tools are recognized by isAnalysisToolName', () => {
 
 test('v0.1.5 series tool is recognized by isAnalysisToolName', () => {
   assert.equal(isAnalysisToolName('dataset_series'), true)
+})
+
+test('v0.2.0 relation tools are recognized by isAnalysisToolName', () => {
+  assert.equal(isAnalysisToolName('dataset_union'), true)
+  assert.equal(isAnalysisToolName('dataset_diff'), true)
+  assert.equal(isAnalysisToolName('dataset_pivot'), true)
+})
+
+test('analysisToolsForScopedAllow can enable v0.2.0 relation tools only', () => {
+  const names = analysisToolsForScopedAllow({
+    mode: 'unconfigured',
+    toolAllowlist: [],
+    analysisTools: ['dataset_union', 'dataset_diff', 'dataset_pivot'],
+  })
+  assert.deepEqual(names, ['dataset_union', 'dataset_diff', 'dataset_pivot'])
 })
 
 test('analysisToolsForScopedAllow can enable quality tools only', () => {

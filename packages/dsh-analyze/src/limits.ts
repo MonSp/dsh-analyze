@@ -27,8 +27,8 @@ export interface AnalysisLimits {
 export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
   timeoutMs: 60_000,
   maxOutputBytes: 262_144,
-  maxSampleRows: 20,
-  maxHeadRows: 20,
+  maxSampleRows: 200,
+  maxHeadRows: 100,
   maxIngestBytes: 268_435_456,
   maxRows: 5_000_000,
   defaultRowLimit: 1000,
@@ -43,19 +43,4 @@ export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = {
   maxSeriesOps: 8,
   maxSeriesPeriods: 10_000,
   maxSeriesWindow: 10_000,
-}
-
-export function clampHeadN(n: unknown, limits: AnalysisLimits): number {
-  const raw = typeof n === 'number' && Number.isFinite(n) ? Math.floor(n) : 5
-  return Math.min(Math.max(raw, 1), limits.maxHeadRows)
-}
-
-export function clampSampleN(n: unknown, limits: AnalysisLimits): number {
-  const raw = typeof n === 'number' && Number.isFinite(n) ? Math.floor(n) : 10
-  return Math.min(Math.max(raw, 1), limits.maxSampleRows)
-}
-
-export function clampValuesLimit(n: unknown, limits: AnalysisLimits): number {
-  const raw = typeof n === 'number' && Number.isFinite(n) ? Math.floor(n) : 20
-  return Math.min(Math.max(raw, 1), limits.maxValuesLimit)
 }

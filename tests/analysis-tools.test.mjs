@@ -15,10 +15,11 @@ import {
   createAnalysisToolDefinitions,
   assertNotSensitiveSource,
   validateAggSpec,
+  validatePositiveInt,
 } from '../packages/dsh-analyze/dist/tools.js'
 import { probeAnalyzeCliSync, resolveAnalysisCliPath } from '../packages/dsh-analyze/dist/cli.js'
 import { attachAnalysisTools } from '../packages/dsh-analyze/dist/register.js'
-import { DEFAULT_ANALYSIS_LIMITS, clampHeadN } from '../packages/dsh-analyze/dist/limits.js'
+import { DEFAULT_ANALYSIS_LIMITS } from '../packages/dsh-analyze/dist/limits.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const mockCli = join(here, 'fixtures', 'mock-analyze-cli.mjs')
@@ -381,7 +382,10 @@ test('probeAnalyzeCliSync accepts mock CLI version', () => {
     if (probe.ok) {
       assert.ok(probe.capabilities.includes('ingest'))
       assert.ok(probe.capabilities.includes('list'))
-      assert.match(probe.version, /0\.1\./)
+      assert.ok(probe.capabilities.includes('union'))
+      assert.ok(probe.capabilities.includes('diff'))
+      assert.ok(probe.capabilities.includes('pivot'))
+      assert.match(probe.version, /0\.2\./)
     }
   } finally {
     rmSync(ws, { recursive: true, force: true })
@@ -428,15 +432,17 @@ test('unicode labels and paths round-trip through ingest', async () => {
   }
 })
 
-test('clampHeadN boundaries', () => {
+test('row/limit params: tool layer rejects non-integer / <1 and passes high values through (R-12/R-13)', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
-  assert.equal(clampHeadN(0, limits), 1)
-  assert.equal(clampHeadN(-5, limits), 1)
-  assert.equal(clampHeadN(20, limits), 20)
-  assert.equal(clampHeadN(999, limits), limits.maxHeadRows)
-  assert.equal(clampHeadN(NaN, limits), 5)
-  assert.equal(clampHeadN(undefined, limits), 5)
-  assert.equal(clampHeadN(3.9, limits), 3)
+  assert.equal(DEFAULT_ANALYSIS_LIMITS.maxHeadRows, 100)
+  assert.equal(DEFAULT_ANALYSIS_LIMITS.maxSampleRows, 200)
+  assert.equal(limits.maxValuesLimit, 100)
+  assert.equal(validatePositiveInt(37, 5, 'n'), 37)
+  assert.equal(validatePositiveInt(500, 5, 'n'), 500)
+  assert.throws(() => validatePositiveInt(0, 5, 'n'), /n must be integer >= 1/)
+  assert.throws(() => validatePositiveInt(-5, 5, 'n'), /n must be integer >= 1/)
+  assert.throws(() => validatePositiveInt(3.9, 5, 'n'), /n must be integer >= 1/)
+  assert.throws(() => validatePositiveInt(1.5, 20, 'sampleLimit'), /sampleLimit must be integer >= 1/)
 })
 
 test('dataset_values / sample / join via mock CLI', async () => {
@@ -1159,6 +1165,504 @@ test('transform_agg in filter matches every member via mock CLI', async () => {
       spec: JSON.stringify({ filter: [{ column: 'amount', op: 'in', value: ['100', '5000'] }] }),
     })
     assert.equal(strRes.rowCount, 2)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+
+// ---------- v0.2.0 acceptance: nested filters / new agg fns / having / topKPerGroup ----------
+
+test('R-5/R-6/R-7/R-15: nested filters, count_distinct/percentile/first/last/count_if, having, topKPerGroup via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'f.csv'),
+      'region,amount,day\nA,10,2026-10-01\nB,20,2026-10-02\nA,30,2026-10-02\nC,40,2026-10-03\nA,50,2026-10-03\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/f.csv' })
+
+    // R-5: OR group
+    const orRes = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        filter: { any: [{ column: 'region', op: 'eq', value: 'A' }, { column: 'amount', op: 'gt', value: 35 }] },
+      }),
+    })
+    assert.equal(orRes.rowCount, 4)
+
+    // R-5: mixed AND/OR with NOT
+    const mixed = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        filter: {
+          all: [
+            { any: [{ column: 'region', op: 'eq', value: 'A' }, { column: 'region', op: 'eq', value: 'B' }] },
+            { not: { column: 'amount', op: 'lte', value: 10 } },
+          ],
+        },
+      }),
+    })
+    assert.equal(mixed.rowCount, 3)
+
+    // R-6: count_distinct / percentile / first / last / count_if
+    const aggRes = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: ['region'],
+        aggs: [
+          { fn: 'count_distinct', column: 'amount', as: 'na' },
+          { fn: 'percentile', column: 'amount', p: 0.5, as: 'p50' },
+          { fn: 'first', column: 'amount', as: 'first_amt' },
+          { fn: 'last', column: 'amount', as: 'last_amt' },
+          { fn: 'count_if', where: { column: 'amount', op: 'gte', value: 30 }, as: 'big' },
+        ],
+      }),
+    })
+    assert.equal(aggRes.rowCount, 3)
+    const rowsA = aggRes.rows.find(r => r[0] === 'A')
+    assert.equal(rowsA[1], 3)
+    assert.equal(rowsA[2], 30)
+    assert.equal(rowsA[3], 10)
+    assert.equal(rowsA[4], 50)
+    assert.equal(rowsA[5], 2)
+
+    // R-7: having on the agg output
+    const hav = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: ['region'],
+        aggs: [{ fn: 'count', as: 'n' }],
+        having: [{ column: 'n', op: 'gt', value: 1 }],
+      }),
+    })
+    assert.equal(hav.rowCount, 1)
+    assert.equal(hav.rows[0][0], 'A')
+
+    // R-15: top-1 amount per region, amount desc
+    const topk = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        topKPerGroup: { by: ['region'], k: 1, orderBy: { column: 'amount', desc: true } },
+      }),
+    })
+    assert.equal(topk.rowCount, 3)
+    assert.deepEqual(topk.rows.map(r => r[1]).sort((a, b) => a - b), [20, 40, 50])
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+// ---------- v0.2.0 acceptance: select rename + cast mutate + warnings ----------
+
+test('R-9: select rename + to_date/to_int mutate via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'd.csv'),
+      'day,region,amount,txt\n2026/10/02,A,10,7\n2026/10/02,B,20,abc\n2026/10/03,A,30,9\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/d.csv' })
+
+    // select rename
+    const ren = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({ select: ['region', { column: 'amount', as: 'amt' }] }),
+    })
+    assert.deepEqual(ren.columns, ['region', 'amt'])
+    assert.deepEqual(ren.rows[0], ['A', 10])
+
+    // to_date then dateColumn grouping eats the produced column
+    const dated = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        mutate: [{ as: 'd2', expr: 'to_date(day, "%Y/%m/%d")' }],
+        groupBy: [{ dateColumn: 'd2', period: 'month' }],
+        aggs: [{ fn: 'count', as: 'n' }],
+      }),
+    })
+    assert.deepEqual(dated.columns, ['d2_month', 'n'])
+    assert.deepEqual(dated.rows[0], ['2026-10', 3])
+
+    // to_int runtime failure -> cast-null warning
+    const cast = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({ mutate: [{ as: 'x', expr: 'to_int(txt)' }] }),
+    })
+    const castWarn = cast.warnings.find(w => w.code === 'cast-null')
+    assert.ok(castWarn, JSON.stringify(cast.warnings))
+    assert.equal(castWarn.column, 'x')
+    assert.equal(castWarn.count, 1)
+    const castRendered = defs.transform_agg.output.render({}, cast).map(p => p.text).join('')
+    assert.match(castRendered, /warnings:/)
+    assert.match(castRendered, /cast-null/)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-12/R-13/R-20: requestedN/requestedLimit pass-through and clamp/mutate-null/date-parse-fail warnings', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    const lines = ['region,amount,day,z']
+    for (let i = 0; i < 5; i++) lines.push(`A,${(i + 1) * 10},2026-10-0${i + 1},0`)
+    lines.push('B,60,not-a-date,0')
+    writeFileSync(join(ws, 'data', 'w.csv'), lines.join('\n') + '\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/w.csv' })
+
+    // head: over-limit n is passed through, CLI clamps + echoes requestedN/n
+    const head = await defs.dataset_head.execute({ datasetId: ing.datasetId, n: 500 })
+    assert.equal(head.requestedN, 500)
+    assert.equal(head.n, 6)
+    const clampWarn = head.warnings.find(w => w.code === 'clamp')
+    assert.ok(clampWarn, JSON.stringify(head.warnings))
+    assert.equal(clampWarn.field, 'n')
+    assert.equal(clampWarn.requested, 500)
+    assert.equal(clampWarn.actual, 100)
+    const headText = defs.dataset_head.output.render({}, head).map(p => p.text).join('')
+    assert.match(headText, /requestedN=500/)
+    assert.match(headText, /warnings:/)
+    assert.match(headText, /clamp/)
+
+    // sample: same policy at 200
+    const samp = await defs.dataset_sample.execute({ datasetId: ing.datasetId, n: 500 })
+    assert.equal(samp.requestedN, 500)
+    assert.equal(samp.n, 6)
+    assert.ok(samp.warnings.some(w => w.code === 'clamp' && w.actual === 200))
+
+    // values: requestedLimit/limit
+    const vals = await defs.dataset_values.execute({ datasetId: ing.datasetId, column: 'region', limit: 500 })
+    assert.equal(vals.requestedLimit, 500)
+    assert.equal(vals.limit, 100)
+    assert.ok(vals.warnings.some(w => w.code === 'clamp' && w.field === 'limit'))
+    const valsText = defs.dataset_values.output.render({}, vals).map(p => p.text).join('')
+    assert.match(valsText, /requestedLimit=500/)
+
+    // non-integer / <1 rejected at the tool layer
+    await assert.rejects(() => defs.dataset_head.execute({ datasetId: ing.datasetId, n: 0 }), /n must be integer/)
+    await assert.rejects(() => defs.dataset_head.execute({ datasetId: ing.datasetId, n: 1.5 }), /n must be integer/)
+    await assert.rejects(() => defs.dataset_values.execute({ datasetId: ing.datasetId, column: 'region', limit: -1 }), /limit must be integer/)
+
+    // mutate-null via division by zero
+    const mut = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({ mutate: [{ as: 'r', expr: 'amount / z' }] }),
+    })
+    const nullWarn = mut.warnings.find(w => w.code === 'mutate-null')
+    assert.ok(nullWarn, JSON.stringify(mut.warnings))
+    assert.equal(nullWarn.column, 'r')
+    assert.equal(nullWarn.count, 6)
+
+    // date-parse-fail alongside parseFailSample
+    const dp = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: [{ dateColumn: 'day', period: 'month' }],
+        aggs: [{ fn: 'count', as: 'n' }],
+      }),
+    })
+    assert.equal(dp.parseFailCount, 1)
+    assert.deepEqual(dp.parseFailSample, ['not-a-date'])
+    assert.ok(dp.warnings.some(w => w.code === 'date-parse-fail' && w.count === 1))
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+// ---------- v0.2.0 acceptance: dataset_union / dataset_diff / dataset_pivot ----------
+
+test('R-8a: dataset_union strict and intersect via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'l.csv'), 'k,v\n1,L1\n2,L2\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r1.csv'), 'k,v\n3,R3\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r2.csv'), 'k,w\n4,W4\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/l.csv' })
+    const right1 = await defs.dataset_ingest.execute({ path: 'data/r1.csv' })
+    const right2 = await defs.dataset_ingest.execute({ path: 'data/r2.csv' })
+
+    const strict = await defs.dataset_union.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right1.datasetId,
+      label: 'combined',
+    })
+    assert.match(strict.datasetId, /^ds_/)
+    assert.equal(strict.rowCount, 3)
+    assert.equal(strict.leftRows, 2)
+    assert.equal(strict.rightRows, 1)
+    assert.deepEqual(strict.columns.map(c => c.name), ['k', 'v'])
+
+    const inter = await defs.dataset_union.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right2.datasetId,
+      columnsPolicy: 'intersect',
+    })
+    assert.deepEqual(inter.columns.map(c => c.name), ['k'])
+    assert.equal(inter.rowCount, 3)
+
+    await assert.rejects(
+      () => defs.dataset_union.execute({ leftDatasetId: left.datasetId, rightDatasetId: right2.datasetId }),
+      /union column mismatch/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_union.execute({
+          leftDatasetId: left.datasetId,
+          rightDatasetId: right1.datasetId,
+          columnsPolicy: 'nope',
+        }),
+      /columnsPolicy must be strict\|intersect/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-8b: dataset_diff keyed pairs and multiset mode via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'l.csv'), 'k,v\n1,a\n2,b\n3,c\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r.csv'), 'k,v\n2,B\n3,c\n4,d\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'l2.csv'), 'k,v\nx,1\ny,2\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'r2.csv'), 'k2,v\nx,1\nz,3\n', 'utf8')
+    const defs = makeDefs(ws)
+    const left = await defs.dataset_ingest.execute({ path: 'data/l.csv' })
+    const right = await defs.dataset_ingest.execute({ path: 'data/r.csv' })
+
+    const keyed = await defs.dataset_diff.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+      on: ['k'],
+    })
+    assert.equal(keyed.onlyLeft, 1)
+    assert.equal(keyed.onlyRight, 1)
+    assert.equal(keyed.changed, 1)
+    assert.equal(keyed.samples.onlyLeft.length, 1)
+    assert.equal(keyed.samples.onlyLeft[0].k, 1)
+    assert.deepEqual(keyed.samples.changed[0].diffColumns, ['v'])
+    assert.deepEqual(keyed.samples.changed[0].key, { k: 2 })
+
+    // multiset mode: changed stays 0
+    const multi = await defs.dataset_diff.execute({
+      leftDatasetId: left.datasetId,
+      rightDatasetId: right.datasetId,
+    })
+    assert.equal(multi.onlyLeft, 2)
+    assert.equal(multi.onlyRight, 2)
+    assert.equal(multi.changed, 0)
+
+    // leftKey:rightKey pair
+    const left2 = await defs.dataset_ingest.execute({ path: 'data/l2.csv' })
+    const right2 = await defs.dataset_ingest.execute({ path: 'data/r2.csv' })
+    const paired = await defs.dataset_diff.execute({
+      leftDatasetId: left2.datasetId,
+      rightDatasetId: right2.datasetId,
+      on: ['k:k2'],
+    })
+    assert.equal(paired.onlyLeft, 1)
+    assert.equal(paired.onlyRight, 1)
+    assert.equal(paired.changed, 0)
+
+    await assert.rejects(
+      () => defs.dataset_diff.execute({ leftDatasetId: left.datasetId, rightDatasetId: right.datasetId, sampleLimit: 0 }),
+      /sampleLimit must be integer/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-16b: dataset_pivot wide table + >50 pivot columns analysis/limit', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'p.csv'),
+      'region,day,amount\nA,d1,10\nA,d2,30\nB,d1,20\n',
+      'utf8',
+    )
+    const wide = ['g,d,v']
+    for (let i = 0; i < 51; i++) wide.push(`a,d${i},${i}`)
+    writeFileSync(join(ws, 'data', 'wide.csv'), wide.join('\n') + '\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/p.csv' })
+    const wideIng = await defs.dataset_ingest.execute({ path: 'data/wide.csv' })
+
+    const piv = await defs.dataset_pivot.execute({
+      datasetId: ing.datasetId,
+      index: ['region'],
+      columns: 'day',
+      values: 'amount',
+      agg: 'sum',
+      label: 'by-day',
+    })
+    assert.match(piv.datasetId, /^ds_/)
+    assert.equal(piv.rowCount, 2)
+    assert.deepEqual(piv.indexColumns, ['region'])
+    assert.equal(piv.pivotColumn, 'day')
+    assert.deepEqual(piv.columns.map(c => c.name), ['region', 'd1', 'd2'])
+    const head = await defs.dataset_head.execute({ datasetId: piv.datasetId, n: 10 })
+    assert.deepEqual(head.rows, [['A', 10, 30], ['B', 20, null]])
+
+    await assert.rejects(
+      () =>
+        defs.dataset_pivot.execute({
+          datasetId: wideIng.datasetId,
+          index: ['g'],
+          columns: 'd',
+          values: 'v',
+          agg: 'sum',
+        }),
+      /pivot columns exceed 50/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_pivot.execute({
+          datasetId: ing.datasetId,
+          index: ['region'],
+          columns: 'day',
+          values: 'amount',
+          agg: 'nope',
+        }),
+      /agg must be sum\|mean\|min\|max\|count/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+// ---------- v0.2.0 acceptance: join pairs / json ingest / list filters ----------
+
+test('R-10: dataset_join leftKey:rightKey on-entries via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'orders.csv'), 'order_id,amount\n1,10\n2,20\n', 'utf8')
+    writeFileSync(join(ws, 'data', 'codes.csv'), 'oid,region\n1,A\n3,C\n', 'utf8')
+    const defs = makeDefs(ws)
+    const orders = await defs.dataset_ingest.execute({ path: 'data/orders.csv' })
+    const codes = await defs.dataset_ingest.execute({ path: 'data/codes.csv' })
+
+    const joined = await defs.dataset_join.execute({
+      leftDatasetId: orders.datasetId,
+      rightDatasetId: codes.datasetId,
+      on: ['order_id:oid'],
+      how: 'inner',
+    })
+    assert.equal(joined.rowCount, 1)
+    assert.ok(joined.columns.some(c => c.name === 'region'))
+
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: orders.datasetId,
+          rightDatasetId: codes.datasetId,
+          on: ['order_id:nope'],
+        }),
+      /unknown column nope on right/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: orders.datasetId,
+          rightDatasetId: codes.datasetId,
+          on: ['nope:oid'],
+        }),
+      /unknown column nope on left/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: orders.datasetId,
+          rightDatasetId: codes.datasetId,
+          on: ['order_id:oid', 'order_id:oid'],
+        }),
+      /duplicate join key/,
+    )
+    await assert.rejects(
+      () =>
+        defs.dataset_join.execute({
+          leftDatasetId: orders.datasetId,
+          rightDatasetId: codes.datasetId,
+          on: ['a:'],
+        }),
+      /on pairs must be leftKey:rightKey/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-11: dataset_ingest accepts json (array and records forms) via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'a.json'), '[{"region":"A","amount":10},{"region":"B","amount":20}]', 'utf8')
+    writeFileSync(join(ws, 'data', 'b.json'), '{"records":[{"x":1},{"x":2},{"x":3}]}', 'utf8')
+    const defs = makeDefs(ws)
+
+    const arr = await defs.dataset_ingest.execute({ path: 'data/a.json', format: 'json' })
+    assert.equal(arr.rowCount, 2)
+    assert.equal(arr.columnCount, 2)
+    assert.deepEqual(arr.columns.map(c => c.name), ['region', 'amount'])
+
+    const rec = await defs.dataset_ingest.execute({ path: 'data/b.json' })
+    assert.equal(rec.rowCount, 3)
+
+    await assert.rejects(
+      () => defs.dataset_ingest.execute({ path: 'data/a.json', format: 'parquet' }),
+      /parquet not supported/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-19: dataset_list labelLike/producedBy/since filters + createdAt render via mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'a.csv'), 'k\n1\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ingA = await defs.dataset_ingest.execute({ path: 'data/a.csv', label: 'ALPHA' })
+    await defs.dataset_ingest.execute({ path: 'data/a.csv', label: 'beta' })
+    const aggregated = await defs.transform_agg.execute({
+      datasetId: ingA.datasetId,
+      spec: JSON.stringify({ aggs: [{ fn: 'count', as: 'n' }] }),
+      outLabel: 'counts',
+    })
+    assert.ok(aggregated.outDatasetId)
+
+    const all = await defs.dataset_list.execute({})
+    assert.equal(all.datasets.length, 3)
+    assert.ok(all.datasets.every(d => typeof d.createdAt === 'string'))
+
+    const byLabel = await defs.dataset_list.execute({ labelLike: 'alpha' })
+    assert.equal(byLabel.datasets.length, 1)
+    assert.equal(byLabel.datasets[0].label, 'ALPHA')
+
+    const byProd = await defs.dataset_list.execute({ producedBy: 'agg' })
+    assert.equal(byProd.datasets.length, 1)
+    assert.equal(byProd.datasets[0].datasetId, aggregated.outDatasetId)
+
+    const recent = await defs.dataset_list.execute({ since: '2020-01-01' })
+    assert.equal(recent.datasets.length, 3)
+    const future = await defs.dataset_list.execute({ since: '2999-01-01' })
+    assert.equal(future.datasets.length, 0)
+
+    const rendered = defs.dataset_list.output.render({}, all).map(p => p.text).join('')
+    assert.match(rendered, /@ /)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

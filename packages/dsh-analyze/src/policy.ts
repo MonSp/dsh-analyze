@@ -21,6 +21,9 @@ export const ANALYSIS_TOOL_NAMES = [
   'dataset_corr',
   'dataset_crosstab',
   'dataset_series',
+  'dataset_union',
+  'dataset_diff',
+  'dataset_pivot',
 ] as const
 
 export type AnalysisToolName = (typeof ANALYSIS_TOOL_NAMES)[number]

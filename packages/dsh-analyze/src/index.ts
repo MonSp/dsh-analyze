@@ -19,6 +19,16 @@ import { probeAnalyzeCliSync, resolveAnalysisCliPath } from './cli.js'
 import { ANALYSIS_TOOL_NAMES } from './policy.js'
 import { createAnalysisToolDefinitions } from './tools.js'
 
+export { createAnalysisToolDefinitions, validateAggSpec } from './tools.js'
+export type { AnalysisRuntimeConfig } from './tools.js'
+export { attachAnalysisTools } from './register.js'
+export type {
+  AgentToolsRegisterLike,
+  AttachAnalysisToolsOptions,
+  AttachAnalysisToolsResult,
+} from './register.js'
+export type { AnalysisLimits } from './limits.js'
+
 interface ToolsSlice {
   register?(definition: unknown): () => void
 }
