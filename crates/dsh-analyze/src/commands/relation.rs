@@ -269,10 +269,11 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         .map(|p| {
             let r_s = p.r.map(json_f64).unwrap_or_else(|| "null".into());
             format!(
-                "{{\"columns\":[{},{}],\"n\":{},\"r\":{},\"degenerate\":{}}}",
+                "{{\"columns\":[{},{}],\"n\":{},\"df\":{},\"r\":{},\"degenerate\":{}}}",
                 json_string(&columns[p.col_i]),
                 json_string(&columns[p.col_j]),
                 p.n,
+                p.n.saturating_sub(2),
                 r_s,
                 p.degenerate
             )

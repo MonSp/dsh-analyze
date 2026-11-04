@@ -298,21 +298,7 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
     let max_rows: usize =
         env_u64("DSH_ANALYZE_MAX_ROWS", "INV_ANALYSIS_MAX_ROWS", 5_000_000) as usize;
 
-    let ops_text = {
-        let t = ops_raw.trim_start();
-        if t.starts_with('[') {
-            ops_raw
-        } else {
-            let path = ensure_within_workspace(workspace, Path::new(&ops_raw)).map_err(|e| {
-                eprintln!("{e}");
-                2u8
-            })?;
-            fs::read_to_string(&path).map_err(|e| {
-                eprintln!("analysis/invalid-args: cannot read ops file: {e}");
-                2u8
-            })?
-        }
-    };
+    let ops_text = resolve_ops(workspace, &ops_raw)?;
     let ops = parse_ops(&ops_text).map_err(|e| {
         eprintln!("{e}");
         2u8
@@ -615,6 +601,37 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         json_string(&order_by),
         ops.len()
     ))
+}
+
+/// Resolve `--ops` as inline JSON array or a workspace file (R-3).
+/// Never leaks OS error text; non-JSON non-file input gets a stable message.
+fn resolve_ops(workspace: &Path, ops_raw: &str) -> Result<String, u8> {
+    let t = ops_raw.trim_start();
+    if t.starts_with('[') {
+        return Ok(ops_raw.to_string());
+    }
+    if !crate::cli::looks_like_workspace_path(ops_raw) {
+        return fail(
+            2,
+            "analysis/invalid-args: --ops must be JSON array or a workspace path",
+        );
+    }
+    let ops_path = match ensure_within_workspace(workspace, Path::new(ops_raw)) {
+        Ok(p) => p,
+        Err(e) if e.contains("escapes") => {
+            return fail(2, &e);
+        }
+        Err(_) => {
+            return fail(2, "analysis/invalid-args: cannot read ops file: file not found");
+        }
+    };
+    if !ops_path.exists() {
+        return fail(2, "analysis/invalid-args: cannot read ops file: file not found");
+    }
+    match fs::read_to_string(&ops_path) {
+        Ok(text) => Ok(text),
+        Err(_) => fail(2, "analysis/invalid-args: cannot read ops file: file not readable"),
+    }
 }
 
 #[cfg(test)]

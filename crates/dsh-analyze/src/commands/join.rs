@@ -20,14 +20,23 @@ pub(crate) fn cmd_join(workspace: &Path, args: &[String]) -> Result<String, u8> 
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --on required"),
     };
-    let on: Vec<String> = on_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if on.is_empty() {
-        return fail(2, "analysis/invalid-args: --on must list at least one column");
-    }
+    let on: Vec<(String, String)> = {
+        let entries: Vec<&str> = on_raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if entries.is_empty() {
+            return fail(2, "analysis/invalid-args: --on must list at least one column");
+        }
+        if entries.len() > 8 {
+            return fail(2, "analysis/invalid-args: --on must list 1..8 key entries");
+        }
+        crate::commands::parse_on_pairs(&on_raw).map_err(|e| {
+            eprintln!("{e}");
+            2u8
+        })?
+    };
     let how = flag_value(args, "--how")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "inner".into());
@@ -59,21 +68,21 @@ pub(crate) fn cmd_join(workspace: &Path, args: &[String]) -> Result<String, u8> 
 
     let mut left_key_idx = Vec::with_capacity(on.len());
     let mut right_key_idx = Vec::with_capacity(on.len());
-    for col in &on {
+    for (ln, rn) in &on {
         let li = left
             .columns
             .iter()
-            .position(|c| &c.name == col)
+            .position(|c| &c.name == ln)
             .ok_or_else(|| {
-                eprintln!("analysis/invalid-args: unknown column {col} on left");
+                eprintln!("analysis/invalid-args: unknown column {ln} on left");
                 2u8
             })?;
         let ri = right
             .columns
             .iter()
-            .position(|c| &c.name == col)
+            .position(|c| &c.name == rn)
             .ok_or_else(|| {
-                eprintln!("analysis/invalid-args: unknown column {col} on right");
+                eprintln!("analysis/invalid-args: unknown column {rn} on right");
                 2u8
             })?;
         left_key_idx.push(li);

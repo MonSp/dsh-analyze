@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::cli::{env_u64, fail, flag_value};
+use crate::commands::clamp_warning_json;
 use crate::dataset::{json_string, load_dataset, Table, Value};
 
 /// SplitMix64 deterministic PRNG for sampling.
@@ -31,10 +32,14 @@ pub(crate) fn cmd_sample(workspace: &Path, args: &[String]) -> Result<String, u8
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --dataset-id required"),
     };
-    let n: usize = flag_value(args, "--n")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10)
-        .clamp(1, 20);
+    let requested_n: u64 = match flag_value(args, "--n") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => return fail(2, "analysis/invalid-args: --n must be integer >= 1"),
+        },
+        None => 10,
+    };
+    let n = requested_n.min(200) as usize;
     let default_seed: u64 = env_u64(
         "DSH_ANALYZE_DEFAULT_SAMPLE_SEED",
         "INV_ANALYSIS_DEFAULT_SAMPLE_SEED",
@@ -81,12 +86,22 @@ pub(crate) fn cmd_sample(workspace: &Path, args: &[String]) -> Result<String, u8
         .as_deref()
         .map(json_string)
         .unwrap_or_else(|| "null".into());
+    let warnings = if requested_n > 200 {
+        format!(
+            ",\"warnings\":[{}]",
+            clamp_warning_json("n", requested_n, 200)
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"sampling\":{{\"method\":\"{method}\",\"n\":{},\"seed\":{seed},\"stratifyBy\":{stratify_json},\"population\":{pop}}}}}",
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"requestedN\":{},\"n\":{},\"sampling\":{{\"method\":\"{method}\",\"n\":{},\"seed\":{seed},\"stratifyBy\":{stratify_json},\"population\":{pop}}}{warnings}}}",
         json_string(&id),
         meta.row_count.max(pop),
         cols.iter().map(|c| json_string(c)).collect::<Vec<_>>().join(","),
         rows_json,
+        requested_n,
+        indices.len(),
         indices.len()
     ))
 }
