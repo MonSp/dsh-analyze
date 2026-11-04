@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use cli::fail;
 
 const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\",\"corr\",\"crosstab\",\"series\",\"union\",\"diff\",\"pivot\"";
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.1.7";
 
 const USAGE: &str = "\
 dsh-analyze — workspace-confined dataset analysis (stdout: one JSON line per run)

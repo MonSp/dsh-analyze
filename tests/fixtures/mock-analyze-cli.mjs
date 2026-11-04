@@ -155,7 +155,7 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.2.0-mock',
+      version: '0.1.7-mock',
       capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
     }))
     return

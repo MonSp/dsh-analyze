@@ -264,7 +264,7 @@ test('BUG-3: transform_agg rejects object filter before CLI spawn', async () => 
   }
 })
 
-// ---- v0.2.0 contract: filter/having trees (R-5/R-7) ----
+// ---- v0.1.7 contract: filter/having trees (R-5/R-7) ----
 
 test('R-5: validateAggSpec accepts nested filter groups (all/any/not)', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
@@ -352,7 +352,7 @@ test('R-7: having is a top-level key with the filter shape', () => {
   )
 })
 
-// ---- v0.2.0 contract: agg fn whitelist (R-6) ----
+// ---- v0.1.7 contract: agg fn whitelist (R-6) ----
 
 test('R-6: validateAggSpec accepts count_distinct/percentile/first/last/count_if', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
@@ -395,7 +395,7 @@ test('R-6: bad agg params rejected (percentile p, count_if where/column, missing
   assert.throws(() => validateAggSpec(JSON.stringify({ aggs: [{ fn: 'mode', column: 'a' }] }), limits), /bad agg fn/)
 })
 
-// ---- v0.2.0 contract: topKPerGroup (R-15) ----
+// ---- v0.1.7 contract: topKPerGroup (R-15) ----
 
 test('R-15: topKPerGroup validates by/k/orderBy ranges', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
@@ -429,7 +429,7 @@ test('R-15: topKPerGroup validates by/k/orderBy ranges', () => {
   }
 })
 
-// ---- v0.2.0 contract: select rename + mutate casts (R-9) ----
+// ---- v0.1.7 contract: select rename + mutate casts (R-9) ----
 
 test('R-9: select entries accept {column,as} renames and reject duplicates', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
@@ -484,7 +484,7 @@ test('R-9: validateMutateExpr whitelist to_int/to_str/to_date + string literals'
   assert.throws(() => validateMutateExpr('a; drop'), /illegal characters/)
 })
 
-// ---- v0.2.0 contract: R-18 package-root library surface ----
+// ---- v0.1.7 contract: R-18 package-root library surface ----
 
 test('R-18: package root (dist/index.js) re-exports createAnalysisToolDefinitions, attachAnalysisTools, validateAggSpec', async () => {
   const api = await import('../packages/dsh-analyze/dist/index.js')

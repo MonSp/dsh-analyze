@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.6)
+# dsh-analyze interface specification (v0.1.7)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.6` |
+| Version | `0.1.7` |
 
 ## 2. Invocation
 
@@ -32,8 +32,25 @@ dsh-analyze --workspace <dir> [--pretty] <cmd> [flags...]
 | 1 | I/O or internal CLI failure (`analysis/cli-failed`) |
 | 2 | invalid arguments / path (`analysis/invalid-args`, `analysis/invalid-path`) |
 | 3 | limit exceeded (`analysis/limit`) |
-| 4 | format not enabled (e.g. parquet) |
+| 4 | format not enabled (parquet / xlsx) |
 | 5 | unknown dataset (`analysis/unknown-dataset`) |
+
+### Response warnings
+
+Success responses may carry an optional `warnings` array (omitted when empty):
+
+```json
+"warnings":[{"code":"clamp","field":"n","requested":500,"actual":100}]
+```
+
+- Entry base shape: `code` (required), `message`, `column`, `count` (optional);
+  code-specific extra fields are allowed (`field`/`requested`/`actual` for
+  `clamp`; `nunique`/`threshold`/`emitted`/`total` for `profile` codes).
+- Codes in this version: `mutate-null` (arithmetic produced Null at runtime,
+  e.g. divide by zero), `cast-null` (`to_int`/`to_str`/`to_date` conversion
+  failed for some rows), `date-parse-fail` (time-period grouping failures,
+  alongside `parseFailSample`), `clamp` (requested cap was clamped).
+- The tool layer renders `warnings` in every tool result.
 
 ## 3. Environment
 
@@ -57,32 +74,42 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.6","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series"]}
+{"ok":true,"version":"0.1.7","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot"]}
 ```
 
-Capability tokens: the v0.1.4 set plus `series` (appended, never inserted
-mid-list). Mutate, time-period grouping, extended `describe` quantiles,
-and join `anti`/`semi` ship inside existing commands and do not add separate
-capability tokens.
+Capability tokens: the v0.1.6 set plus `union`, `diff`, `pivot` (appended,
+never inserted mid-list). Mutate, time-period grouping, extended `describe`
+quantiles, `having`, `topKPerGroup`, select rename, and join `anti`/`semi` ship
+inside existing commands and do not add separate capability tokens.
 
 ### `ingest`
 
-Flags: `--input <path>` (required), `--format csv|jsonl|parquet`, `--dataset-id <id>`, `--label <text>`
+Flags: `--input <path>` (required), `--format csv|json|jsonl`, `--dataset-id <id>`, `--label <text>`
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"bytesOnDisk":N}
 ```
 
 - `--input` must resolve inside `--workspace`.
-- parquet is rejected with exit 4 (not enabled).
+- `json` accepts a top-level array of objects `[{…},…]` or a wrapper object
+  `{"records":[{…},…]}`; non-object elements fail with
+  `analysis/invalid-args: bad json record at index {i}`. Columns are the union
+  of record keys in first-seen order; dtype inference matches `jsonl`.
+- `parquet` / `xlsx` are not enabled: exit 4 with
+  `analysis/limit: parquet not supported yet (planned, see docs/interface.md)`
+  / `analysis/limit: xlsx not supported (convert to csv/jsonl)`.
 
 ### `head`
 
-Flags: `--dataset-id` (required), `--n` (1–20, default 5)
+Flags: `--dataset-id` (required), `--n` (1–100, default 5)
 
 ```json
-{"ok":true,"datasetId":"ds_…","rowCount":N,"columns":["…"],"rows":[[…]]}
+{"ok":true,"datasetId":"ds_…","rowCount":N,"columns":["…"],"rows":[[…]],"requestedN":N,"n":N}
 ```
+
+- `requestedN` echoes the requested `--n`; `n` is the number of rows returned.
+- `--n` non-integer or < 1 → exit 2; values above 100 clamp to 100 and add a
+  `clamp` warning (`field: "n"`). `rowCount` is the dataset size.
 
 ### `schema`
 
@@ -111,24 +138,30 @@ Column value distribution (top values + uniqueness).
 Flags: `--dataset-id` (required), `--column` (required), `--limit` (1–100, default 20)
 
 ```json
-{"ok":true,"datasetId":"ds_…","column":"…","dtype":"…","rowCount":N,"nullCount":N,"nunique":N,"limit":20,"top":[{"value":…,"count":N,"ratio":0.0}]}
+{"ok":true,"datasetId":"ds_…","column":"…","dtype":"…","rowCount":N,"nullCount":N,"nunique":N,"requestedLimit":20,"limit":20,"top":[{"value":…,"count":N,"ratio":0.0}]}
 ```
 
 - `null` cells are counted in `nullCount` and **excluded** from `top`.
 - `nunique` counts distinct non-null values.
 - `ratio` = `count / max(rowCount - nullCount, 1)` (share of non-null rows).
 - `top` sorted by `count` desc, then stable by JSON form of `value` asc.
-- `limit` clamps the length of `top` only; does not change `nunique`.
+- `requestedLimit` echoes the requested `--limit`; `limit` is the effective cap
+  (clamped to 100, with a `clamp` warning). It clamps the length of `top` only;
+  does not change `nunique`.
 
 ### `sample`
 
-Deterministic row sample. Never returns more than 20 rows.
+Deterministic row sample. Never returns more than 200 rows.
 
-Flags: `--dataset-id` (required), `--n` (1–20, default 10), `--seed` (u64, default `DSH_ANALYZE_DEFAULT_SAMPLE_SEED` or 42), `--stratify-by <column>` (optional)
+Flags: `--dataset-id` (required), `--n` (1–200, default 10), `--seed` (u64, default `DSH_ANALYZE_DEFAULT_SAMPLE_SEED` or 42), `--stratify-by <column>` (optional)
 
 ```json
-{"ok":true,"datasetId":"ds_…","rowCount":N,"columns":["…"],"rows":[[…]],"sampling":{"method":"random"|"stratified","n":10,"seed":42,"stratifyBy":null|"…","population":N}}
+{"ok":true,"datasetId":"ds_…","rowCount":N,"columns":["…"],"rows":[[…]],"requestedN":N,"n":N,"sampling":{"method":"random"|"stratified","n":10,"seed":42,"stratifyBy":null|"…","population":N}}
 ```
+
+- `requestedN` echoes the requested `--n`; `n` is the number of rows returned.
+  Non-integer or < 1 → exit 2; values above 200 clamp to 200 with a `clamp`
+  warning (`field: "n"`).
 
 - `sampling.stratifyBy` is `string | null` — `null` when `--stratify-by` is not given (unstratified), else the strata column name.
 - PRNG: SplitMix64 seeded by `seed`. Same `(dataset, n, seed, stratifyBy)` always yields the same rows.
@@ -144,28 +177,39 @@ Spec JSON:
 
 ```json
 {
-  "select": ["col"],
+  "select": ["col", {"column":"c","as":"r"}],
   "filter": [{"column":"col","op":"eq","value":1}],
+  "topKPerGroup": {"by":["region"],"k":3,"orderBy":{"column":"amount","desc":true}},
   "mutate": [{"as":"rate","expr":"hits / total"}],
   "groupBy": ["col", {"dateColumn":"created_at","period":"day"}],
   "aggs": [{"fn":"count","as":"n"},{"fn":"sum","column":"col","as":"s"}],
+  "having": [{"column":"n","op":"gt","value":1}],
   "orderBy": [{"column":"s","desc":true}],
   "limit": 100
 }
 ```
 
-Filter ops: `eq ne gt gte lt lte in contains is_null not_null`  
-Agg fns: `count sum mean min max median std`  
-Limit range: `1..5000` (default `DSH_ANALYZE_DEFAULT_ROW_LIMIT`).  
-`--spec` may be inline JSON or a workspace-relative file path.
+Filter ops: `eq ne gt gte lt lte in contains is_null not_null` (see filter
+shapes for the boolean-group form).
+Agg fns: `count sum mean min max median std count_distinct percentile first last count_if`
+Limit range: `1..5000` (default `DSH_ANALYZE_DEFAULT_ROW_LIMIT`).
+`--spec` must be a JSON object or a workspace-relative file path
+(`analysis/invalid-args: --spec must be JSON object or a workspace path`
+otherwise; file read errors never leak OS text).
 
 Spec key shapes (enforced by the CLI and by tool-layer `validateAggSpec`):
 
-- `filter` must be an **array** of predicate objects — positive:
-  `"filter": [{"column":"amount","op":"gt","value":3000}]`; negative: a bare
-  object `{"filter": {"column":"amount","op":"gt","value":3000}}` (or a
-  string) is rejected with `analysis/invalid-args: filter must be an array`,
-  never applied as "no filter".
+- `filter` is either an **array** of predicate objects (AND across items) or a
+  **boolean-group object**: `{"all":[item…]}` / `{"any":[item…]}` /
+  `{"not":item}` where `item` is a predicate or another group (nesting depth
+  ≤ 8; deeper → `analysis/invalid-args: filter nesting too deep`). Empty
+  `all` is true, empty `any` is false. Positive array:
+  `"filter": [{"column":"amount","op":"gt","value":3000}]`; positive group:
+  `"filter": {"any":[{"column":"region","op":"eq","value":"East"},{"column":"region","op":"eq","value":"North"}]}`.
+  A bare predicate object `{"filter": {"column":"amount","op":"gt","value":3000}}`
+  (or a string) is still rejected (`analysis/invalid-args: filter must be an
+  array` for non-object/array shapes; unknown group keys fail), never applied
+  as "no filter".
 - A filter item needs a `column` string
   (`analysis/invalid-args: filter column required`). Its `value` is a scalar
   (string / number / boolean), required for every op except `is_null` /
@@ -176,20 +220,43 @@ Spec key shapes (enforced by the CLI and by tool-layer `validateAggSpec`):
   `analysis/invalid-args: filter value …` — never a silent first-element
   pick or null default.
 - `select` / `mutate` / `groupBy` / `aggs` / `orderBy` must be arrays;
-  `orderBy` items need a string `column` and an optional boolean `desc`
-  (`analysis/invalid-args: orderBy desc must be boolean` otherwise);
-  `limit` must be an integer `1..5000`. Wrong shapes fail with
-  `analysis/invalid-args`.
+  `select` entries are column-name strings or `{"column":"…","as":"…"}`
+  rename objects (`as` required, identifier ≤64 chars; duplicate output names
+  → `analysis/invalid-args`); `orderBy` items need a string `column` and an
+  optional boolean `desc` (`analysis/invalid-args: orderBy desc must be
+  boolean` otherwise); `limit` must be an integer `1..5000`.
+  `having` has the same shape as `filter` and is applied to result columns
+  (group keys + agg `as` names) after aggregation. `topKPerGroup` is
+  `{"by":[col…1..8],"k":int 1..1000,"orderBy":{"column":…,"desc":bool}?}` —
+  a row stage (after `filter`, before `mutate`) keeping ≤ `k` rows per `by`
+  key combination (Null its own group), ordered by `orderBy` (input order
+  default). Wrong shapes fail with `analysis/invalid-args`.
 - Unknown top-level spec keys are rejected
   (`analysis/invalid-args: unknown spec key …`), never silently dropped.
 
-Pipeline order (v0.1.2):
+Pipeline order (v0.1.7):
 
-1. `filter` (AND across predicates)
-2. `mutate` — each `as` becomes a derived column before grouping
-3. `groupBy` — plain column names and time-period objects
-4. `aggs`
-5. `orderBy` / `limit` / `select`
+1. `filter` (AND array, or `all`/`any`/`not` groups)
+2. `topKPerGroup` — per-`by`-group row cap
+3. `mutate` — each `as` becomes a derived column before grouping
+4. `groupBy` + `aggs`
+5. `having` — result-column filter
+6. `select` — projection / rename
+7. `orderBy` / `limit`
+
+Agg fn notes (v0.1.7):
+
+- `count_distinct`: distinct non-null values of `column`.
+- `percentile`: requires `p` number in (0,1); nearest-rank estimate over
+  non-null values (same estimator as `describe` quantiles); all-null → `null`.
+  Missing / out-of-range `p` → `analysis/invalid-args: percentile requires p
+  in (0,1)`.
+- `first` / `last`: first / last **non-null** value of `column` in input order.
+- `count_if`: counts rows where `where` (a filter predicate or boolean group)
+  is true; `where` is required and `column` is not allowed. Predicate semantics
+  match `filter`.
+- With `aggs` but no `groupBy`, the result is a single row even when the
+  filtered table is empty (SQL-style; e.g. `count` yields 0).
 
 #### `mutate` (derived columns)
 
@@ -201,14 +268,29 @@ Pipeline order (v0.1.2):
 expr    := term (('+' | '-') term)*
 term    := unary (('*' | '/') unary)*
 unary   := '-' unary | primary
-primary := number | identifier | '(' expr ')'
+primary := number | string | identifier | call | '(' expr ')'
+call    := ('to_int' | 'to_str') '(' expr ')' | 'to_date' '(' expr ',' string ')'
 number  := integer or decimal literal (optional leading '-')
+string  := double-quoted text with \" and \\ escapes
 identifier := [A-Za-z_][A-Za-z0-9_]*
 ```
 
-- No function calls, no string literals, no indexing, no assignment, no commas.
+- No other function calls, no indexing, no assignment, no commas outside
+  `to_date`. `to_date`'s format string supports the directives `%Y %m %d %H %M %S`
+  plus literal separators; unknown directives → `analysis/invalid-args`.
 - Identifiers resolve to **original** column names (not other `mutate` outputs from the same list — mutate columns are computed in order and earlier derived names **are** visible to later exprs).
-- Null / non-numeric operand → result Null for that cell. Division by zero → Null.
+- **Type checking (v0.1.7)**: arithmetic (`+ - * /`) and unary minus require
+  numeric operands (`i64`/`f64`); a `utf8` / `bool` / date operand is a plan-time
+  error → `analysis/invalid-args` (exit 2), e.g. `mutate x: cannot add number to
+  string`. Verbs: `add {rhs} to {lhs}`, `subtract {rhs} from {lhs}`,
+  `multiply {lhs} by {rhs}`, `divide {lhs} by {rhs}`, `negate {type}` (types:
+  `number` / `string` / `boolean` / `date`). `to_date` products are `date`
+  (accepted by time-period `groupBy`, rejected by arithmetic); `to_int` →
+  `number`, `to_str` → `string`.
+- Null operand value → result Null (propagation, not an error). Division by
+  zero → Null and counts into the `mutate-null` warning. Runtime conversion
+  failures (`to_int("abc")`, unparseable `to_date`) → Null and count into the
+  `cast-null` warning — never a silent all-null column from a type error.
 - Invalid expression (parse error, unknown identifier at eval time, illegal char) → `analysis/invalid-args`. No partial apply: the CLI validates and evaluates against the filtered working table; any error aborts the whole `agg` before `--out` is written.
 
 #### Time-period `groupBy`
@@ -228,6 +310,9 @@ Accepted timestamp text (after trim):
 | datetime | `2024-01-31T15:04:05` |
 | datetime + Z | `2024-01-31T15:04:05Z` |
 | datetime + offset | `2024-01-31T23:04:05+08:00` |
+| slash date (v0.1.7) | `2024/01/31` |
+| slash datetime (v0.1.7) | `2024/01/31 15:04:05` |
+| compact date (v0.1.7) | `20240131` |
 
 Timezone rule: values without an explicit offset are treated as **UTC**. With
 offset, the instant is converted to UTC before bucketing.
@@ -241,15 +326,18 @@ Buckets:
 | `month` | `YYYY-MM` |
 
 - Unparseable **non-null** values go to the JSON `null` bucket and increment
-  `parseFailCount` in the response (field present only when > 0).
+  `parseFailCount` in the response (field present only when > 0); the response
+  also carries `parseFailSample` — up to 10 failing raw values (first-seen
+  order, deduped) — and a `date-parse-fail` warning.
 - Cell `null` / empty string go to the `null` bucket and do **not** count as parse failures.
 - Silent drop of all rows is forbidden: every filtered row lands in exactly one bucket.
 
 ```json
-{"ok":true,"datasetId":"ds_…","outDatasetId":null,"rowCount":N,"columns":["…"],"rows":[[…]],"truncated":false,"parseFailCount":0}
+{"ok":true,"datasetId":"ds_…","outDatasetId":null,"rowCount":N,"columns":["…"],"rows":[[…]],"truncated":false,"parseFailCount":0,"parseFailSample":["…"]}
 ```
 
-`parseFailCount` is omitted or `0` when there is no time-period grouping or no failures.
+`parseFailCount` is omitted or `0` when there is no time-period grouping or no
+failures; `parseFailSample` follows the same rule (at most 10 entries).
 
 `outDatasetId` is `string | null` — `null` when `--out` is not given (inline
 result only), else the new dataset id. When `--out` is set, a new dataset is
@@ -260,7 +348,7 @@ persisted and `outDatasetId` is set; inline `rows` may be empty with
 
 Equi-join on one or more key columns. Result is **always** a new dataset.
 
-Flags: `--left <id>` (required), `--right <id>` (required), `--on a,b` (required, non-empty list of shared column names), `--how inner|left|anti|semi` (default `inner`), `--out <label>` (optional)
+Flags: `--left <id>` (required), `--right <id>` (required), `--on pair[,pair…]` (required, 1–8 pairs; `pair := name | leftName:rightName`), `--how inner|left|anti|semi` (default `inner`), `--out <label>` (optional)
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"leftDatasetId":"ds_…","rightDatasetId":"ds_…","how":"inner"}
@@ -277,7 +365,10 @@ Flags: `--left <id>` (required), `--right <id>` (required), `--on a,b` (required
 - Multi-match is a cross product per matching key group for `inner`/`left` only.
 - Result row count must be ≤ `DSH_ANALYZE_MAX_ROWS` else `analysis/limit` (exit 3). Nothing is written on limit failure.
 - New meta: `producedBy: "join"`, `parentDatasetId` = left dataset id, `label` = `--out` when provided, `sourceKind: "join"`.
-- Missing `--on` column on either side → `analysis/invalid-args`.
+- Missing `--on` column → `analysis/invalid-args: unknown column {name} on
+  left|right` (a `leftName:rightName` pair checks the left name on the left
+  table and the right name on the right table; a bare `name` must exist on
+  both). Duplicate key names → `analysis/invalid-args: duplicate join key {name}`.
 - Bad `--how` → `analysis/invalid-args: --how must be inner|left|anti|semi`.
 
 ### `corr` (v0.1.4)
@@ -287,11 +378,12 @@ Pairwise correlation among numeric-capable columns. Summary only — never a ful
 Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--method pearson|spearman` (default `pearson`), `--pairwise complete|omit` (default `complete`), `--min-numeric <n>` (integer ≥ 2, default 2)
 
 ```json
-{"ok":true,"datasetId":"ds_…","rowCount":N,"method":"pearson","pairwise":"complete","minNumeric":2,"columns":["a","b","c"],"pairCount":3,"pairs":[{"columns":["a","b"],"n":123,"r":0.87,"degenerate":false}],"truncated":false}
+{"ok":true,"datasetId":"ds_…","rowCount":N,"method":"pearson","pairwise":"complete","minNumeric":2,"columns":["a","b","c"],"pairCount":3,"pairs":[{"columns":["a","b"],"n":123,"df":121,"r":0.87,"degenerate":false}],"truncated":false}
 ```
 
 - Response uses a **pairs array** (upper triangle), sorted by `|r|` desc (nulls last), then `n` desc, then input column order. Cap **50** pairs; more → `truncated: true`.
-- Each pair has `n` (rows contributing under `--pairwise`). `n < --min-numeric` → `r: null`, `degenerate: false`.
+- Each pair has `n` (rows contributing under `--pairwise`) and `df` (= `n-2`,
+  saturating at 0). `n < --min-numeric` → `r: null`, `degenerate: false`.
 - Non-numeric-capable column (zero `as_f64` successes) → exit 2 `analysis/invalid-args: column {name} is not numeric-capable`.
 - Degenerate (either variance 0 after enough samples) → `r: null`, `degenerate: true`.
 - `--pairwise complete`: pairwise deletion (each pair uses its own complete rows).
@@ -404,22 +496,83 @@ Flags: `--dataset-id` (required), `--order-by <col>` (required), `--ops <json-or
 - No rows dropped. `producedBy: "series"`, `sourceKind: "series"`, `source_path: series:<src>`.
 - Invalid ops / unknown column / empty ops / >8 ops → exit 2. No sample rows in the success body.
 
-### `list`
+### `union` (v0.1.7)
+
+Vertical concatenation of two datasets with column alignment. Writes a new
+dataset.
+
+Flags: `--left <id>` (required), `--right <id>` (required), `--columns-policy strict|intersect` (default `strict`), `--out <label>` (optional)
 
 ```json
-{"ok":true,"datasets":[{"datasetId":"ds_…","rowCount":N,"columnCount":N,"label":null,"producedBy":"ingest","parentDatasetId":null,"sourceKind":"csv"}]}
+{"ok":true,"datasetId":"ds_…","rowCount":N,"leftRows":N,"rightRows":N,"columns":[{"name":"…","dtype":"…"}]}
+```
+
+- `strict`: both sides must present the same column-name **set** (output order
+  = left's); otherwise `analysis/invalid-args: union column mismatch: …`.
+- `intersect`: keep only shared columns (left's order).
+- Same-name dtype conflicts promote via the mixed-dtype rules (`utf8` wins).
+- Result rows ≤ `DSH_ANALYZE_MAX_ROWS` else `analysis/limit`. Meta:
+  `producedBy: "union"`, `parentDatasetId` = left id.
+
+### `diff` (v0.1.7)
+
+Row-level difference report between two datasets. Writes a report dataset.
+
+Flags: `--left <id>` (required), `--right <id>` (required), `--on pair[,pair…]` (optional; same `leftKey:rightKey` grammar as `join`), `--sample-limit <n>` (1–20, default 5; non-integer or < 1 → exit 2; > 20 clamps to 20 with a `clamp` warning)
+
+```json
+{"ok":true,"datasetId":"ds_…","onlyLeft":N,"onlyRight":N,"changed":N,"samples":{"onlyLeft":[…],"onlyRight":[…],"changed":[{"key":{"…":…},"diffColumns":["…"],"left":{"…":…},"right":{"…":…}}]}}
+```
+
+- Without `--on`: multiset comparison over shared columns (`changed` is 0).
+- With `--on`: keyed match (Null keys never match); `changed` counts keys
+  present on both sides with at least one differing non-key shared column.
+- Each `samples` list holds at most `--sample-limit` entries.
+- Meta: `producedBy: "diff"`, `parentDatasetId` = left id; `datasetId` is the
+  report dataset of differing rows (additive field).
+
+### `pivot` (v0.1.7)
+
+Wide-format pivot of one dimension into columns. Writes a new dataset.
+
+Flags: `--dataset-id` (required), `--index <col,…>` (required, 1+ columns), `--columns <col>` (required), `--values <col>` (required), `--agg sum|mean|min|max|count` (required), `--out <label>` (optional)
+
+```json
+{"ok":true,"datasetId":"ds_…","rowCount":N,"columns":[{"name":"…","dtype":"…"}],"indexColumns":["…"],"pivotColumn":"…"}
+```
+
+- Rows = distinct `--index` combinations (input order); output columns = index
+  columns followed by the distinct values of `--columns` (first-seen order,
+  ≤ 50; more → `analysis/limit: pivot columns exceed 50`); cells = the `--agg`
+  aggregate of `--values` (missing → `null`).
+- Meta: `producedBy: "pivot"`, `parentDatasetId` = source id.
+
+### `list`
+
+Flags: `--label-like <substr>` (optional), `--produced-by <name>` (optional), `--since <YYYY-MM-DD[THH:MM:SS]>` (optional, UTC)
+
+```json
+{"ok":true,"datasets":[{"datasetId":"ds_…","rowCount":N,"columnCount":N,"label":null,"producedBy":"ingest","parentDatasetId":null,"sourceKind":"csv","createdAt":"2026-11-04T03:23:02Z"}]}
 ```
 
 - `datasets[].label` is `string | null` — `null` when the dataset carries no
   label (created without `--label` / `--out`).
 - `datasets[].parentDatasetId` is `string | null` — `null` for datasets with
   no parent (plain ingests); `sourceKind` is always a string.
+- `datasets[].createdAt` is `string | null` — ISO-8601 UTC creation timestamp
+  recorded since v0.1.7; `null` for older data.
+- Filters combine with AND: `--label-like` is a case-insensitive substring of
+  the label, `--produced-by` an exact `producedBy` match, `--since` keeps
+  `createdAt >= since` (datasets without `createdAt` are excluded when
+  `--since` is given).
 
 ### `export`
 
 Flags: `--dataset-id` (required), `--output <path>` (required)
 
 - Output is forced under `<workspace>/.dsh-analyze/outputs/` (file name kept).
+- Missing parent directories are created before writing (v0.1.7); escapes stay
+  `analysis/invalid-path`.
 - CSV only.
 
 ```json
@@ -442,25 +595,37 @@ The DSH plugin registers the same operations as tools:
 `dataset_export` · `dataset_rm` · `stats_describe` · `transform_agg` ·
 `dataset_values` · `dataset_sample` · `dataset_join` ·
 `dataset_profile` · `dataset_dedup` · `dataset_outliers` ·
-`dataset_corr` · `dataset_crosstab` · `dataset_series`
+`dataset_corr` · `dataset_crosstab` · `dataset_series` ·
+`dataset_union` · `dataset_diff` · `dataset_pivot`
 
 | Tool | CLI | Notes |
 |---|---|---|
-| `dataset_values` | `values` | requires `column`; `limit` 1–100 default 20 |
-| `dataset_sample` | `sample` | `n` 1–20 default 10; optional `seed`, `stratifyBy` |
-| `dataset_join` | `join` | writes new dataset; returns ids + counts only; `how` inner\|left\|anti\|semi |
+| `dataset_values` | `values` | requires `column`; `limit` 1–100 default 20; echoes `requestedLimit` |
+| `dataset_sample` | `sample` | `n` 1–200 default 10; optional `seed`, `stratifyBy`; echoes `requestedN` |
+| `dataset_join` | `join` | writes new dataset; returns ids + counts only; `how` inner\|left\|anti\|semi; `on` entries may be `leftKey:rightKey` |
 | `dataset_profile` | `profile` | optional `highCardinalityThreshold` (default 200) |
 | `dataset_dedup` | `dedup` | optional `keyColumns` (1–16); `sampleLimit` integer 1–20 default 5 |
 | `dataset_outliers` | `outliers` | `method` iqr\|zscore\|mad; optional `k`, `outLabel`; `sampleLimit` integer 1–20 default 10 |
 | `dataset_corr` | `corr` | 2..16 numeric-capable columns; `method` pearson\|spearman; `pairwise` complete\|omit; `minNumeric` integer ≥2 default 2 |
 | `dataset_crosstab` | `crosstab` | `rows`/`cols` required and distinct; `top` 1–50 default 20; `minCount` ≥1 default 1; `dropNull` boolean default true |
 | `dataset_series` | `series` | `orderBy` required; `ops` array 1–8 of lag\|lead\|diff\|pct_change\|rolling; always writes new dataset |
+| `dataset_list` | `list` | optional `labelLike`, `producedBy`, `since` filters |
+| `dataset_union` | `union` | `leftDatasetId`/`rightDatasetId` required; `columnsPolicy` strict\|intersect; writes new dataset |
+| `dataset_diff` | `diff` | `leftDatasetId`/`rightDatasetId` required; optional `on`, `sampleLimit`; writes report dataset |
+| `dataset_pivot` | `pivot` | `index` array, `columns`, `values`, `agg` required; writes new dataset |
 
-`transform_agg` `spec` string gains optional `mutate` and time-period
-`groupBy` objects (see §4 `agg`). `filter` must be an array of predicate
-objects (a bare object / string filter is rejected). Tool-layer
-`validateAggSpec` must reject illegal mutate expressions, non-array `filter`,
-and unknown top-level spec keys with `analysis/invalid-args` before spawn.
+`transform_agg` `spec` string gains optional `mutate`, time-period
+`groupBy` objects, `having`, `topKPerGroup`, select rename, and the v0.1.7
+agg fns (see §4 `agg`). `filter` is a predicate array or an `all`/`any`/`not`
+group object (a bare predicate object / string filter is rejected). Tool-layer
+`validateAggSpec` must reject illegal mutate expressions, bad `filter`
+shapes, and unknown top-level spec keys with `analysis/invalid-args` before
+spawn. All tool renders surface `warnings[]` and the `requestedN` /
+`requestedLimit` echo fields.
+
+The npm package root re-exports `createAnalysisToolDefinitions`,
+`attachAnalysisTools`, and `validateAggSpec` for hosts that embed the tool
+layer directly.
 
 Tool-layer extra guards:
 
@@ -485,12 +650,17 @@ profile root is known. The deny list is a defensive path guard only; see
 - Online database connectors
 - Arbitrary code execution
 - Write-side SQL or mutating external systems
-- Parquet (planned behind a feature flag; still exit 4 in this version)
-- Window functions, UDF / JS / Python expressions, diff of two datasets
+- Parquet / xlsx ingest (planned; still exit 4 in this version)
+- UDF / JS / Python expressions
 - Full correlation-matrix export, p-values / confidence intervals
-- Crosstab with three or more dimensions
-- Centered series windows, ewm / cumsum / expanding, multi-key series order
+- Crosstab with three or more dimensions (`dataset_pivot` covers the common
+  third-dimension case as a separate command)
+- Rank / row_number / cumsum / ewm / expanding windows, centered series
+  windows, multi-key series order (`agg` `topKPerGroup` is the narrow v0.1.7
+  slice)
 
 (Duplicate detection, outlier detection shipped in v0.1.3; correlation, crosstab,
 and anti/semi join shipped in v0.1.4; series lag/lead/diff/pct_change/rolling
-shipped in v0.1.5.)
+shipped in v0.1.5; filter groups, extended agg fns, having, topKPerGroup,
+select rename, mutate casts, union/diff/pivot, join/diff key pairs, json
+ingest, list filters, warnings, requested caps shipped in v0.1.7.)

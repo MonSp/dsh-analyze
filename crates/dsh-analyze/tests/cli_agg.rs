@@ -261,7 +261,7 @@ fn agg_escaped_quotes_keep_all_filters() {
     assert!(line.contains("\"rowCount\":1"), "stdout={line}");
 }
 
-// ---- v0.2.0 requirement regressions ---------------------------------------
+// ---- v0.1.7 requirement regressions ---------------------------------------
 
 const RICH: &str = "region,amount,day\n\
 east,100,2026-10-01\n\

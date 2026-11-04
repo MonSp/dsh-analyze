@@ -385,7 +385,7 @@ test('probeAnalyzeCliSync accepts mock CLI version', () => {
       assert.ok(probe.capabilities.includes('union'))
       assert.ok(probe.capabilities.includes('diff'))
       assert.ok(probe.capabilities.includes('pivot'))
-      assert.match(probe.version, /0\.2\./)
+      assert.match(probe.version, /^\d+\.\d+\.\d+/)
     }
   } finally {
     rmSync(ws, { recursive: true, force: true })
@@ -1171,7 +1171,7 @@ test('transform_agg in filter matches every member via mock CLI', async () => {
 })
 
 
-// ---------- v0.2.0 acceptance: nested filters / new agg fns / having / topKPerGroup ----------
+// ---------- v0.1.7 acceptance: nested filters / new agg fns / having / topKPerGroup ----------
 
 test('R-5/R-6/R-7/R-15: nested filters, count_distinct/percentile/first/last/count_if, having, topKPerGroup via mock CLI', async () => {
   const ws = makeWorkspace()
@@ -1256,7 +1256,7 @@ test('R-5/R-6/R-7/R-15: nested filters, count_distinct/percentile/first/last/cou
   }
 })
 
-// ---------- v0.2.0 acceptance: select rename + cast mutate + warnings ----------
+// ---------- v0.1.7 acceptance: select rename + cast mutate + warnings ----------
 
 test('R-9: select rename + to_date/to_int mutate via mock CLI', async () => {
   const ws = makeWorkspace()
@@ -1377,7 +1377,7 @@ test('R-12/R-13/R-20: requestedN/requestedLimit pass-through and clamp/mutate-nu
   }
 })
 
-// ---------- v0.2.0 acceptance: dataset_union / dataset_diff / dataset_pivot ----------
+// ---------- v0.1.7 acceptance: dataset_union / dataset_diff / dataset_pivot ----------
 
 test('R-8a: dataset_union strict and intersect via mock CLI', async () => {
   const ws = makeWorkspace()
@@ -1542,7 +1542,7 @@ test('R-16b: dataset_pivot wide table + >50 pivot columns analysis/limit', async
   }
 })
 
-// ---------- v0.2.0 acceptance: join pairs / json ingest / list filters ----------
+// ---------- v0.1.7 acceptance: join pairs / json ingest / list filters ----------
 
 test('R-10: dataset_join leftKey:rightKey on-entries via mock CLI', async () => {
   const ws = makeWorkspace()

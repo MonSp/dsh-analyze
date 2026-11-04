@@ -432,7 +432,7 @@ fn version_capabilities_include_new_commands() {
         assert!(o.status.success());
         String::from_utf8(o.stdout).unwrap()
     };
-    assert!(out.contains("\"version\":\"0.2.0\""), "{out}");
+    assert!(out.contains("\"version\":\"0.1.7\""), "{out}");
     for tok in ["\"union\"", "\"diff\"", "\"pivot\""] {
         assert!(out.contains(tok), "missing {tok}: {out}");
     }
