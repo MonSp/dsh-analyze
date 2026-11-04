@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.7
+
+Full v0.1.6-联调 requirement list (R-1..R-20): correctness hardening, analysis
+capability gaps, and tool-layer experience fixes.
+
+### Added
+
+- `filter` accepts nested boolean groups `{"all":[…]}` / `{"any":[…]}` /
+  `{"not":…}` alongside the legacy AND array (nesting depth ≤ 8).
+- `agg` functions: `count_distinct`, `percentile` (nearest-rank, `p` in (0,1)),
+  `first` / `last` (first/last non-null in input order), `count_if` (`where`
+  predicate or group).
+- `agg` `having` (post-aggregation result filter) and `topKPerGroup`
+  (`{by:[…],k,orderBy?}` row stage before mutate/grouping).
+- `select` entries accept `{"column":"…","as":"…"}` rename; `mutate` whitelist
+  gains `to_int` / `to_str` / `to_date(col, fmt)` plus string literals.
+- CLI + tools: `union` / `dataset_union`, `diff` / `dataset_diff`, `pivot` /
+  `dataset_pivot`.
+- `join --on` (and `diff --on`) accept `leftKey:rightKey` pairs.
+- `ingest --format json` (top-level array or `{"records":[…]}`).
+- `list` / `dataset_list`: `--label-like` / `--produced-by` / `--since` filters;
+  meta records `createdAt` (UTC).
+- Response `warnings[]` (`mutate-null` / `cast-null` / `date-parse-fail` /
+  `clamp`) with `requestedN` / `requestedLimit` echo fields; `parseFailSample`
+  on time-period grouping.
+- `corr` pairs report `df`; `dsh-analyze --help` usage text.
+- npm package re-exports `createAnalysisToolDefinitions` /
+  `attachAnalysisTools` / `validateAggSpec` from the package root.
+
+### Fixed
+
+- `mutate` type errors are rejected at plan time (`analysis/invalid-args`,
+  exit 2) instead of silently producing null columns.
+- `export` creates missing parent directories before writing.
+- `--ops` / `--spec` / path errors no longer leak OS error text.
+- Time-period grouping accepts `YYYY/MM/DD`, `YYYY/MM/DD HH:MM:SS`, `YYYYMMDD`
+  in addition to the ISO forms.
+
+### Changed
+
+- `head --n` cap 100 (was 20); `sample --n` cap 200 (was 20); `values --limit`
+  echoes `requestedLimit` and clamps visibly with a `clamp` warning.
+- Version and `version` capabilities: `0.1.7` plus `union`, `diff`, `pivot`.
+- Public contract updated in `docs/interface.md` (v0.1.7).
+- Package version `dsh-analyze@0.1.7`.
+
 ## 0.1.6
 
 Tool-layer contract hardening: DSH-host-compatible nullable output schemas

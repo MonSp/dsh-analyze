@@ -69,7 +69,12 @@ impl Value {
             Value::I64(v) => v.to_string(),
             Value::F64(v) => {
                 if v.is_finite() {
-                    format!("{v}")
+                    // -0.0 serializes as "-0"; normalize so JSON never carries -0.
+                    if *v == 0.0 {
+                        "0".to_string()
+                    } else {
+                        format!("{v}")
+                    }
                 } else {
                     "null".into()
                 }
@@ -99,27 +104,58 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
+/// Resolve `candidate` inside `workspace` without requiring the target or its
+/// intermediate directories to exist. Errors never carry raw OS text.
 pub fn ensure_within_workspace(workspace: &Path, candidate: &Path) -> Result<PathBuf, String> {
-    let ws = fs::canonicalize(workspace).map_err(|e| format!("workspace unavailable: {e}"))?;
+    let ws = fs::canonicalize(workspace)
+        .map_err(|_| "analysis/invalid-path: workspace unavailable".to_string())?;
     let abs = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         ws.join(candidate)
     };
-    // canonicalize parent if file does not exist yet
-    let norm = if abs.exists() {
-        fs::canonicalize(&abs).map_err(|e| format!("invalid-path: {e}"))?
-    } else {
-        let parent = abs
-            .parent()
-            .ok_or_else(|| "invalid-path: no parent".to_string())?;
-        let parent_c = fs::canonicalize(parent).map_err(|e| format!("invalid-path: {e}"))?;
-        parent_c.join(abs.file_name().ok_or("invalid-path: no file name")?)
-    };
+    let norm = normalize_missing(&abs)?;
     if !norm.starts_with(&ws) {
         return Err("analysis/invalid-path: path escapes workspace".into());
     }
     Ok(norm)
+}
+
+/// Canonicalize the deepest existing ancestor, then re-attach the missing tail
+/// with lexical `.`/`..` resolution so nested not-yet-created parents work.
+fn normalize_missing(abs: &Path) -> Result<PathBuf, String> {
+    if abs.exists() {
+        return fs::canonicalize(abs).map_err(|_| "analysis/invalid-path: path not found".into());
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.to_path_buf();
+    loop {
+        let parent = match cur.parent() {
+            Some(p) if p != cur => p.to_path_buf(),
+            _ => return Err("analysis/invalid-path: invalid path".into()),
+        };
+        tail.push(
+            cur.file_name()
+                .map(|s| s.to_os_string())
+                .ok_or("analysis/invalid-path: invalid path")?,
+        );
+        cur = parent;
+        if cur.exists() {
+            break;
+        }
+    }
+    let mut base =
+        fs::canonicalize(&cur).map_err(|_| "analysis/invalid-path: path not found".to_string())?;
+    for comp in tail.iter().rev() {
+        if comp == ".." {
+            if !base.pop() {
+                return Err("analysis/invalid-path: path escapes workspace".into());
+            }
+        } else if comp != "." {
+            base.push(comp);
+        }
+    }
+    Ok(base)
 }
 
 pub fn analysis_dir(workspace: &Path) -> PathBuf {
@@ -154,7 +190,104 @@ pub fn new_dataset_id() -> String {
     format!("ds_{a:08x}{b:08x}")
 }
 
-fn infer_dtype(values: &[Value]) -> String {
+/// Current UTC time as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` (std only).
+pub fn now_iso_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DD[THH:MM:SS][.fff][Z]`) into a
+/// comparable `(y, mo, d, h, mi, s)` tuple. Lenient on fractional seconds.
+pub fn parse_iso_utc_ts(s: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    let t = s.trim();
+    if t.len() < 10 {
+        return None;
+    }
+    let bytes = t.as_bytes();
+    let num = |a: usize, b: usize| -> Option<u32> { t.get(a..b)?.parse().ok() };
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let y: i64 = t.get(0..4)?.parse().ok()?;
+    let mo = num(5, 7)?;
+    let d = num(8, 10)?;
+    let rest = t.get(10..)?;
+    if rest.is_empty() {
+        return Some((y, mo, d, 0, 0, 0));
+    }
+    if !rest.starts_with('T') && !rest.starts_with('t') && !rest.starts_with(' ') {
+        return None;
+    }
+    let rest = &rest[1..];
+    if rest.len() < 8 {
+        return None;
+    }
+    if rest.as_bytes().get(2) != Some(&b':') || rest.as_bytes().get(5) != Some(&b':') {
+        return None;
+    }
+    let h = rest.get(0..2)?.parse().ok()?;
+    let mi = rest.get(3..5)?.parse().ok()?;
+    let se = rest.get(6..8)?.parse().ok()?;
+    if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    Some((y, mo, d, h, mi, se))
+}
+
+/// Parse `--since` (`YYYY-MM-DD[THH:MM:SS]`) to a comparable tuple.
+pub fn parse_since_arg(s: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    let t = s.trim();
+    let ok_date = t.len() >= 10
+        && t.as_bytes().get(4) == Some(&b'-')
+        && t.as_bytes().get(7) == Some(&b'-')
+        && t.as_bytes()[0..4].iter().all(|b| b.is_ascii_digit())
+        && t.as_bytes()[5..7].iter().all(|b| b.is_ascii_digit())
+        && t.as_bytes()[8..10].iter().all(|b| b.is_ascii_digit());
+    if !ok_date {
+        return None;
+    }
+    if t.len() == 10 {
+        return parse_iso_utc_ts(t);
+    }
+    let sep = t.as_bytes().get(10).copied()?;
+    if sep != b'T' && sep != b' ' {
+        return None;
+    }
+    let hms = &t[11..];
+    if hms.len() != 8 || !hms.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return None;
+    }
+    parse_iso_utc_ts(&format!("{}T{}", &t[0..10], hms))
+}
+
+pub fn infer_dtype(values: &[Value]) -> String {
     let mut seen_bool = false;
     let mut seen_i64 = false;
     let mut seen_f64 = false;
@@ -219,13 +352,23 @@ fn parse_cell(raw: &str) -> Value {
     Value::Str(raw.to_string())
 }
 
+/// Stable reason for a failed file read; never leaks OS error text.
+pub fn io_read_reason(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "file not found",
+        std::io::ErrorKind::PermissionDenied => "file not readable",
+        _ => "read failed",
+    }
+}
+
 pub fn parse_csv_path(path: &Path) -> Result<Table, String> {
-    let file = fs::File::open(path).map_err(|e| format!("analysis/cli-failed: open: {e}"))?;
+    let file = fs::File::open(path)
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
     let n = reader
         .read_line(&mut header_line)
-        .map_err(|e| format!("analysis/cli-failed: {e}"))?;
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
     if n == 0 {
         return Err("analysis/cli-failed: empty csv".into());
     }
@@ -241,7 +384,7 @@ pub fn parse_csv_path(path: &Path) -> Result<Table, String> {
         line.clear();
         let read = reader
             .read_line(&mut line)
-            .map_err(|e| format!("analysis/cli-failed: {e}"))?;
+            .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
         if read == 0 {
             break;
         }
@@ -261,11 +404,13 @@ pub fn parse_csv_path(path: &Path) -> Result<Table, String> {
 }
 
 pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {
-    let file = fs::File::open(path).map_err(|e| format!("analysis/cli-failed: open: {e}"))?;
+    let file = fs::File::open(path)
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
     let reader = BufReader::new(file);
     let mut rows_map: Vec<BTreeMap<String, Value>> = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("analysis/cli-failed: {e}"))?;
+        let line = line
+            .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
         let t = line.trim();
         if t.is_empty() {
             continue;
@@ -291,6 +436,259 @@ pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {
         );
     }
     finish_table(headers, rows)
+}
+
+/// Parse a `--format json` file: top-level array `[{…},…]` or `{"records":[…]}`.
+/// Columns are the key union in first-seen order; dtype rules match jsonl.
+pub fn parse_json_path(path: &Path) -> Result<Table, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
+    parse_json_text(&text)
+}
+
+pub fn parse_json_text(text: &str) -> Result<Table, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let s = text.trim();
+    let elements = json_top_level_records(s)?;
+    let mut headers: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (i, el) in elements.iter().enumerate() {
+        if !el.starts_with('{') || !el.ends_with('}') {
+            return Err(format!(
+                "analysis/invalid-args: bad json record at index {i}"
+            ));
+        }
+        let rec = parse_json_object(el)
+            .map_err(|_| "analysis/invalid-args: bad json file".to_string())?;
+        // BTreeMap sorts keys; re-read key order from the record text.
+        let order = record_key_order(el)?;
+        let mut row: Vec<Value> = Vec::with_capacity(headers.len());
+        for _ in 0..headers.len() {
+            row.push(Value::Null);
+        }
+        for key in order {
+            let v = rec.get(&key).cloned().unwrap_or(Value::Null);
+            match headers.iter().position(|h| *h == key) {
+                Some(ci) => row[ci] = v,
+                None => {
+                    headers.push(key);
+                    row.push(v);
+                }
+            }
+        }
+        rows.push(row);
+    }
+    finish_table(headers, rows)
+}
+
+/// Split top-level `[{…},…]` / `{"records":[…]}` into element strings.
+fn json_top_level_records(s: &str) -> Result<Vec<String>, String> {
+    if s.starts_with('[') {
+        return split_json_elements(s);
+    }
+    if s.starts_with('{') {
+        return json_object_records(s);
+    }
+    Err("analysis/invalid-args: json must be a top-level array or {records:[…]}".into())
+}
+
+fn split_json_elements(arr: &str) -> Result<Vec<String>, String> {
+    let inner = arr
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or("analysis/invalid-args: bad json file")?;
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut esc = false;
+    for ch in inner.chars() {
+        if in_str {
+            cur.push(ch);
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_str = true;
+                cur.push(ch);
+            }
+            '{' | '[' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '}' | ']' => {
+                if depth == 0 {
+                    return Err("analysis/invalid-args: bad json file".into());
+                }
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                if !cur.trim().is_empty() {
+                    out.push(std::mem::take(&mut cur).trim().to_string());
+                }
+                cur.clear();
+            }
+            c => cur.push(c),
+        }
+    }
+    if depth != 0 {
+        return Err("analysis/invalid-args: bad json file".into());
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    Ok(out)
+}
+
+/// Extract the `records` array elements from a top-level JSON object.
+fn json_object_records(obj: &str) -> Result<Vec<String>, String> {
+    let no_records =
+        || "analysis/invalid-args: json must be a top-level array or {records:[…]}".to_string();
+    let chars: Vec<char> = obj.chars().collect();
+    let mut i = 1usize;
+    loop {
+        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] == '}' {
+            return Err(no_records());
+        }
+        if chars[i] != '"' {
+            return Err("analysis/invalid-args: bad json file".into());
+        }
+        let (key, ni) = read_json_string(&chars, i)?;
+        i = ni;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != ':' {
+            return Err("analysis/invalid-args: bad json file".into());
+        }
+        i += 1;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let val_start = i;
+        let val_end = skip_json_value(&chars, i)?;
+        if key == "records" {
+            let val: String = chars[val_start..val_end].iter().collect();
+            let t = val.trim();
+            if !t.starts_with('[') {
+                return Err(no_records());
+            }
+            return split_json_elements(t);
+        }
+        i = val_end;
+    }
+}
+
+/// Advance past one JSON value starting at `i`; returns the end index.
+fn skip_json_value(chars: &[char], start: usize) -> Result<usize, String> {
+    let mut i = start;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return Err("analysis/invalid-args: bad json file".into());
+    }
+    match chars[i] {
+        '"' => read_json_string(chars, i).map(|(_, n)| n),
+        '{' | '[' => {
+            let open = chars[i];
+            let close = if open == '{' { '}' } else { ']' };
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut esc = false;
+            while i < chars.len() {
+                let c = chars[i];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = true;
+                } else if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    i += 1;
+                    if depth == 0 {
+                        return Ok(i);
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            Err("analysis/invalid-args: bad json file".into())
+        }
+        't' => expect_lit(chars, i, "true").map(|_| i + 4),
+        'f' => expect_lit(chars, i, "false").map(|_| i + 5),
+        'n' => expect_lit(chars, i, "null").map(|_| i + 4),
+        _ => {
+            let mut j = i;
+            while j < chars.len()
+                && (chars[j].is_ascii_digit() || matches!(chars[j], '-' | '+' | '.' | 'e' | 'E'))
+            {
+                j += 1;
+            }
+            if j == i {
+                return Err("analysis/invalid-args: bad json file".into());
+            }
+            Ok(j)
+        }
+    }
+}
+
+/// First-seen key order of a flat JSON object text.
+fn record_key_order(el: &str) -> Result<Vec<String>, String> {
+    let inner = el
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or("analysis/invalid-args: bad json file")?;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] != '"' {
+            return Err("analysis/invalid-args: bad json file".into());
+        }
+        let (key, ni) = read_json_string(&chars, i)?;
+        i = ni;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != ':' {
+            return Err("analysis/invalid-args: bad json file".into());
+        }
+        i += 1;
+        i = skip_json_value(&chars, i)?;
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    Ok(out)
 }
 
 fn finish_table(headers: Vec<String>, rows: Vec<Vec<Value>>) -> Result<Table, String> {
@@ -481,7 +879,7 @@ impl Meta {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"version\":1,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"sourceKind\":{},\"sourcePath\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{}}}",
+            "{{\"version\":1,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"sourceKind\":{},\"sourcePath\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"createdAt\":{}}}",
             json_string(&self.dataset_id),
             self.row_count,
             self.columns.len(),
@@ -497,6 +895,7 @@ impl Meta {
                 .as_deref()
                 .map(json_string)
                 .unwrap_or_else(|| "null".into()),
+            json_string(&now_iso_utc()),
         )
     }
 
@@ -512,16 +911,16 @@ impl Meta {
 pub fn write_table_parquet_placeholder(workspace: &Path, id: &str, table: &Table) -> Result<(u64, PathBuf), String> {
     // T0 stores a simple CSV next to meta; format name "csv" until Parquet lands.
     let dir = datasets_dir(workspace);
-    fs::create_dir_all(&dir).map_err(|e| format!("analysis/cli-failed: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     let path = dir.join(format!("{id}.csv"));
-    let mut f = fs::File::create(&path).map_err(|e| format!("analysis/cli-failed: {e}"))?;
+    let mut f = fs::File::create(&path).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     let header = table
         .columns
         .iter()
         .map(|c| csv_escape(&c.name))
         .collect::<Vec<_>>()
         .join(",");
-    writeln!(f, "{header}").map_err(|e| format!("analysis/cli-failed: {e}"))?;
+    writeln!(f, "{header}").map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     for row in &table.rows {
         let line = row
             .iter()
@@ -532,7 +931,7 @@ pub fn write_table_parquet_placeholder(workspace: &Path, id: &str, table: &Table
             })
             .collect::<Vec<_>>()
             .join(",");
-        writeln!(f, "{line}").map_err(|e| format!("analysis/cli-failed: {e}"))?;
+        writeln!(f, "{line}").map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     }
     let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     Ok((bytes, path))
@@ -548,10 +947,10 @@ fn csv_escape(s: &str) -> String {
 
 pub fn save_meta(workspace: &Path, meta: &Meta) -> Result<(), String> {
     let dir = datasets_dir(workspace);
-    fs::create_dir_all(&dir).map_err(|e| format!("analysis/cli-failed: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     let path = dir.join(format!("{}.meta.json", meta.dataset_id));
     fs::write(path, format!("{}\n", meta.to_json()))
-        .map_err(|e| format!("analysis/cli-failed: {e}"))
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())
 }
 
 pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String> {
@@ -561,7 +960,8 @@ pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String>
     if !meta_path.exists() || !csv_path.exists() {
         return Err("analysis/unknown-dataset".into());
     }
-    let meta_raw = fs::read_to_string(&meta_path).map_err(|e| format!("analysis/cli-failed: {e}"))?;
+    let meta_raw = fs::read_to_string(&meta_path)
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
     let row_count = extract_u64(&meta_raw, "rowCount").unwrap_or(0) as usize;
     let source_kind = extract_string(&meta_raw, "sourceKind").unwrap_or_else(|| "csv".into());
     let source_path = extract_string(&meta_raw, "sourcePath").unwrap_or_default();
@@ -589,15 +989,51 @@ pub fn validate_dataset_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One `list` summary row. `created_at` is nullable (absent on old datasets).
+pub struct DatasetSummary {
+    pub dataset_id: String,
+    pub row_count: u64,
+    pub column_count: u64,
+    pub label: Option<String>,
+    pub produced_by: String,
+    pub parent_dataset_id: Option<String>,
+    pub source_kind: String,
+    pub created_at: Option<String>,
+}
+
+impl DatasetSummary {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"sourceKind\":{},\"createdAt\":{}}}",
+            json_string(&self.dataset_id),
+            self.row_count,
+            self.column_count,
+            self.label
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            json_string(&self.produced_by),
+            self.parent_dataset_id
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            json_string(&self.source_kind),
+            self.created_at
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+        )
+    }
+}
+
 /// Summarize every `*.meta.json` under the datasets dir (sorted by datasetId).
-/// Returns one JSON object string per dataset.
-pub fn list_dataset_summaries(workspace: &Path) -> Result<Vec<String>, String> {
+pub fn list_dataset_summaries(workspace: &Path) -> Result<Vec<DatasetSummary>, String> {
     let dir = datasets_dir(workspace);
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut names: Vec<String> = fs::read_dir(&dir)
-        .map_err(|e| format!("analysis/cli-failed: {e}"))?
+        .map_err(|_| "analysis/cli-failed: cannot read file: read failed".to_string())?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
@@ -612,25 +1048,18 @@ pub fn list_dataset_summaries(workspace: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         let raw = fs::read_to_string(dir.join(&name))
-            .map_err(|e| format!("analysis/cli-failed: {e}"))?;
+            .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
         let fallback_id = name.trim_end_matches(".meta.json").to_string();
-        let dataset_id = extract_string(&raw, "datasetId").unwrap_or(fallback_id);
-        let row_count = extract_u64(&raw, "rowCount").unwrap_or(0);
-        let column_count = extract_u64(&raw, "columnCount").unwrap_or(0);
-        let label = extract_string(&raw, "label");
-        let produced_by = extract_string(&raw, "producedBy").unwrap_or_else(|| "ingest".into());
-        let parent = extract_string(&raw, "parentDatasetId");
-        let source_kind = extract_string(&raw, "sourceKind").unwrap_or_else(|| "csv".into());
-        out.push(format!(
-            "{{\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"sourceKind\":{}}}",
-            json_string(&dataset_id),
-            row_count,
-            column_count,
-            label.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-            json_string(&produced_by),
-            parent.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-            json_string(&source_kind)
-        ));
+        out.push(DatasetSummary {
+            dataset_id: extract_string(&raw, "datasetId").unwrap_or(fallback_id),
+            row_count: extract_u64(&raw, "rowCount").unwrap_or(0),
+            column_count: extract_u64(&raw, "columnCount").unwrap_or(0),
+            label: extract_string(&raw, "label"),
+            produced_by: extract_string(&raw, "producedBy").unwrap_or_else(|| "ingest".into()),
+            parent_dataset_id: extract_string(&raw, "parentDatasetId"),
+            source_kind: extract_string(&raw, "sourceKind").unwrap_or_else(|| "csv".into()),
+            created_at: extract_string(&raw, "createdAt"),
+        });
     }
     Ok(out)
 }

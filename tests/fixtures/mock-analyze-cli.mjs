@@ -112,6 +112,7 @@ function writeDataset(ws, id, table, metaExtra) {
     label: metaExtra.label ?? null,
     producedBy: metaExtra.producedBy,
     parentDatasetId: metaExtra.parentDatasetId ?? null,
+    createdAt: metaExtra.createdAt ?? new Date().toISOString(),
   }
   writeFileSync(join(datasets, `${id}.meta.json`), JSON.stringify(meta) + '\n', 'utf8')
   return { meta, bytes: statSync(csvPath).size }
@@ -154,8 +155,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.6-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series'],
+      version: '0.1.7-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
     }))
     return
   }
@@ -168,15 +169,43 @@ async function main() {
     if (!input) fail(2, 'analysis/invalid-args: --input required')
     const path = within(ws, input)
     if (!existsSync(path)) fail(2, 'analysis/invalid-path: not a file')
-    const format = getFlag(rest, '--format') || (path.endsWith('.jsonl') ? 'jsonl' : 'csv')
-    if (format === 'parquet') fail(4, 'analysis/limit: parquet not enabled in T0 (use csv/jsonl)')
-    if (format === 'jsonl') fail(4, 'analysis/limit: mock CLI supports csv only in T0 tests')
+    const format = getFlag(rest, '--format') || (path.endsWith('.jsonl') ? 'jsonl' : path.endsWith('.json') ? 'json' : 'csv')
+    if (format === 'parquet') fail(4, 'analysis/limit: parquet not supported yet (planned, see docs/interface.md)')
+    if (format === 'xlsx') fail(4, 'analysis/limit: xlsx not supported (convert to csv/jsonl)')
+    if (format === 'jsonl') fail(4, 'analysis/limit: mock CLI supports csv/json only in T0 tests')
     const id = getFlag(rest, '--dataset-id') || newId()
     const text = readFileSync(path, 'utf8')
-    const table = parseCsv(text)
+    let table
+    if (format === 'json') {
+      let records
+      try { records = JSON.parse(text.replace(/^﻿/, '')) } catch { fail(2, 'analysis/invalid-args: bad json file') }
+      if (records && !Array.isArray(records) && typeof records === 'object' && Array.isArray(records.records)) {
+        records = records.records
+      }
+      if (!Array.isArray(records)) fail(2, 'analysis/invalid-args: json must be a top-level array or {records:[…]}')
+      const headers = []
+      const rows = []
+      for (let ri = 0; ri < records.length; ri++) {
+        const rec = records[ri]
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+          fail(2, `analysis/invalid-args: bad json record at index ${ri}`)
+        }
+        const row = []
+        for (const key of Object.keys(rec)) {
+          let ci = headers.indexOf(key)
+          if (ci < 0) { headers.push(key); ci = headers.length - 1 }
+          row[ci] = rec[key] === undefined ? null : rec[key]
+        }
+        for (let c = 0; c < headers.length; c++) if (row[c] === undefined) row[c] = null
+        rows.push(row)
+      }
+      table = { headers, rows }
+    } else {
+      table = parseCsv(text)
+    }
     const label = getFlag(rest, '--label')
     const { meta, bytes } = writeDataset(ws, id, table, {
-      sourceKind: 'csv',
+      sourceKind: format === 'json' ? 'json' : 'csv',
       sourcePath: input,
       label,
       producedBy: 'ingest',
@@ -194,15 +223,23 @@ async function main() {
 
   if (cmd === 'head') {
     const id = getFlag(rest, '--dataset-id')
-    const n = Math.min(20, Math.max(1, Number(getFlag(rest, '--n') || 5)))
+    const rawN = getFlag(rest, '--n')
+    const requestedN = rawN === undefined ? 5 : Number(rawN)
+    if (!Number.isInteger(requestedN) || requestedN < 1) fail(2, 'analysis/invalid-args: --n must be integer >= 1')
+    const limit = Math.min(requestedN, 100)
     const { meta, table } = loadDataset(ws, id)
-    const rows = table.rows.slice(0, n).map(r => r.map(c => (c === null ? null : c)))
+    const rows = table.rows.slice(0, limit).map(r => r.map(c => (c === null ? null : c)))
+    const warnings = []
+    if (requestedN > 100) warnings.push({ code: 'clamp', field: 'n', requested: requestedN, actual: 100 })
     console.log(json({
       ok: true,
       datasetId: id,
       rowCount: meta.rowCount,
       columns: table.headers,
       rows,
+      requestedN,
+      n: rows.length,
+      ...(warnings.length ? { warnings } : {}),
     }))
     return
   }
@@ -269,83 +306,264 @@ async function main() {
     let spec
     try { spec = JSON.parse(specRaw) } catch { fail(2, 'analysis/invalid-args: bad spec json') }
     const { table } = loadDataset(ws, id)
-    const idx = name => {
-      const i = table.headers.indexOf(name)
-      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
-      return i
+    const warnings = []
+
+    // ---- filter / having / count_if predicate trees (R-5) ----
+    const evalPredicate = (pred, row, headerList) => {
+      const ci = headerList.indexOf(pred.column)
+      if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${pred.column}`)
+      const cell = row[ci]
+      switch (pred.op) {
+        case 'is_null': return cell === null || cell === undefined
+        case 'not_null': return !(cell === null || cell === undefined)
+        case 'eq': return cell == pred.value
+        case 'ne': return cell != pred.value
+        case 'gt': return Number(cell) > Number(pred.value)
+        case 'gte': return Number(cell) >= Number(pred.value)
+        case 'lt': return Number(cell) < Number(pred.value)
+        case 'lte': return Number(cell) <= Number(pred.value)
+        case 'in': return (Array.isArray(pred.value) ? pred.value : [pred.value]).some(v => cell == v)
+        case 'contains': return String(cell ?? '').includes(String(pred.value))
+        default: fail(2, `analysis/invalid-args: bad op ${pred.op}`)
+      }
     }
-    let keep = table.rows.map((_, i) => i)
-    for (const f of spec.filter || []) {
-      const ci = idx(f.column)
-      keep = keep.filter(i => {
-        const cell = table.rows[i][ci]
-        switch (f.op) {
-          case 'is_null': return cell === null || cell === undefined
-          case 'not_null': return !(cell === null || cell === undefined)
-          case 'eq': return cell == f.value
-          case 'ne': return cell != f.value
-          case 'gt': return Number(cell) > Number(f.value)
-          case 'gte': return Number(cell) >= Number(f.value)
-          case 'lt': return Number(cell) < Number(f.value)
-          case 'lte': return Number(cell) <= Number(f.value)
-          case 'in': return (Array.isArray(f.value) ? f.value : [f.value]).some(v => cell == v)
-          case 'contains': return String(cell ?? '').includes(String(f.value))
-          default: fail(2, `analysis/invalid-args: bad op ${f.op}`)
+    const evalFilterNode = (node, row, headerList) => {
+      if (Array.isArray(node)) return node.every(item => evalFilterNode(item, row, headerList))
+      if (node && typeof node === 'object') {
+        const keys = Object.keys(node)
+        if ('op' in node) return evalPredicate(node, row, headerList)
+        if (keys.length === 1 && 'all' in node) {
+          if (!Array.isArray(node.all)) fail(2, 'analysis/invalid-args: filter all must be an array')
+          return node.all.every(item => evalFilterNode(item, row, headerList))
         }
-      })
+        if (keys.length === 1 && 'any' in node) {
+          if (!Array.isArray(node.any)) fail(2, 'analysis/invalid-args: filter any must be an array')
+          return node.any.some(item => evalFilterNode(item, row, headerList))
+        }
+        if (keys.length === 1 && 'not' in node) return !evalFilterNode(node.not, row, headerList)
+        fail(2, 'analysis/invalid-args: bad filter group')
+      }
+      fail(2, 'analysis/invalid-args: bad filter entry')
     }
 
-    // Working table after filter + mutate
+    let keep = table.rows.map((_, i) => i)
+    if (spec.filter !== undefined) {
+      keep = keep.filter(i => evalFilterNode(spec.filter, table.rows[i], table.headers))
+    }
+
+    // ---- topKPerGroup (R-15): row stage after filter, before mutate ----
+    if (spec.topKPerGroup) {
+      const t = spec.topKPerGroup
+      const by = Array.isArray(t.by) ? t.by : []
+      if (!by.length || by.length > 8) fail(2, 'analysis/invalid-args: topKPerGroup.by must be 1..8 column names')
+      const k = t.k
+      if (!Number.isInteger(k) || k < 1 || k > 1000) fail(2, 'analysis/invalid-args: topKPerGroup.k must be integer 1..1000')
+      const byIdx = by.map(name => {
+        const i = table.headers.indexOf(name)
+        if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+        return i
+      })
+      let orderByIdx = -1
+      let orderDesc = false
+      if (t.orderBy && t.orderBy.column) {
+        orderByIdx = table.headers.indexOf(t.orderBy.column)
+        if (orderByIdx < 0) fail(2, `analysis/invalid-args: unknown column ${t.orderBy.column}`)
+        orderDesc = !!t.orderBy.desc
+      }
+      const groupsMap = new Map()
+      for (const i of keep) {
+        const key = JSON.stringify(byIdx.map(ci => table.rows[i][ci] ?? null))
+        if (!groupsMap.has(key)) groupsMap.set(key, [])
+        groupsMap.get(key).push(i)
+      }
+      const keptSet = new Set()
+      for (const members of groupsMap.values()) {
+        let ordered = members
+        if (orderByIdx >= 0) {
+          ordered = [...members].sort((a, b) => {
+            const av = table.rows[a][orderByIdx], bv = table.rows[b][orderByIdx]
+            const cmp = (av > bv ? 1 : av < bv ? -1 : 0) * (orderDesc ? -1 : 1)
+            return cmp !== 0 ? cmp : a - b
+          })
+        }
+        for (const i of ordered.slice(0, k)) keptSet.add(i)
+      }
+      keep = keep.filter(i => keptSet.has(i))
+    }
+
+    // ---- mutate (R-9: to_int/to_str/to_date + string literals) ----
     let workHeaders = [...table.headers]
     let workRows = keep.map(i => [...table.rows[i]])
-    const evalExpr = (expr, row, colIndex) => {
-      // tiny whitelist evaluator for mock tests
-      if (!/^[A-Za-z0-9_\s+\-*/().]+$/.test(expr)) fail(2, 'analysis/invalid-args: illegal mutate expr')
-      if (/[A-Za-z_]\w*\s*\(/.test(expr)) fail(2, 'analysis/invalid-args: function calls not allowed')
-      const tokens = expr.match(/[A-Za-z_]\w*|\d+\.?\d*|[+\-*/()]/g) || []
+    const parseWithFmt = (s, fmt) => {
+      let re = '^'
+      const groups = []
+      for (let fi = 0; fi < fmt.length; fi++) {
+        if (fmt[fi] === '%') {
+          const d = fmt[fi + 1]
+          if (!'YmdHMS'.includes(d ?? '')) fail(2, 'analysis/invalid-args: to_date fmt has unsupported directive (only %Y %m %d %H %M %S)')
+          const pat = d === 'Y' ? '(\\d{4})' : '(\\d{2})'
+          re += pat
+          groups.push(d)
+          fi++
+        } else {
+          re += fmt[fi].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        }
+      }
+      re += '$'
+      const m = String(s).trim().match(new RegExp(re))
+      if (!m) return null
+      const parts = {}
+      groups.forEach((d, gi) => { parts[d] = +m[gi + 1] })
+      const y = parts.Y, mo = parts.m, d = parts.d
+      if (!y || !mo || !d) return null
+      let out = `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+      if (parts.H !== undefined || parts.M !== undefined || parts.S !== undefined) {
+        out += `T${String(parts.H ?? 0).padStart(2, '0')}:${String(parts.M ?? 0).padStart(2, '0')}:${String(parts.S ?? 0).padStart(2, '0')}`
+      }
+      return out
+    }
+    const makeEvalExpr = (stats) => (expr, row, colIndex) => {
+      if (typeof expr !== 'string' || !expr.trim() || expr.length > 512) {
+        fail(2, 'analysis/invalid-args: mutate expr must be non-empty string ≤512')
+      }
+      if (!/[A-Za-z_]/.test(expr) && !/\d/.test(expr)) {
+        fail(2, 'analysis/invalid-args: mutate expr is empty of operands')
+      }
+      const tokens = []
+      let ti = 0
+      while (ti < expr.length) {
+        const ch = expr[ti]
+        if (/\s/.test(ch)) { ti++; continue }
+        if (ch === '"') {
+          let j = ti + 1
+          while (j < expr.length && expr[j] !== '"') { if (expr[j] === '\\') j++; j++ }
+          if (j >= expr.length) fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
+          tokens.push({ t: 'str', v: expr.slice(ti + 1, j) })
+          ti = j + 1
+          continue
+        }
+        if (/[A-Za-z_]/.test(ch)) {
+          let j = ti
+          while (j < expr.length && /\w/.test(expr[j])) j++
+          tokens.push({ t: 'id', v: expr.slice(ti, j) })
+          ti = j
+          continue
+        }
+        if (/[0-9]/.test(ch)) {
+          let j = ti
+          while (j < expr.length && /[0-9.]/.test(expr[j])) j++
+          tokens.push({ t: 'num', v: Number(expr.slice(ti, j)) })
+          ti = j
+          continue
+        }
+        if ('+-*/(),'.includes(ch)) { tokens.push({ t: 'op', v: ch }); ti++; continue }
+        fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
+      }
       let pos = 0
       const peek = () => tokens[pos]
       const next = () => tokens[pos++]
-      const primary = () => {
-        const t = next()
-        if (t === undefined) fail(2, 'analysis/invalid-args: bad expr')
-        if (t === '(') {
-          const v = add()
-          if (next() !== ')') fail(2, 'analysis/invalid-args: expected )')
+      // null = propagate null; NaN = computed null (non-numeric operand)
+      const numOrUndef = (v) => {
+        if (v === null || v === undefined) return null
+        if (typeof v === 'boolean') return NaN
+        const n = typeof v === 'number' ? v : Number(String(v).trim())
+        return Number.isFinite(n) ? n : NaN
+      }
+      const parsePrimary = () => {
+        const tok = next()
+        if (!tok) fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
+        if (tok.t === 'num' || tok.t === 'str') return tok.v
+        if (tok.t === 'op' && tok.v === '(') {
+          const v = parseAdd()
+          const c = next()
+          if (!c || c.v !== ')') fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
           return v
         }
-        if (/^\d/.test(t)) return Number(t)
-        if (/^[A-Za-z_]/.test(t)) {
-          const ci = colIndex[t]
-          if (ci === undefined) fail(2, `analysis/invalid-args: unknown column in expr: ${t}`)
+        if (tok.t === 'id') {
+          const nxt = peek()
+          if (nxt && nxt.t === 'op' && nxt.v === '(') {
+            if (!['to_int', 'to_str', 'to_date'].includes(tok.v)) {
+              fail(2, 'analysis/invalid-args: function calls are not allowed in mutate expr')
+            }
+            next()
+            let argc = 0, arg1 = null, fmt = null
+            if (!(peek() && peek().t === 'op' && peek().v === ')')) {
+              arg1 = parseAdd()
+              argc = 1
+              const sep = peek()
+              if (sep && sep.t === 'op' && sep.v === ',') {
+                if (tok.v !== 'to_date') fail(2, `analysis/invalid-args: ${tok.v}(e) takes 1 argument`)
+                next()
+                const fmtTok = next()
+                if (!fmtTok || fmtTok.t !== 'str') fail(2, 'analysis/invalid-args: to_date fmt must be a string literal')
+                fmt = fmtTok.v
+                argc = 2
+              }
+            }
+            const close = next()
+            if (!close || close.v !== ')') fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
+            if (tok.v === 'to_date' && argc !== 2) fail(2, 'analysis/invalid-args: to_date(e, fmt) takes 2 arguments')
+            if (tok.v !== 'to_date' && argc !== 1) fail(2, `analysis/invalid-args: ${tok.v}(e) takes 1 argument`)
+            if (tok.v === 'to_int') {
+              if (arg1 === null || arg1 === undefined) return null
+              const n = Number(String(arg1).trim())
+              if (!Number.isFinite(n)) { stats.cast++; return null }
+              return Math.trunc(n)
+            }
+            if (tok.v === 'to_str') {
+              if (arg1 === null || arg1 === undefined) return null
+              return String(arg1)
+            }
+            if (arg1 === null || arg1 === undefined) return null
+            const parsed = parseWithFmt(String(arg1), fmt)
+            if (parsed === null) { stats.cast++; return null }
+            return parsed
+          }
+          const ci = colIndex[tok.v]
+          if (ci === undefined) fail(2, `analysis/invalid-args: unknown column in expr: ${tok.v}`)
           return row[ci]
         }
-        if (t === '-') return -primary()
-        fail(2, `analysis/invalid-args: bad token ${t}`)
+        if (tok.t === 'op' && tok.v === '-') return parseNeg()
+        fail(2, 'analysis/invalid-args: mutate expr has illegal characters')
       }
-      const mul = () => {
-        let v = primary()
-        while (peek() === '*' || peek() === '/') {
-          const op = next()
-          const r = primary()
-          const a = Number(v), b = Number(r)
-          if (!Number.isFinite(a) || !Number.isFinite(b)) return null
-          v = op === '*' ? a * b : (b === 0 ? null : a / b)
+      const parseNeg = () => {
+        const v = parseUnary()
+        const n = numOrUndef(v)
+        if (n === null) return null
+        if (!Number.isFinite(n)) { stats.nullOut++; return null }
+        return -n
+      }
+      const parseUnary = () => {
+        const t = peek()
+        if (t && t.t === 'op' && t.v === '-') { next(); return parseNeg() }
+        return parsePrimary()
+      }
+      const parseMul = () => {
+        let v = parseUnary()
+        while (peek() && peek().t === 'op' && (peek().v === '*' || peek().v === '/')) {
+          const op = next().v
+          const r = parseUnary()
+          const a = numOrUndef(v), b = numOrUndef(r)
+          if (a === null || b === null) { v = null; continue }
+          if (!Number.isFinite(a) || !Number.isFinite(b)) { stats.nullOut++; v = null; continue }
+          if (op === '/' && b === 0) { stats.nullOut++; v = null; continue }
+          v = op === '*' ? a * b : a / b
         }
         return v
       }
-      const add = () => {
-        let v = mul()
-        while (peek() === '+' || peek() === '-') {
-          const op = next()
-          const r = mul()
-          const a = Number(v), b = Number(r)
-          if (!Number.isFinite(a) || !Number.isFinite(b)) return null
+      const parseAdd = () => {
+        let v = parseMul()
+        while (peek() && peek().t === 'op' && (peek().v === '+' || peek().v === '-')) {
+          const op = next().v
+          const r = parseMul()
+          const a = numOrUndef(v), b = numOrUndef(r)
+          if (a === null || b === null) { v = null; continue }
+          if (!Number.isFinite(a) || !Number.isFinite(b)) { stats.nullOut++; v = null; continue }
           v = op === '+' ? a + b : a - b
         }
         return v
       }
-      return add()
+      return parseAdd()
     }
     if (Array.isArray(spec.mutate)) {
       for (const m of spec.mutate) {
@@ -354,10 +572,14 @@ async function main() {
         }
         if (workHeaders.includes(m.as)) fail(2, `analysis/invalid-args: mutate column collides: ${m.as}`)
         const colIndex = Object.fromEntries(workHeaders.map((h, i) => [h, i]))
+        const stats = { cast: 0, nullOut: 0 }
+        const evalExpr = makeEvalExpr(stats)
         for (const row of workRows) {
           row.push(evalExpr(m.expr, row, colIndex))
         }
         workHeaders.push(m.as)
+        if (stats.nullOut > 0) warnings.push({ code: 'mutate-null', column: m.as, count: stats.nullOut })
+        if (stats.cast > 0) warnings.push({ code: 'cast-null', column: m.as, count: stats.cast })
       }
     }
     const work = { headers: workHeaders, rows: workRows }
@@ -371,12 +593,11 @@ async function main() {
     const groupBy = spec.groupBy || []
     const aggs = spec.aggs || []
     let parseFailCount = 0
+    let parseFailSample = []
     let outHeaders, outRows
     if (!groupBy.length && !aggs.length) {
-      const select = spec.select || work.headers
-      const idxs = select.map(widx)
-      outHeaders = select
-      outRows = work.rows.slice(0, limit).map(r => idxs.map(ci => r[ci]))
+      outHeaders = [...work.headers]
+      outRows = work.rows.map(r => [...r])
     } else {
       const gKeys = groupBy.map(g => {
         if (typeof g === 'string') return { kind: 'col', name: g, ci: widx(g) }
@@ -389,6 +610,8 @@ async function main() {
       const parseTs = (s, period) => {
         const t = String(s).trim()
         const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?(?:Z|z|[+-]\d{2}:?\d{2})?$/)
+          || t.match(/^(\d{4})\/(\d{2})\/(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/)
+          || t.match(/^(\d{4})(\d{2})(\d{2})$/)
         if (!m) return null
         let y = +m[1], mo = +m[2], d = +m[3]
         if (m[4] !== undefined) {
@@ -423,7 +646,12 @@ async function main() {
           const cell = row[g.ci]
           if (cell === null || cell === undefined || cell === '') return null
           const b = parseTs(cell, g.period)
-          if (b === null) { parseFailCount++; return null }
+          if (b === null) {
+            parseFailCount++
+            const s = String(cell)
+            if (!parseFailSample.includes(s) && parseFailSample.length < 10) parseFailSample.push(s)
+            return null
+          }
           return b
         })
         const k = JSON.stringify(key)
@@ -439,8 +667,35 @@ async function main() {
             row.push(g.members.length)
             continue
           }
+          if (a.fn === 'count_if') {
+            if (!a.where) fail(2, 'analysis/invalid-args: count_if requires where')
+            row.push(g.members.filter(m => evalFilterNode(a.where, m, work.headers) === true).length)
+            continue
+          }
           const ci = widx(a.column)
-          const nums = g.members.map(r => r[ci]).filter(v => typeof v === 'number')
+          const vals = g.members.map(r => r[ci]).filter(v => v !== null && v !== undefined)
+          if (a.fn === 'count_distinct') {
+            row.push(new Set(vals.map(v => JSON.stringify(v))).size)
+            continue
+          }
+          if (a.fn === 'first') {
+            row.push(vals.length ? vals[0] : null)
+            continue
+          }
+          if (a.fn === 'last') {
+            row.push(vals.length ? vals[vals.length - 1] : null)
+            continue
+          }
+          const nums = vals.filter(v => typeof v === 'number')
+          if (a.fn === 'percentile') {
+            if (typeof a.p !== 'number' || !(a.p > 0 && a.p < 1)) {
+              fail(2, 'analysis/invalid-args: percentile requires p in (0,1)')
+            }
+            if (!nums.length) { row.push(null); continue }
+            const s = [...nums].sort((x, y) => x - y)
+            row.push(s[Math.min(s.length - 1, Math.round((s.length - 1) * a.p))])
+            continue
+          }
           let v = null
           if (a.fn === 'sum') v = nums.reduce((x, y) => x + y, 0)
           else if (a.fn === 'mean') v = nums.length ? nums.reduce((x, y) => x + y, 0) / nums.length : null
@@ -449,7 +704,7 @@ async function main() {
           else if (a.fn === 'median') {
             if (!nums.length) v = null
             else {
-              const s = [...nums].sort((a, b) => a - b)
+              const s = [...nums].sort((x, y) => x - y)
               const m = Math.floor(s.length / 2)
               v = s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
             }
@@ -464,18 +719,54 @@ async function main() {
         }
         outRows.push(row)
       }
-      if (spec.orderBy?.length) {
-        const order = spec.orderBy.map(o => ({ i: outHeaders.indexOf(o.column), desc: !!o.desc }))
-        outRows.sort((a, b) => {
-          for (const o of order) {
-            const av = a[o.i], bv = b[o.i]
-            const cmp = (av > bv ? 1 : av < bv ? -1 : 0) * (o.desc ? -1 : 1)
-            if (cmp) return cmp
-          }
-          return 0
-        })
+    }
+
+    // ---- having (R-7): filter result rows before select ----
+    if (spec.having !== undefined) {
+      outRows = outRows.filter(r => evalFilterNode(spec.having, r, outHeaders))
+    }
+
+    // ---- select (R-9): project / rename ----
+    if (Array.isArray(spec.select)) {
+      const newHeaders = []
+      const idxs = []
+      const seen = new Set()
+      for (const s of spec.select) {
+        let src, out
+        if (typeof s === 'string') { src = s; out = s }
+        else if (s && typeof s === 'object') { src = s.column; out = s.as }
+        else fail(2, 'analysis/invalid-args: select entries must be strings or {column,as}')
+        const ci = outHeaders.indexOf(src)
+        if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${src}`)
+        if (seen.has(out)) fail(2, `analysis/invalid-args: duplicate select name ${out}`)
+        seen.add(out)
+        newHeaders.push(out)
+        idxs.push(ci)
       }
-      outRows = outRows.slice(0, limit)
+      outRows = outRows.map(r => idxs.map(ci => r[ci]))
+      outHeaders = newHeaders
+    }
+
+    // ---- orderBy + limit on the final columns ----
+    if (spec.orderBy?.length) {
+      const order = spec.orderBy.map(o => {
+        const i = outHeaders.indexOf(o.column)
+        if (i < 0) fail(2, `analysis/invalid-args: unknown column ${o.column}`)
+        return { i, desc: !!o.desc }
+      })
+      outRows.sort((a, b) => {
+        for (const o of order) {
+          const av = a[o.i], bv = b[o.i]
+          const cmp = (av > bv ? 1 : av < bv ? -1 : 0) * (o.desc ? -1 : 1)
+          if (cmp) return cmp
+        }
+        return 0
+      })
+    }
+    outRows = outRows.slice(0, limit)
+
+    if (parseFailCount > 0) {
+      warnings.push({ code: 'date-parse-fail', count: parseFailCount })
     }
     let outDatasetId = null
     let truncated = false
@@ -499,7 +790,8 @@ async function main() {
       columns: outHeaders,
       rows: includeRows ? outRows : [],
       truncated,
-      ...(parseFailCount > 0 ? { parseFailCount } : {}),
+      ...(parseFailCount > 0 ? { parseFailCount, parseFailSample } : {}),
+      ...(warnings.length ? { warnings } : {}),
     }))
     return
   }
@@ -507,7 +799,10 @@ async function main() {
   if (cmd === 'values') {
     const id = getFlag(rest, '--dataset-id')
     const column = getFlag(rest, '--column')
-    const limit = Math.min(100, Math.max(1, Number(getFlag(rest, '--limit') || 20)))
+    const rawLimit = getFlag(rest, '--limit')
+    const requestedLimit = rawLimit === undefined ? 20 : Number(rawLimit)
+    if (!Number.isInteger(requestedLimit) || requestedLimit < 1) fail(2, 'analysis/invalid-args: --limit must be integer >= 1')
+    const limit = Math.min(requestedLimit, 100)
     if (!column) fail(2, 'analysis/invalid-args: --column required')
     const { meta, table } = loadDataset(ws, id)
     const ci = table.headers.indexOf(column)
@@ -524,6 +819,8 @@ async function main() {
       .map(([value, count]) => ({ value, count, ratio: count / nonNull }))
       .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)))
       .slice(0, limit)
+    const warnings = []
+    if (requestedLimit > 100) warnings.push({ code: 'clamp', field: 'limit', requested: requestedLimit, actual: 100 })
     console.log(json({
       ok: true,
       datasetId: id,
@@ -532,15 +829,20 @@ async function main() {
       rowCount: meta.rowCount,
       nullCount,
       nunique: counts.size,
+      requestedLimit,
       limit,
       top,
+      ...(warnings.length ? { warnings } : {}),
     }))
     return
   }
 
   if (cmd === 'sample') {
     const id = getFlag(rest, '--dataset-id')
-    const n = Math.min(20, Math.max(1, Number(getFlag(rest, '--n') || 10)))
+    const rawN = getFlag(rest, '--n')
+    const requestedN = rawN === undefined ? 10 : Number(rawN)
+    if (!Number.isInteger(requestedN) || requestedN < 1) fail(2, 'analysis/invalid-args: --n must be integer >= 1')
+    const n = Math.min(requestedN, 200)
     const seed = Number(getFlag(rest, '--seed') ?? 42)
     const stratifyBy = getFlag(rest, '--stratify-by')
     const { meta, table } = loadDataset(ws, id)
@@ -596,12 +898,16 @@ async function main() {
       indices = sampleFrom(Array.from({ length: pop }, (_, i) => i), n, seed)
     }
     const rows = indices.map(i => table.rows[i])
+    const warnings = []
+    if (requestedN > 200) warnings.push({ code: 'clamp', field: 'n', requested: requestedN, actual: 200 })
     console.log(json({
       ok: true,
       datasetId: id,
       rowCount: meta.rowCount,
       columns: table.headers,
       rows,
+      requestedN,
+      n: rows.length,
       sampling: {
         method,
         n: indices.length,
@@ -609,6 +915,7 @@ async function main() {
         stratifyBy: stratifyBy ?? null,
         population: pop,
       },
+      ...(warnings.length ? { warnings } : {}),
     }))
     return
   }
@@ -629,14 +936,27 @@ async function main() {
     const left = loadDataset(ws, leftId)
     const right = loadDataset(ws, rightId)
     const maxRows = Number(process.env.DSH_ANALYZE_MAX_ROWS || 5000000)
-    const lKey = on.map(c => {
-      const i = left.table.headers.indexOf(c)
-      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${c} on left`)
+    const seenLeft = new Set()
+    const seenRight = new Set()
+    const lKey = on.map(entry => {
+      const parts = entry.split(':')
+      const name = parts.length === 2 ? parts[0] : entry
+      if (parts.length > 2 || (parts.length === 2 && (!parts[0] || !parts[1]))) {
+        fail(2, 'analysis/invalid-args: on pairs must be leftKey:rightKey')
+      }
+      if (seenLeft.has(name)) fail(2, `analysis/invalid-args: duplicate join key ${name}`)
+      seenLeft.add(name)
+      const i = left.table.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name} on left`)
       return i
     })
-    const rKey = on.map(c => {
-      const i = right.table.headers.indexOf(c)
-      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${c} on right`)
+    const rKey = on.map(entry => {
+      const parts = entry.split(':')
+      const name = parts.length === 2 ? parts[1] : entry
+      if (seenRight.has(name)) fail(2, `analysis/invalid-args: duplicate join key ${name}`)
+      seenRight.add(name)
+      const i = right.table.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name} on right`)
       return i
     })
     const outHeaders = [...left.table.headers]
@@ -714,6 +1034,15 @@ async function main() {
   }
 
   if (cmd === 'list') {
+    const labelLike = getFlag(rest, '--label-like')
+    const producedBy = getFlag(rest, '--produced-by')
+    const sinceRaw = getFlag(rest, '--since')
+    let sinceTs = null
+    if (sinceRaw !== undefined) {
+      const m = sinceRaw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?$/)
+      if (!m) fail(2, 'analysis/invalid-args: --since must be YYYY-MM-DD[THH:MM:SS]')
+      sinceTs = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0))
+    }
     const { datasets } = analysisDirs(ws)
     const items = readdirSync(datasets)
       .filter(n => n.endsWith('.meta.json'))
@@ -728,7 +1057,18 @@ async function main() {
           producedBy: meta.producedBy,
           parentDatasetId: meta.parentDatasetId ?? null,
           sourceKind: meta.sourceKind,
+          createdAt: meta.createdAt ?? null,
         }
+      })
+      .filter(d => {
+        if (labelLike !== undefined && !String(d.label ?? '').toLowerCase().includes(labelLike.toLowerCase())) return false
+        if (producedBy !== undefined && d.producedBy !== producedBy) return false
+        if (sinceTs !== null) {
+          if (!d.createdAt) return false
+          const ts = Date.parse(d.createdAt)
+          if (!Number.isFinite(ts) || ts < sinceTs) return false
+        }
+        return true
       })
     console.log(json({ ok: true, datasets: items }))
     return
@@ -1532,6 +1872,291 @@ async function main() {
       sourceDatasetId: id,
       orderBy,
       opCount: ops.length,
+    }))
+    return
+  }
+
+  if (cmd === 'union') {
+    const leftId = getFlag(rest, '--left')
+    const rightId = getFlag(rest, '--right')
+    const policy = getFlag(rest, '--columns-policy') || 'strict'
+    const outLabel = getFlag(rest, '--out')
+    if (!leftId || !rightId) fail(2, 'analysis/invalid-args: --left --right required')
+    if (policy !== 'strict' && policy !== 'intersect') {
+      fail(2, 'analysis/invalid-args: --columns-policy must be strict|intersect')
+    }
+    const left = loadDataset(ws, leftId)
+    const right = loadDataset(ws, rightId)
+    let outHeaders
+    if (policy === 'strict') {
+      const lset = new Set(left.table.headers)
+      const rset = new Set(right.table.headers)
+      const missingRight = left.table.headers.filter(h => !rset.has(h))
+      const missingLeft = right.table.headers.filter(h => !lset.has(h))
+      if (missingRight.length || missingLeft.length) {
+        const bits = [
+          ...missingRight.map(h => `left-only ${h}`),
+          ...missingLeft.map(h => `right-only ${h}`),
+        ]
+        fail(2, `analysis/invalid-args: union column mismatch: ${bits.join(', ')}`)
+      }
+      outHeaders = [...left.table.headers]
+    } else {
+      const rset = new Set(right.table.headers)
+      outHeaders = left.table.headers.filter(h => rset.has(h))
+      if (!outHeaders.length) fail(2, 'analysis/invalid-args: union column mismatch: no shared columns')
+    }
+    const project = (tbl) => {
+      const idxs = outHeaders.map(h => tbl.headers.indexOf(h))
+      return tbl.rows.map(r => idxs.map(ci2 => (ci2 < 0 ? null : r[ci2])))
+    }
+    const lRows = project(left.table)
+    const rRows = project(right.table)
+    const outRows = [...lRows, ...rRows]
+    const maxRows = Number(process.env.DSH_ANALYZE_MAX_ROWS || 5000000)
+    if (outRows.length > maxRows) fail(3, 'analysis/limit: union result too large')
+    const newIdVal = newId()
+    writeDataset(ws, newIdVal, { headers: outHeaders, rows: outRows }, {
+      sourceKind: 'union',
+      sourcePath: `union:${leftId}+${rightId}`,
+      label: outLabel,
+      producedBy: 'union',
+      parentDatasetId: leftId,
+    })
+    console.log(json({
+      ok: true,
+      datasetId: newIdVal,
+      rowCount: outRows.length,
+      leftRows: lRows.length,
+      rightRows: rRows.length,
+      columns: outHeaders.map((name, idx) => ({
+        name,
+        dtype: inferDtype(outRows.map(r => r[idx])),
+      })),
+    }))
+    return
+  }
+
+  if (cmd === 'diff') {
+    const leftId = getFlag(rest, '--left')
+    const rightId = getFlag(rest, '--right')
+    const onRaw = getFlag(rest, '--on')
+    const rawSample = getFlag(rest, '--sample-limit')
+    const requestedSample = rawSample === undefined ? 5 : Number(rawSample)
+    if (!Number.isInteger(requestedSample) || requestedSample < 1) {
+      fail(2, 'analysis/invalid-args: --sample-limit must be integer 1..=20')
+    }
+    const sampleLimit = Math.min(requestedSample, 20)
+    if (!leftId || !rightId) fail(2, 'analysis/invalid-args: --left --right required')
+    const left = loadDataset(ws, leftId)
+    const right = loadDataset(ws, rightId)
+    const warnings = []
+    if (requestedSample > 20) {
+      warnings.push({ code: 'clamp', field: 'sampleLimit', requested: requestedSample, actual: 20 })
+    }
+    const shared = left.table.headers.filter(h => right.table.headers.includes(h))
+    const rowObj = (tbl, row) => Object.fromEntries(tbl.headers.map((h, i) => [h, row[i] ?? null]))
+    let onlyLeft = 0, onlyRight = 0, changed = 0
+    const samples = { onlyLeft: [], onlyRight: [], changed: [] }
+    if (onRaw === undefined) {
+      // Multiset comparison over shared columns; changed stays 0 (R-8b).
+      const keyOf = (tbl, row) => JSON.stringify(shared.map(h => row[tbl.headers.indexOf(h)] ?? null))
+      const rightByKey = new Map()
+      right.table.rows.forEach((row, ri) => {
+        const k = keyOf(right.table, row)
+        if (!rightByKey.has(k)) rightByKey.set(k, [])
+        rightByKey.get(k).push(ri)
+      })
+      const consumed = new Set()
+      for (const row of left.table.rows) {
+        const k = keyOf(left.table, row)
+        const q = rightByKey.get(k)
+        if (q && q.length) {
+          consumed.add(q.shift())
+        } else {
+          onlyLeft++
+          if (samples.onlyLeft.length < sampleLimit) samples.onlyLeft.push(rowObj(left.table, row))
+        }
+      }
+      right.table.rows.forEach((row, ri) => {
+        if (consumed.has(ri)) return
+        onlyRight++
+        if (samples.onlyRight.length < sampleLimit) samples.onlyRight.push(rowObj(right.table, row))
+      })
+    } else {
+      const entries = onRaw.split(',').map(s => s.trim()).filter(Boolean)
+      if (!entries.length || entries.length > 8) fail(2, 'analysis/invalid-args: --on must list 1..8 key entries')
+      const seen = new Set()
+      const pairs = entries.map(entry => {
+        const parts = entry.split(':')
+        const ln = parts.length === 2 ? parts[0] : entry
+        const rn = parts.length === 2 ? parts[1] : entry
+        if (parts.length > 2 || !ln || !rn) fail(2, 'analysis/invalid-args: on pairs must be leftKey:rightKey')
+        if (seen.has(ln)) fail(2, `analysis/invalid-args: duplicate join key ${ln}`)
+        seen.add(ln)
+        const li = left.table.headers.indexOf(ln)
+        if (li < 0) fail(2, `analysis/invalid-args: unknown column ${ln} on left`)
+        const ri = right.table.headers.indexOf(rn)
+        if (ri < 0) fail(2, `analysis/invalid-args: unknown column ${rn} on right`)
+        return { li, ri, ln }
+      })
+      const keyLeftNames = new Set(pairs.map(p => p.ln))
+      const nonKeyShared = shared.filter(h => !keyLeftNames.has(h))
+      const rightByKey = new Map()
+      right.table.rows.forEach((row, ri) => {
+        const key = pairs.map(p => row[p.ri] ?? null)
+        if (key.some(v => v === null || v === undefined)) return // null keys never match
+        const k = JSON.stringify(key)
+        if (!rightByKey.has(k)) rightByKey.set(k, [])
+        rightByKey.get(k).push(ri)
+      })
+      const consumed = new Set()
+      for (const row of left.table.rows) {
+        const key = pairs.map(p => row[p.li] ?? null)
+        const q = key.some(v => v === null || v === undefined) ? null : rightByKey.get(JSON.stringify(key))
+        if (!q || !q.length) {
+          onlyLeft++
+          if (samples.onlyLeft.length < sampleLimit) samples.onlyLeft.push(rowObj(left.table, row))
+          continue
+        }
+        const ri = q.shift()
+        consumed.add(ri)
+        const rrow = right.table.rows[ri]
+        const diffColumns = []
+        for (const h of nonKeyShared) {
+          const li = left.table.headers.indexOf(h)
+          const rj = right.table.headers.indexOf(h)
+          if ((row[li] ?? null) !== (rrow[rj] ?? null)) diffColumns.push(h)
+        }
+        if (diffColumns.length) {
+          changed++
+          if (samples.changed.length < sampleLimit) {
+            samples.changed.push({
+              key: Object.fromEntries(pairs.map(p => [p.ln, row[p.li] ?? null])),
+              diffColumns,
+              left: rowObj(left.table, row),
+              right: rowObj(right.table, rrow),
+            })
+          }
+        }
+      }
+      right.table.rows.forEach((row, ri) => {
+        if (consumed.has(ri)) return
+        onlyRight++
+        if (samples.onlyRight.length < sampleLimit) samples.onlyRight.push(rowObj(right.table, row))
+      })
+    }
+    console.log(json({
+      ok: true,
+      datasetId: newId(),
+      onlyLeft,
+      onlyRight,
+      changed,
+      samples,
+      ...(warnings.length ? { warnings } : {}),
+    }))
+    return
+  }
+
+  if (cmd === 'pivot') {
+    const id = getFlag(rest, '--dataset-id')
+    const indexRaw = getFlag(rest, '--index')
+    const columnsName = (getFlag(rest, '--columns') || '').trim()
+    const valuesName = (getFlag(rest, '--values') || '').trim()
+    const agg = getFlag(rest, '--agg')
+    const outLabel = getFlag(rest, '--out')
+    if (!id || !indexRaw || !columnsName || !valuesName || !agg) {
+      fail(2, 'analysis/invalid-args: --dataset-id --index --columns --values --agg required')
+    }
+    if (!['sum', 'mean', 'min', 'max', 'count'].includes(agg)) {
+      fail(2, 'analysis/invalid-args: --agg must be sum|mean|min|max|count')
+    }
+    const { table } = loadDataset(ws, id)
+    const indexNames = indexRaw.split(',').map(s => s.trim()).filter(Boolean)
+    if (!indexNames.length || indexNames.length > 16) {
+      fail(2, 'analysis/invalid-args: --index must list 1..16 columns')
+    }
+    const indexIdx = indexNames.map(name => {
+      const i = table.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+      return i
+    })
+    const pcol = table.headers.indexOf(columnsName)
+    if (pcol < 0) fail(2, `analysis/invalid-args: unknown column ${columnsName}`)
+    const vcol = table.headers.indexOf(valuesName)
+    if (vcol < 0) fail(2, `analysis/invalid-args: unknown column ${valuesName}`)
+    // Distinct pivot values in first-seen order; >50 → analysis/limit (R-16b).
+    const pivotKeys = []
+    const pivotNames = new Map()
+    for (const row of table.rows) {
+      const v = row[pcol]
+      const k = JSON.stringify(v ?? null)
+      if (!pivotNames.has(k)) {
+        if (pivotKeys.length >= 50) fail(3, 'analysis/limit: pivot columns exceed 50')
+        pivotKeys.push(k)
+        pivotNames.set(k, v === null || v === undefined ? 'null' : String(v))
+      }
+    }
+    const rowKeys = []
+    const rowGroups = new Map()
+    for (const row of table.rows) {
+      const rk = JSON.stringify(indexIdx.map(ci2 => row[ci2] ?? null))
+      if (!rowGroups.has(rk)) {
+        rowGroups.set(rk, { key: indexIdx.map(ci2 => row[ci2] ?? null), cells: new Map() })
+        rowKeys.push(rk)
+      }
+      const pk = JSON.stringify(row[pcol] ?? null)
+      const g = rowGroups.get(rk)
+      if (!g.cells.has(pk)) g.cells.set(pk, [])
+      g.cells.get(pk).push(row[vcol] === undefined ? null : row[vcol])
+    }
+    const outHeaders = [...indexNames, ...pivotKeys.map(k => pivotNames.get(k))]
+    const outRows = []
+    for (const rk of rowKeys) {
+      const g = rowGroups.get(rk)
+      const row = [...g.key]
+      for (const pk of pivotKeys) {
+        const vals = g.cells.get(pk) ?? []
+        if (!vals.length) {
+          row.push(null) // missing cell → Null
+          continue
+        }
+        if (agg === 'count') {
+          row.push(vals.length)
+          continue
+        }
+        const nums = vals.filter(v => typeof v === 'number')
+        let cell = null
+        if (nums.length) {
+          if (agg === 'sum') cell = nums.reduce((x, y) => x + y, 0)
+          else if (agg === 'mean') cell = nums.reduce((x, y) => x + y, 0) / nums.length
+          else if (agg === 'min') cell = Math.min(...nums)
+          else if (agg === 'max') cell = Math.max(...nums)
+        }
+        row.push(cell)
+      }
+      outRows.push(row)
+    }
+    const maxRows = Number(process.env.DSH_ANALYZE_MAX_ROWS || 5000000)
+    if (outRows.length > maxRows) fail(3, 'analysis/limit: pivot result too large')
+    const newIdVal = newId()
+    writeDataset(ws, newIdVal, { headers: outHeaders, rows: outRows }, {
+      sourceKind: 'pivot',
+      sourcePath: `pivot:${id}`,
+      label: outLabel,
+      producedBy: 'pivot',
+      parentDatasetId: id,
+    })
+    console.log(json({
+      ok: true,
+      datasetId: newIdVal,
+      rowCount: outRows.length,
+      columns: outHeaders.map((name, idx) => ({
+        name,
+        dtype: inferDtype(outRows.map(r => r[idx])),
+      })),
+      indexColumns: indexNames,
+      pivotColumn: columnsName,
     }))
     return
   }

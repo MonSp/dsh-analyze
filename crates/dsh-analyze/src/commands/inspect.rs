@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::cli::{fail, flag_value};
+use crate::commands::clamp_warning_json;
 use crate::dataset::{json_string, load_dataset, Value};
 
 pub(crate) fn cmd_head(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -9,10 +10,14 @@ pub(crate) fn cmd_head(workspace: &Path, args: &[String]) -> Result<String, u8> 
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --dataset-id required"),
     };
-    let n: usize = flag_value(args, "--n")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5)
-        .clamp(1, 20);
+    let requested_n: u64 = match flag_value(args, "--n") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => return fail(2, "analysis/invalid-args: --n must be integer >= 1"),
+        },
+        None => 5,
+    };
+    let limit = requested_n.min(100) as usize;
     let (meta, table) = load_dataset(workspace, &id).map_err(|e| {
         eprintln!("{e}");
         if e.contains("unknown") {
@@ -25,7 +30,7 @@ pub(crate) fn cmd_head(workspace: &Path, args: &[String]) -> Result<String, u8> 
     let rows_json = table
         .rows
         .iter()
-        .take(n)
+        .take(limit)
         .map(|row| {
             let cells = row
                 .iter()
@@ -36,12 +41,20 @@ pub(crate) fn cmd_head(workspace: &Path, args: &[String]) -> Result<String, u8> 
         })
         .collect::<Vec<_>>()
         .join(",");
+    let n = table.rows.len().min(limit);
+    let warnings = if requested_n > 100 {
+        format!(",\"warnings\":[{}]", clamp_warning_json("n", requested_n, 100))
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}]}}",
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columns\":[{}],\"rows\":[{}],\"requestedN\":{},\"n\":{}{warnings}}}",
         json_string(&id),
         meta.row_count,
         cols.iter().map(|c| json_string(c)).collect::<Vec<_>>().join(","),
-        rows_json
+        rows_json,
+        requested_n,
+        n
     ))
 }
 
@@ -170,10 +183,14 @@ pub(crate) fn cmd_values(workspace: &Path, args: &[String]) -> Result<String, u8
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --column required"),
     };
-    let limit: usize = flag_value(args, "--limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20)
-        .clamp(1, 100);
+    let requested_limit: u64 = match flag_value(args, "--limit") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => return fail(2, "analysis/invalid-args: --limit must be integer >= 1"),
+        },
+        None => 20,
+    };
+    let limit = requested_limit.min(100) as usize;
     let (meta, table) = load_dataset(workspace, &id).map_err(|e| {
         eprintln!("{e}");
         if e.contains("unknown") {
@@ -218,14 +235,23 @@ pub(crate) fn cmd_values(workspace: &Path, args: &[String]) -> Result<String, u8
         })
         .collect::<Vec<_>>()
         .join(",");
+    let warnings = if requested_limit > 100 {
+        format!(
+            ",\"warnings\":[{}]",
+            clamp_warning_json("limit", requested_limit, 100)
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"column\":{},\"dtype\":{},\"rowCount\":{},\"nullCount\":{},\"nunique\":{},\"limit\":{},\"top\":[{}]}}",
+        "{{\"ok\":true,\"datasetId\":{},\"column\":{},\"dtype\":{},\"rowCount\":{},\"nullCount\":{},\"nunique\":{},\"requestedLimit\":{},\"limit\":{},\"top\":[{}]{warnings}}}",
         json_string(&id),
         json_string(&column),
         json_string(&dtype),
         meta.row_count.max(table.rows.len()),
         null_count,
         nunique,
+        requested_limit,
         limit,
         top_json
     ))

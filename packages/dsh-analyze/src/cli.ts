@@ -76,6 +76,11 @@ export async function runAnalyzeCli(options: RunCliOptions): Promise<AnalyzeCliR
         DSH_ANALYZE_MAX_ROWS: String(limits.maxRows),
         DSH_ANALYZE_MAX_INGEST_BYTES: String(limits.maxIngestBytes),
         DSH_ANALYZE_DEFAULT_ROW_LIMIT: String(limits.defaultRowLimit),
+        // Embedded-node wrappers (e.g. MiMo's mimo-node) refuse to spawn
+        // without their host handle; forward it when the parent has it.
+        ...(process.env.MIMO_ELECTRON_NODE_HOST
+          ? { MIMO_ELECTRON_NODE_HOST: process.env.MIMO_ELECTRON_NODE_HOST }
+          : {}),
         ...(process.env.NODE_ENV ? { NODE_ENV: process.env.NODE_ENV } : {}),
       },
     })
@@ -227,6 +232,9 @@ function probeAnalyzeCliUncached(options: {
       windowsHide: true,
       env: {
         PATH: process.env.PATH,
+        ...(process.env.MIMO_ELECTRON_NODE_HOST
+          ? { MIMO_ELECTRON_NODE_HOST: process.env.MIMO_ELECTRON_NODE_HOST }
+          : {}),
         ...(process.env.NODE_ENV ? { NODE_ENV: process.env.NODE_ENV } : {}),
       },
     })

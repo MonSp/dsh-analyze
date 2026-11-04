@@ -439,7 +439,7 @@ fn version_capabilities_include_corr_crosstab() {
         assert!(out.status.success(), "version failed");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(out.contains("\"0.1.6\""), "got: {out}");
+    assert!(out.contains("\"0.1.7\""), "got: {out}");
     for tok in [
         "\"ingest\"",
         "\"head\"",
@@ -783,4 +783,56 @@ fn extract_array(line: &str, field: &str) -> String {
         }
     }
     panic!("unterminated array for {field}");
+}
+
+// R-16a: corr pairs carry `df` (= n-2; n<2 -> 0).
+
+#[test]
+fn corr_pairs_carry_df() {
+    let ws = temp_workspace();
+    write_csv(&ws, "c.csv", "x,y,z\n1,2,5\n2,4,6\n3,6,8\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &["corr", "--dataset-id", "ds_aabbccdd11223344", "--columns", "x,y,z"],
+    );
+    // three pairs, each n=3 -> df=1
+    assert_eq!(out.matches("\"df\":1").count(), 3, "got: {out}");
+    assert_eq!(out.matches("\"n\":3").count(), 3, "got: {out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn corr_df_zero_when_n_below_two() {
+    let ws = temp_workspace();
+    // x has 3 numerics, y only 1 -> pair n=1 -> df=0.
+    write_csv(&ws, "c.csv", "x,y\n1,2\n2,\n3,\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/c.csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &["corr", "--dataset-id", "ds_aabbccdd11223344", "--columns", "x,y"],
+    );
+    assert!(out.contains("\"n\":1"), "got: {out}");
+    assert!(out.contains("\"df\":0"), "n<2 must give df=0: {out}");
+
+    let _ = fs::remove_dir_all(&ws);
 }

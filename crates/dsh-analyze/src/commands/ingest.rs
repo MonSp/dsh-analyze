@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::cli::{env_u64, fail, flag_value};
 use crate::dataset::{
-    ensure_within_workspace, json_string, new_dataset_id, parse_csv_path, parse_jsonl_path,
-    save_meta, write_table_parquet_placeholder, Meta,
+    ensure_within_workspace, json_string, new_dataset_id, parse_csv_path, parse_json_path,
+    parse_jsonl_path, save_meta, write_table_parquet_placeholder, Meta,
 };
 
 pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -18,8 +18,12 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
             let lower = input.to_ascii_lowercase();
             if lower.ends_with(".parquet") {
                 "parquet".into()
+            } else if lower.ends_with(".xlsx") {
+                "xlsx".into()
             } else if lower.ends_with(".jsonl") {
                 "jsonl".into()
+            } else if lower.ends_with(".json") {
+                "json".into()
             } else {
                 "csv".into()
             }
@@ -42,7 +46,10 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
         256 * 1024 * 1024,
     );
     let meta_fs = fs::metadata(&path).map_err(|e| {
-        eprintln!("analysis/cli-failed: {e}");
+        eprintln!(
+            "analysis/cli-failed: cannot read file: {}",
+            crate::dataset::io_read_reason(&e)
+        );
         1u8
     })?;
     if meta_fs.len() > max_bytes {
@@ -54,12 +61,23 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
             eprintln!("{e}");
             1u8
         })?,
+        "json" => parse_json_path(&path).map_err(|e| {
+            eprintln!("{e}");
+            if e.starts_with("analysis/invalid-args") {
+                2u8
+            } else {
+                1u8
+            }
+        })?,
         "jsonl" => parse_jsonl_path(&path).map_err(|e| {
             eprintln!("{e}");
             1u8
         })?,
         "parquet" => {
-            return fail(4, "analysis/limit: parquet not enabled in T0 (use csv/jsonl)");
+            return fail(4, "analysis/limit: parquet not supported yet (planned, see docs/interface.md)");
+        }
+        "xlsx" => {
+            return fail(4, "analysis/limit: xlsx not supported (convert to csv/jsonl)");
         }
         other => return fail(2, &format!("analysis/invalid-args: bad format {other}")),
     };

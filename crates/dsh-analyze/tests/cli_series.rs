@@ -390,7 +390,7 @@ fn series_unknown_column_exit_2() {
 fn series_version_has_capability() {
     let ws = temp_workspace();
     let out = run_ok(&ws, &["version"]);
-    assert!(out.contains("\"version\":\"0.1.6\""));
+    assert!(out.contains("\"version\":\"0.1.7\""));
     assert!(out.contains("\"series\""));
 }
 
@@ -485,4 +485,100 @@ fn series_response_source_fields() {
     let list = run_ok(&ws, &["list"]);
     assert!(list.contains(&new_id));
     assert!(list.contains("series-run"));
+}
+
+// R-3: stable error text for --ops resolution (never raw OS messages).
+
+#[test]
+fn series_ops_non_json_non_file_gets_stable_message() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n");
+    let id = ingest(&ws, "data/s.csv");
+    for bad in ["diff:amount:d", "a:b:c", "not json"] {
+        let err = run_fail(
+            &ws,
+            &["series", "--dataset-id", &id, "--order-by", "t", "--ops", bad],
+            2,
+        );
+        assert!(
+            err.contains("analysis/invalid-args: --ops must be JSON array or a workspace path"),
+            "input={bad} stderr={err}"
+        );
+        assert!(!err.contains("os error"), "input={bad} stderr={err}");
+    }
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn series_ops_file_failures_use_stable_reasons() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n");
+    let id = ingest(&ws, "data/s.csv");
+
+    let err = run_fail(
+        &ws,
+        &[
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            "data/missing-ops.json",
+        ],
+        2,
+    );
+    assert!(
+        err.contains("analysis/invalid-args: cannot read ops file: file not found"),
+        "stderr={err}"
+    );
+    assert!(!err.contains("os error"), "stderr={err}");
+
+    // Workspace escape stays a path error, still without OS text.
+    let err2 = run_fail(
+        &ws,
+        &[
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            "../outside.json",
+        ],
+        2,
+    );
+    assert!(
+        err2.contains("analysis/invalid-path: path escapes workspace"),
+        "stderr={err2}"
+    );
+    assert!(!err2.contains("os error"), "stderr={err2}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn series_ops_file_path_still_works() {
+    let ws = temp_workspace();
+    write_csv(&ws, "s.csv", "t,v\n1,10\n2,20\n");
+    fs::write(
+        ws.join("data").join("ops.json"),
+        r#"[{"fn":"lag","column":"v","as":"v_lag"}]"#,
+    )
+    .unwrap();
+    let id = ingest(&ws, "data/s.csv");
+    let out = run_ok(
+        &ws,
+        &[
+            "series",
+            "--dataset-id",
+            &id,
+            "--order-by",
+            "t",
+            "--ops",
+            "data/ops.json",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let _ = fs::remove_dir_all(&ws);
 }

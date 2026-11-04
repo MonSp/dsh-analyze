@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import {
   createAnalysisToolDefinitions,
   validateAggSpec,
+  validateMutateExpr,
 } from '../packages/dsh-analyze/dist/tools.js'
 import { DEFAULT_ANALYSIS_LIMITS } from '../packages/dsh-analyze/dist/limits.js'
 
@@ -261,4 +262,244 @@ test('BUG-3: transform_agg rejects object filter before CLI spawn', async () => 
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }
+})
+
+// ---- v0.1.7 contract: filter/having trees (R-5/R-7) ----
+
+test('R-5: validateAggSpec accepts nested filter groups (all/any/not)', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  const pred = { column: 'amount', op: 'gt', value: 3000 }
+  // OR group
+  validateAggSpec(JSON.stringify({ filter: { any: [pred, { column: 'region', op: 'eq', value: 'A' }] } }), limits)
+  // mixed AND/OR with nesting
+  validateAggSpec(
+    JSON.stringify({
+      filter: {
+        all: [
+          { any: [{ column: 'region', op: 'eq', value: 'A' }, { column: 'region', op: 'eq', value: 'B' }] },
+          { not: { column: 'amount', op: 'lte', value: 0 } },
+        ],
+      },
+    }),
+    limits,
+  )
+  // NOT group
+  validateAggSpec(JSON.stringify({ filter: { not: pred } }), limits)
+  // empty all → true; empty any → false (both structurally valid)
+  validateAggSpec(JSON.stringify({ filter: { all: [] } }), limits)
+  validateAggSpec(JSON.stringify({ filter: { any: [] } }), limits)
+  // groups may appear inside AND-arrays
+  validateAggSpec(JSON.stringify({ filter: [pred, { any: [pred] }] }), limits)
+})
+
+test('R-5: filter groups reject bad shapes and over-deep nesting', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  const pred = { column: 'amount', op: 'gt', value: 1 }
+  // bare predicate object at top level stays rejected (v0.1.6 strictness)
+  assert.throws(() => validateAggSpec(JSON.stringify({ filter: pred }), limits), /filter must be an array/)
+  // unknown group key
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { or: [pred] } }), limits),
+    /filter must be an array/,
+  )
+  // two group keys in one object
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { all: [pred], any: [pred] } }), limits),
+    /bad filter group/,
+  )
+  // extra unknown key in a group object
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { all: [pred], junk: 1 } }), limits),
+    /bad filter group/,
+  )
+  // all must be an array
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { all: pred } }), limits),
+    /filter all must be an array/,
+  )
+  // unknown nested shape
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { all: [{ nope: 1 }] } }), limits),
+    /bad filter op/,
+  )
+  // depth ≤8 groups (wrapper array is not a level): 8 nested not-groups pass,
+  // the 9th fails with the spec message — same boundary as the CLI.
+  let deep = pred
+  for (let i = 0; i < 8; i++) deep = { not: deep }
+  validateAggSpec(JSON.stringify({ filter: deep }), limits)
+  deep = { not: deep }
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: deep }), limits),
+    /filter nesting too deep/,
+  )
+})
+
+test('R-7: having is a top-level key with the filter shape', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(
+    JSON.stringify({
+      groupBy: ['region'],
+      aggs: [{ fn: 'count', as: 'n' }],
+      having: [{ column: 'n', op: 'gt', value: 1 }],
+    }),
+    limits,
+  )
+  validateAggSpec(
+    JSON.stringify({ aggs: [{ fn: 'count', as: 'n' }], having: { any: [{ column: 'n', op: 'gt', value: 1 }] } }),
+    limits,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ having: 'n > 1' }), limits),
+    /having must be an array/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ having: [{ op: 'gt', value: 1 }] }), limits),
+    /having column required/,
+  )
+})
+
+// ---- v0.1.7 contract: agg fn whitelist (R-6) ----
+
+test('R-6: validateAggSpec accepts count_distinct/percentile/first/last/count_if', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(JSON.stringify({ aggs: [{ fn: 'count_distinct', column: 'region', as: 'nr' }] }), limits)
+  validateAggSpec(JSON.stringify({ aggs: [{ fn: 'percentile', column: 'amount', p: 0.95, as: 'p95' }] }), limits)
+  validateAggSpec(JSON.stringify({ aggs: [{ fn: 'first', column: 'status', as: 's0' }] }), limits)
+  validateAggSpec(JSON.stringify({ aggs: [{ fn: 'last', column: 'status', as: 's1' }] }), limits)
+  validateAggSpec(
+    JSON.stringify({ aggs: [{ fn: 'count_if', where: { column: 'amount', op: 'gt', value: 1 }, as: 'k' }] }),
+    limits,
+  )
+  validateAggSpec(
+    JSON.stringify({
+      aggs: [{ fn: 'count_if', where: { any: [{ column: 'a', op: 'eq', value: 1 }] }, as: 'k' }],
+    }),
+    limits,
+  )
+})
+
+test('R-6: bad agg params rejected (percentile p, count_if where/column, missing column)', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  const cases = [
+    [{ fn: 'percentile', column: 'amount', as: 'p95' }, /percentile requires p in \(0,1\)/],
+    [{ fn: 'percentile', column: 'amount', p: 0, as: 'p' }, /percentile requires p in \(0,1\)/],
+    [{ fn: 'percentile', column: 'amount', p: 1, as: 'p' }, /percentile requires p in \(0,1\)/],
+    [{ fn: 'percentile', column: 'amount', p: 1.5, as: 'p' }, /percentile requires p in \(0,1\)/],
+    [{ fn: 'percentile', column: 'amount', p: '0.9', as: 'p' }, /percentile requires p in \(0,1\)/],
+    [{ fn: 'percentile', p: 0.5, as: 'p' }, /percentile requires column/],
+    [{ fn: 'count_distinct', as: 'nr' }, /count_distinct requires column/],
+    [{ fn: 'first', as: 'f' }, /first requires column/],
+    [{ fn: 'last', as: 'l' }, /last requires column/],
+    [{ fn: 'count_if', as: 'k' }, /count_if requires where/],
+    [{ fn: 'count_if', column: 'a', where: { column: 'a', op: 'eq', value: 1 }, as: 'k' }, /count_if must not specify column/],
+    [{ fn: 'count_if', where: 'a = 1', as: 'k' }, /bad where/],
+  ]
+  for (const [agg, re] of cases) {
+    assert.throws(() => validateAggSpec(JSON.stringify({ aggs: [agg] }), limits), re)
+  }
+  // unknown fn still rejected
+  assert.throws(() => validateAggSpec(JSON.stringify({ aggs: [{ fn: 'mode', column: 'a' }] }), limits), /bad agg fn/)
+})
+
+// ---- v0.1.7 contract: topKPerGroup (R-15) ----
+
+test('R-15: topKPerGroup validates by/k/orderBy ranges', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(
+    JSON.stringify({ topKPerGroup: { by: ['region'], k: 3 }, aggs: [] }),
+    limits,
+  )
+  validateAggSpec(
+    JSON.stringify({
+      topKPerGroup: {
+        by: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+        k: 1000,
+        orderBy: { column: 'amount', desc: true },
+      },
+    }),
+    limits,
+  )
+  const cases = [
+    [{ topKPerGroup: { by: [], k: 3 } }, /topKPerGroup\.by must be 1\.\.8/],
+    [{ topKPerGroup: { by: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'], k: 3 } }, /topKPerGroup\.by must be 1\.\.8/],
+    [{ topKPerGroup: { by: [1], k: 3 } }, /topKPerGroup\.by must be 1\.\.8/],
+    [{ topKPerGroup: { by: ['a'], k: 0 } }, /topKPerGroup\.k must be integer 1\.\.1000/],
+    [{ topKPerGroup: { by: ['a'], k: 1001 } }, /topKPerGroup\.k must be integer 1\.\.1000/],
+    [{ topKPerGroup: { by: ['a'], k: 1.5 } }, /topKPerGroup\.k must be integer 1\.\.1000/],
+    [{ topKPerGroup: { by: ['a'], k: 3, orderBy: {} } }, /topKPerGroup\.orderBy needs a column name/],
+    [{ topKPerGroup: { by: ['a'], k: 3, orderBy: { column: 'x', desc: 'yes' } } }, /topKPerGroup\.orderBy desc must be boolean/],
+    [{ topKPerGroup: { by: 'a', k: 3 } }, /topKPerGroup\.by must be 1\.\.8/],
+  ]
+  for (const [spec, re] of cases) {
+    assert.throws(() => validateAggSpec(JSON.stringify(spec), limits), re)
+  }
+})
+
+// ---- v0.1.7 contract: select rename + mutate casts (R-9) ----
+
+test('R-9: select entries accept {column,as} renames and reject duplicates', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(JSON.stringify({ select: ['a', { column: 'b', as: 'bee' }] }), limits)
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: [{ column: 'b' }] }), limits),
+    /select as must match/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: [{ column: 'b', as: '1bad' }] }), limits),
+    /select as must match/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: [{ as: 'x' }] }), limits),
+    /select entry column required/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: ['a', { column: 'b', as: 'a' }] }), limits),
+    /duplicate select name/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: ['a', 'a'] }), limits),
+    /duplicate select name/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ select: [1] }), limits),
+    /select entries must be strings/,
+  )
+})
+
+test('R-9: validateMutateExpr whitelist to_int/to_str/to_date + string literals', () => {
+  validateMutateExpr('amount * 2')
+  validateMutateExpr('to_int(amount)')
+  validateMutateExpr('to_str(amount)')
+  validateMutateExpr('to_date("2026/10/02","%Y/%m/%d")')
+  validateMutateExpr('to_date(day, "%Y-%m-%d")')
+  validateMutateExpr('to_date("2026-10-02T11:22:33", "%Y-%m-%dT%H:%M:%S")')
+  validateMutateExpr('to_int(amount) + 1')
+  assert.throws(() => validateMutateExpr('foo()'), /function calls are not allowed/)
+  assert.throws(() => validateMutateExpr('system(1)'), /function calls are not allowed/)
+  assert.throws(() => validateMutateExpr('to_date(a)'), /to_date\(e, fmt\) takes 2 arguments/)
+  assert.throws(() => validateMutateExpr('to_int(a, b)'), /to_int\(e\) takes 1 argument/)
+  assert.throws(() => validateMutateExpr('to_date(a, b)'), /to_date fmt must be a string literal/)
+  assert.throws(
+    () => validateMutateExpr('to_date(a, "%Q")'),
+    /unsupported directive/,
+  )
+  assert.throws(
+    () => validateMutateExpr('to_date(a, "%Y-%m-%d %q")'),
+    /unsupported directive/,
+  )
+  assert.throws(() => validateMutateExpr('a; drop'), /illegal characters/)
+})
+
+// ---- v0.1.7 contract: R-18 package-root library surface ----
+
+test('R-18: package root (dist/index.js) re-exports createAnalysisToolDefinitions, attachAnalysisTools, validateAggSpec', async () => {
+  const api = await import('../packages/dsh-analyze/dist/index.js')
+  assert.equal(typeof api.createAnalysisToolDefinitions, 'function')
+  assert.equal(typeof api.attachAnalysisTools, 'function')
+  assert.equal(typeof api.validateAggSpec, 'function')
+  // apply stays exported for the plugin entry
+  assert.equal(typeof api.apply, 'function')
+  // the root createAnalysisToolDefinitions is the same function the tools module exposes
+  assert.equal(api.createAnalysisToolDefinitions, createAnalysisToolDefinitions)
+  assert.equal(api.validateAggSpec, validateAggSpec)
 })
