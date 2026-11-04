@@ -1452,6 +1452,9 @@ test('R-8b: dataset_diff keyed pairs and multiset mode via mock CLI', async () =
     assert.equal(keyed.samples.onlyLeft[0].k, 1)
     assert.deepEqual(keyed.samples.changed[0].diffColumns, ['v'])
     assert.deepEqual(keyed.samples.changed[0].key, { k: 2 })
+    assert.ok(typeof keyed.datasetId === 'string' && keyed.datasetId.length > 0)
+    const diffText = defs.dataset_diff.output.render({}, keyed).map((p) => p.text).join('')
+    assert.ok(diffText.includes(keyed.datasetId), `render shows datasetId: ${diffText}`)
 
     // multiset mode: changed stays 0
     const multi = await defs.dataset_diff.execute({

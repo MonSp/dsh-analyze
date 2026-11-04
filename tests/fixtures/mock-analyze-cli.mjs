@@ -2048,6 +2048,7 @@ async function main() {
     }
     console.log(json({
       ok: true,
+      datasetId: newId(),
       onlyLeft,
       onlyRight,
       changed,

@@ -227,7 +227,10 @@ pub fn run_agg(
         let mut counters = EvalCounters::default();
         let mut out_vals = Vec::with_capacity(work_rows.len());
         for row in &work_rows {
-            out_vals.push(expr::eval_expr(&m.expr, row, &col_index, &mut counters)?);
+            counters.begin_row();
+            let v = expr::eval_expr(&m.expr, row, &col_index, &mut counters)?;
+            counters.end_row();
+            out_vals.push(v);
         }
         if counters.arith_null > 0 {
             mutate_warnings.push(AggWarning {
@@ -791,7 +794,16 @@ fn compute_agg(
         }
     }
     match a.r#fn.as_str() {
-        "sum" => Ok(Value::F64(nums.iter().sum())),
+        // SQL SUM semantics: zero non-null values → Null (consistent with mean).
+        // `f64::sum` of an empty iterator is -0.0, which must never surface.
+        "sum" => {
+            if nums.is_empty() {
+                Ok(Value::Null)
+            } else {
+                let s: f64 = nums.iter().sum();
+                Ok(Value::F64(if s == 0.0 { 0.0 } else { s }))
+            }
+        }
         "mean" => {
             if nums.is_empty() {
                 Ok(Value::Null)
@@ -1203,6 +1215,12 @@ fn parse_filter_obj(
         ));
     }
     if n_group == 1 {
+        // Strict group shape: exactly the one group key, no extras (S2.6).
+        if top_level_keys(t)?.len() != 1 {
+            return Err(format!(
+                "analysis/invalid-args: {what} group must be exactly one of all/any/not"
+            ));
+        }
         if depth + 1 > MAX_FILTER_DEPTH {
             return Err("analysis/invalid-args: filter nesting too deep".into());
         }
@@ -1874,6 +1892,22 @@ mod tests {
         assert!(parse_spec_json(r#"{"filter":{"all":[]}}"#).is_ok());
     }
 
+    /// Group objects must carry exactly one of all/any/not — no extra keys.
+    #[test]
+    fn filter_group_rejects_unknown_keys() {
+        for spec in [
+            r#"{"filter":{"all":[{"op":"eq","column":"a","value":1}],"junk":1}}"#,
+            r#"{"filter":{"any":[],"column":"a"}}"#,
+            r#"{"filter":{"all":[],"all":[]}}"#,
+        ] {
+            let err = parse_spec_json(spec).unwrap_err();
+            assert!(
+                err.contains("group must be exactly one of all/any/not"),
+                "spec={spec} err={err}"
+            );
+        }
+    }
+
     #[test]
     fn array_keys_reject_wrong_shape() {
         assert!(parse_spec_json(r#"{"select":"a,b"}"#).is_err());
@@ -2302,6 +2336,25 @@ mod tests {
             .find(|w| w.code == "cast-null")
             .expect("cast-null warning");
         assert_eq!(w.count, 1);
+        // Null propagation is silent; a row with two failing nodes counts once.
+        let t2 = Table {
+            columns: vec![Column {
+                name: "a".into(),
+                dtype: "i64".into(),
+            }],
+            rows: vec![vec![Value::Null], vec![Value::I64(1)]],
+        };
+        let spec = parse_spec_json(r#"{"mutate":[{"as":"x","expr":"a + 1"}]}"#).unwrap();
+        let out = run_agg(&t2, &spec, 1000, 5000).unwrap();
+        assert!(out.warnings.is_empty(), "propagation must not warn");
+        let spec = parse_spec_json(r#"{"mutate":[{"as":"x","expr":"(a / 0) + (a / 0)"}]}"#).unwrap();
+        let out = run_agg(&t2, &spec, 1000, 5000).unwrap();
+        let w = out
+            .warnings
+            .iter()
+            .find(|w| w.code == "mutate-null")
+            .expect("mutate-null warning");
+        assert_eq!(w.count, 1, "one failing row, not two failing nodes");
         // clean run: no warnings
         let spec = parse_spec_json(r#"{"aggs":[{"fn":"count","as":"n"}]}"#).unwrap();
         let out = run_agg(&t, &spec, 1000, 5000).unwrap();

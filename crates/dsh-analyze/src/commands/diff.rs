@@ -106,9 +106,10 @@ pub(crate) fn cmd_diff(workspace: &Path, args: &[String]) -> Result<String, u8> 
             right_key_idx.push(ri);
         }
         let key_left_names: Vec<String> = pairs.iter().map(|(ln, _)| ln.clone()).collect();
+        let key_right_names: Vec<String> = pairs.iter().map(|(_, rn)| rn.clone()).collect();
         let non_key_shared: Vec<(String, usize, usize)> = shared
             .iter()
-            .filter(|n| !key_left_names.contains(n))
+            .filter(|n| !key_left_names.contains(n) && !key_right_names.contains(n))
             .map(|n| {
                 let li = left.columns.iter().position(|c| &c.name == n).unwrap();
                 let ri = right.columns.iter().position(|c| &c.name == n).unwrap();

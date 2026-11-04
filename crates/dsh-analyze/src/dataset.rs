@@ -69,7 +69,12 @@ impl Value {
             Value::I64(v) => v.to_string(),
             Value::F64(v) => {
                 if v.is_finite() {
-                    format!("{v}")
+                    // -0.0 serializes as "-0"; normalize so JSON never carries -0.
+                    if *v == 0.0 {
+                        "0".to_string()
+                    } else {
+                        format!("{v}")
+                    }
                 } else {
                     "null".into()
                 }

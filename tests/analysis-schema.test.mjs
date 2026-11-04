@@ -307,6 +307,11 @@ test('R-5: filter groups reject bad shapes and over-deep nesting', () => {
     () => validateAggSpec(JSON.stringify({ filter: { all: [pred], any: [pred] } }), limits),
     /bad filter group/,
   )
+  // extra unknown key in a group object
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ filter: { all: [pred], junk: 1 } }), limits),
+    /bad filter group/,
+  )
   // all must be an array
   assert.throws(
     () => validateAggSpec(JSON.stringify({ filter: { all: pred } }), limits),
@@ -317,11 +322,12 @@ test('R-5: filter groups reject bad shapes and over-deep nesting', () => {
     () => validateAggSpec(JSON.stringify({ filter: { all: [{ nope: 1 }] } }), limits),
     /bad filter op/,
   )
-  // depth ≤8: 8 nested not-groups pass, 9th fails with the spec message
+  // depth ≤8 groups (wrapper array is not a level): 8 nested not-groups pass,
+  // the 9th fails with the spec message — same boundary as the CLI.
   let deep = pred
-  for (let i = 0; i < 7; i++) deep = { not: deep }
+  for (let i = 0; i < 8; i++) deep = { not: deep }
   validateAggSpec(JSON.stringify({ filter: deep }), limits)
-  for (let i = 0; i < 2; i++) deep = { not: deep }
+  deep = { not: deep }
   assert.throws(
     () => validateAggSpec(JSON.stringify({ filter: deep }), limits),
     /filter nesting too deep/,

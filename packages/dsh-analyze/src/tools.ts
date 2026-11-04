@@ -361,15 +361,14 @@ function validatePredicateEntry(f: Record<string, unknown>, label: string): void
 }
 
 /**
- * Predicate tree: predicate | {"all":[item…]} | {"any":[item…]} | {"not":item},
- * with arrays as implicit AND. Empty all → true, empty any → false. Nesting
- * depth ≤8 (R-5).
+ * Predicate tree item: predicate | {"all":[item…]} | {"any":[item…]} | {"not":item}.
+ * `depth` counts enclosing GROUP objects (wrapper arrays are not a level),
+ * mirroring the CLI: 8 nested groups are allowed, a 9th errors. Empty all →
+ * true, empty any → false.
  */
 function validateFilterNode(node: unknown, label: string, depth: number): void {
-  if (depth > MAX_FILTER_DEPTH) throw invalidArgs(`${label} nesting too deep`)
   if (Array.isArray(node)) {
-    for (const item of node) validateFilterNode(item, label, depth + 1)
-    return
+    throw invalidArgs(`${label} item must be a predicate or group`)
   }
   if (node && typeof node === 'object') {
     const o = node as Record<string, unknown>
@@ -382,6 +381,7 @@ function validateFilterNode(node: unknown, label: string, depth: number): void {
     if (groupKeys.length !== 1 || keys.length !== 1) {
       throw invalidArgs(`bad ${label} group`)
     }
+    if (depth + 1 > MAX_FILTER_DEPTH) throw invalidArgs(`${label} nesting too deep`)
     const kind = groupKeys[0]!
     if (kind === 'all' || kind === 'any') {
       const list = o[kind]
@@ -398,7 +398,7 @@ function validateFilterNode(node: unknown, label: string, depth: number): void {
 /** Top-level filter/having shape: AND-array or a single {all|any|not} group. */
 function validateFilterTree(root: unknown, label: string): void {
   if (Array.isArray(root)) {
-    validateFilterNode(root, label, 1)
+    for (const item of root) validateFilterNode(item, label, 0)
     return
   }
   if (root && typeof root === 'object') {
@@ -406,7 +406,7 @@ function validateFilterTree(root: unknown, label: string): void {
     const keys = Object.keys(o)
     const groupKeys = keys.filter((k) => k === 'all' || k === 'any' || k === 'not')
     if (groupKeys.length === 1 && keys.length === 1 && !('op' in o)) {
-      validateFilterNode(root, label, 1)
+      validateFilterNode(root, label, 0)
       return
     }
     if (groupKeys.length > 0) {
@@ -2295,6 +2295,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         schema: {
           type: 'object',
           properties: {
+            datasetId: { type: 'string' },
             onlyLeft: { type: 'number' },
             onlyRight: { type: 'number' },
             changed: { type: 'number' },
@@ -2308,18 +2309,20 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             },
             warnings: { type: 'array', items: { type: 'object', additionalProperties: true } },
           },
-          required: ['onlyLeft', 'onlyRight', 'changed', 'samples'],
+          required: ['datasetId', 'onlyLeft', 'onlyRight', 'changed', 'samples'],
           additionalProperties: true,
         },
         render(_args: unknown, value: unknown) {
           const v = value as {
+            datasetId: string
             onlyLeft: number
             onlyRight: number
             changed: number
             samples?: { onlyLeft?: unknown[]; onlyRight?: unknown[]; changed?: unknown[] }
           }
           return textRender(withWarnings(
-            `diff: onlyLeft=${v.onlyLeft} onlyRight=${v.onlyRight} changed=${v.changed}\n` +
+            `diff → ${v.datasetId}: onlyLeft=${v.onlyLeft} onlyRight=${v.onlyRight} ` +
+              `changed=${v.changed}\n` +
               `samples: onlyLeft=${v.samples?.onlyLeft?.length ?? 0} ` +
               `onlyRight=${v.samples?.onlyRight?.length ?? 0} ` +
               `changed=${v.samples?.changed?.length ?? 0}`,

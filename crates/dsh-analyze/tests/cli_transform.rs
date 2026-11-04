@@ -370,6 +370,53 @@ fn diff_multi_key_and_left_right_key_pairs() {
 }
 
 #[test]
+fn diff_pair_keys_exclude_both_sides_from_comparison() {
+    let ws = temp_workspace();
+    // Right key name `oid` also exists as LEFT data (and vice versa); those
+    // name collisions must not be compared as non-key columns.
+    write_csv(&ws, "l.csv", "order_id,oid,v\n1,99,x\n");
+    write_csv(&ws, "r.csv", "oid,order_id,v\n1,55,x\n");
+    ingest(&ws, "l.csv", "ds_left000011112222");
+    ingest(&ws, "r.csv", "ds_right00011112222");
+
+    let out = run_ok(
+        &ws,
+        &[
+            "diff",
+            "--left",
+            "ds_left000011112222",
+            "--right",
+            "ds_right00011112222",
+            "--on",
+            "order_id:oid",
+        ],
+    );
+    assert_eq!(json_usize_field(&out, "changed"), Some(0), "{out}");
+    assert_eq!(json_usize_field(&out, "onlyLeft"), Some(0), "{out}");
+    assert_eq!(json_usize_field(&out, "onlyRight"), Some(0), "{out}");
+
+    // A real non-key difference is still reported.
+    write_csv(&ws, "r2.csv", "oid,order_id,v\n1,55,y\n");
+    ingest(&ws, "r2.csv", "ds_right00011112223");
+    let out = run_ok(
+        &ws,
+        &[
+            "diff",
+            "--left",
+            "ds_left000011112222",
+            "--right",
+            "ds_right00011112223",
+            "--on",
+            "order_id:oid",
+        ],
+    );
+    assert_eq!(json_usize_field(&out, "changed"), Some(1), "{out}");
+    assert!(out.contains("\"diffColumns\":[\"v\"]"), "{out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn diff_null_keys_never_match() {
     let ws = temp_workspace();
     write_csv(&ws, "l.csv", "k,amount\n1,10\n,20\n");

@@ -51,12 +51,47 @@ impl ExprType {
 }
 
 /// Runtime evaluation counters feeding the agg `warnings[]` entries.
+/// Counting is per output row: a row counts at most once per code, and only
+/// runtime failures count — Null propagation does not (S2.5).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EvalCounters {
-    /// Arithmetic node produced Null (incl. div-by-zero / Null propagation).
+    /// Rows whose output cell is Null due to an arithmetic runtime failure
+    /// (divide-by-zero). Null propagation does not count (R-20 / S2.5).
     pub arith_null: u64,
-    /// to_int/to_str/to_date conversion failed to Null.
+    /// Rows whose output cell is Null due to a failed conversion of a
+    /// non-null value. `to_int(null)` is propagation and does not count.
     pub cast_null: u64,
+    /// Per-row scratch: arithmetic runtime failure seen while evaluating the
+    /// current row.
+    row_arith_fail: bool,
+    /// Per-row scratch: non-null cast failed while evaluating the current row.
+    row_cast_fail: bool,
+}
+
+impl EvalCounters {
+    /// Start collecting for one output row.
+    pub fn begin_row(&mut self) {
+        self.row_arith_fail = false;
+        self.row_cast_fail = false;
+    }
+
+    /// Roll the row's failures into the totals (a row counts once per code).
+    pub fn end_row(&mut self) {
+        if self.row_arith_fail {
+            self.arith_null += 1;
+        }
+        if self.row_cast_fail {
+            self.cast_null += 1;
+        }
+    }
+
+    fn note_arith_fail(&mut self) {
+        self.row_arith_fail = true;
+    }
+
+    fn note_cast_fail(&mut self) {
+        self.row_cast_fail = true;
+    }
 }
 
 pub fn validate_as_name(name: &str) -> bool {
@@ -368,12 +403,10 @@ pub fn eval_expr(
         }
         Expr::Neg(inner) => {
             let v = eval_expr(inner, row, col_index, counters)?;
+            // Null propagates (not a failure); numeric negate cannot fail.
             Ok(match v.as_f64() {
                 Some(n) => Value::F64(-n),
-                None => {
-                    counters.arith_null += 1;
-                    Value::Null
-                }
+                None => Value::Null,
             })
         }
         Expr::Add(a, b) => arith(a, b, row, col_index, counters, |x, y| x + y),
@@ -384,38 +417,49 @@ pub fn eval_expr(
             let vb = eval_expr(b, row, col_index, counters)?;
             match (va.as_f64(), vb.as_f64()) {
                 (Some(x), Some(y)) if y != 0.0 => Ok(Value::F64(x / y)),
-                _ => {
-                    counters.arith_null += 1;
+                (Some(_), Some(_)) => {
+                    // Divide by zero is a runtime failure; Null operands propagate.
+                    counters.note_arith_fail();
                     Ok(Value::Null)
                 }
+                _ => Ok(Value::Null),
             }
         }
         Expr::ToInt(inner) => {
             let v = eval_expr(inner, row, col_index, counters)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
             match cast_to_int(&v) {
                 Some(n) => Ok(Value::I64(n)),
                 None => {
-                    counters.cast_null += 1;
+                    counters.note_cast_fail();
                     Ok(Value::Null)
                 }
             }
         }
         Expr::ToStr(inner) => {
             let v = eval_expr(inner, row, col_index, counters)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
             match cast_to_str(&v) {
                 Some(s) => Ok(Value::Str(s)),
                 None => {
-                    counters.cast_null += 1;
+                    counters.note_cast_fail();
                     Ok(Value::Null)
                 }
             }
         }
         Expr::ToDate(inner, fmt) => {
             let v = eval_expr(inner, row, col_index, counters)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
             match cast_to_date(&v, fmt) {
                 Some(s) => Ok(Value::Str(s)),
                 None => {
-                    counters.cast_null += 1;
+                    counters.note_cast_fail();
                     Ok(Value::Null)
                 }
             }
@@ -488,12 +532,10 @@ fn arith(
 ) -> Result<Value, String> {
     let va = eval_expr(a, row, col_index, counters)?;
     let vb = eval_expr(b, row, col_index, counters)?;
+    // Null operands propagate (not a runtime failure); + - * cannot fail otherwise.
     Ok(match (va.as_f64(), vb.as_f64()) {
         (Some(x), Some(y)) => Value::F64(f(x, y)),
-        _ => {
-            counters.arith_null += 1;
-            Value::Null
-        }
+        _ => Value::Null,
     })
 }
 
@@ -590,12 +632,54 @@ mod tests {
         let row = vec![Value::I64(1), Value::Str("abc".into())];
         let e = parse_expr("to_int(s)").unwrap();
         let mut c = EvalCounters::default();
+        c.begin_row();
         assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
         assert_eq!(c.cast_null, 1);
         assert_eq!(c.arith_null, 0);
         let e = parse_expr("a / 0").unwrap();
         let mut c = EvalCounters::default();
+        c.begin_row();
         assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
         assert_eq!(c.arith_null, 1);
+    }
+
+    #[test]
+    fn propagation_not_counted_and_rows_count_once() {
+        let cols = vec![
+            ("a".to_string(), 0usize),
+            ("s".to_string(), 1usize),
+        ];
+        // Null propagation in arithmetic is silent.
+        let row = vec![Value::Null, Value::Str("10".into())];
+        let e = parse_expr("a + 1").unwrap();
+        let mut c = EvalCounters::default();
+        c.begin_row();
+        assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
+        assert_eq!(c.arith_null, 0);
+        // to_int(null) is propagation, not a cast failure.
+        let e = parse_expr("to_int(a)").unwrap();
+        let mut c = EvalCounters::default();
+        c.begin_row();
+        assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
+        assert_eq!(c.cast_null, 0);
+        // Two failing nodes in one row count once.
+        let row = vec![Value::I64(1), Value::Str("abc".into())];
+        let e = parse_expr("(a / 0) + (a / 0)").unwrap();
+        let mut c = EvalCounters::default();
+        c.begin_row();
+        assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
+        assert_eq!(c.arith_null, 1);
+        let e = parse_expr("to_int(s) + to_int(s)").unwrap();
+        let mut c = EvalCounters::default();
+        c.begin_row();
+        assert_eq!(eval_expr(&e, &row, &cols, &mut c).unwrap(), Value::Null);
+        c.end_row();
+        assert_eq!(c.cast_null, 1);
+        assert_eq!(c.arith_null, 0);
     }
 }
