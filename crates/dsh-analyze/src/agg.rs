@@ -1112,9 +1112,13 @@ fn parse_window(obj: &str) -> Result<WindowOp, String> {
             "analysis/invalid-args: bad window fn {fn_name} (rank|row_number|cumsum|ewm)"
         ));
     }
-    let by = match extract_array(t, "by")? {
-        Some(arr) => parse_string_array(&arr)?,
-        None => Vec::new(),
+    // K2: a present-but-wrong-shape field is invalid-args, never "missing".
+    let by = if find_key(t, "\"by\"").is_some() {
+        let arr = extract_array(t, "by")?
+            .ok_or_else(|| "analysis/invalid-args: window by must be an array".to_string())?;
+        parse_string_array(&arr)?
+    } else {
+        Vec::new()
     };
     if by.len() > MAX_WINDOW_BY {
         return Err(format!(
@@ -1126,7 +1130,12 @@ fn parse_window(obj: &str) -> Result<WindowOp, String> {
         return Err(format!("analysis/invalid-args: window {fn_name} requires by"));
     }
     let order_by = match extract_json_value(t, "orderBy")? {
-        Some(ob) => parse_order_by(&ob)?,
+        Some(ob) => {
+            if !ob.trim_start().starts_with('{') {
+                return Err("analysis/invalid-args: window orderBy must be an object".into());
+            }
+            parse_order_by(&ob)?
+        }
         None => {
             return Err(format!(
                 "analysis/invalid-args: window {fn_name} requires orderBy"
@@ -1258,6 +1267,13 @@ fn apply_window(
         }
 
         let mut out = vec![Value::Null; rows.len()];
+        // cumsum two-pass (K3): exact running sums first (i128 when every
+        // source is integral), then one dtype decision for the whole column,
+        // then emit values matching that dtype. Overflow promotes the column
+        // to f64 instead of emitting F64 under an i64 schema.
+        let mut cum_i: Vec<i128> = vec![0; rows.len()];
+        let mut cum_f: Vec<f64> = vec![0.0; rows.len()];
+        let mut cum_fits_i64 = cum_all_i64;
         for members in parts.values_mut() {
             // Stable sort by orderBy (nulls last), ties keep input index order.
             members.sort_by(|&a, &b| {
@@ -1286,21 +1302,30 @@ fn apply_window(
                 }
                 "cumsum" => {
                     let ci = col_i.expect("cumsum column");
-                    let mut acc: f64 = 0.0;
-                    for &ri in members.iter() {
-                        let cell = rows[ri].get(ci).cloned().unwrap_or(Value::Null);
-                        if let Some(n) = cell.as_f64() {
-                            if n.is_finite() {
-                                acc += n;
+                    if cum_all_i64 {
+                        // Integral sources: accumulate exactly in i128 (null = 0).
+                        let mut acc: i128 = 0;
+                        for &ri in members.iter() {
+                            if let Some(Value::I64(v)) = rows[ri].get(ci) {
+                                acc += *v as i128;
+                            }
+                            cum_i[ri] = acc;
+                            if acc < i64::MIN as i128 || acc > i64::MAX as i128 {
+                                cum_fits_i64 = false;
                             }
                         }
-                        // null contributes 0 (already skipped)
-                        out[ri] = if cum_all_i64 && acc.fract() == 0.0 && acc.abs() < i64::MAX as f64
-                        {
-                            Value::I64(acc as i64)
-                        } else {
-                            Value::F64(acc)
-                        };
+                    } else {
+                        // Mixed sources: f64 accumulation (null contributes 0).
+                        let mut acc: f64 = 0.0;
+                        for &ri in members.iter() {
+                            let cell = rows[ri].get(ci).cloned().unwrap_or(Value::Null);
+                            if let Some(n) = cell.as_f64() {
+                                if n.is_finite() {
+                                    acc += n;
+                                }
+                            }
+                            cum_f[ri] = acc;
+                        }
                     }
                 }
                 "ewm" => {
@@ -1335,7 +1360,22 @@ fn apply_window(
         let dtype = match w.r#fn.as_str() {
             "rank" | "row_number" => "i64".to_string(),
             "cumsum" => {
-                if cum_all_i64 { "i64" } else { "f64" }.to_string()
+                if cum_all_i64 && cum_fits_i64 {
+                    for (ri, v) in cum_i.iter().enumerate() {
+                        out[ri] = Value::I64(*v as i64);
+                    }
+                    "i64".to_string()
+                } else if cum_all_i64 {
+                    for (ri, v) in cum_i.iter().enumerate() {
+                        out[ri] = Value::F64(*v as f64);
+                    }
+                    "f64".to_string()
+                } else {
+                    for (ri, v) in cum_f.iter().enumerate() {
+                        out[ri] = Value::F64(*v);
+                    }
+                    "f64".to_string()
+                }
             }
             _ => "f64".to_string(),
         };
@@ -2885,5 +2925,65 @@ mod tests {
         .unwrap();
         let err = run_agg(&table(), &spec, 1000, 5000).unwrap_err();
         assert!(err.contains("collides"), "err={err}");
+    }
+
+    /// K2: a present-but-wrong-shape field is invalid-args, never silent "missing".
+    #[test]
+    fn window_shape_errors_strict() {
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"ewm","column":"a","alpha":0.5,"by":"acc","orderBy":{"column":"b"},"as":"e"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("by must be an array"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":123,"orderBy":{"column":"b"},"as":"r"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("by must be an array"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":["a"],"orderBy":"b","as":"r"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("orderBy must be an object"), "err={err}");
+    }
+
+    /// K3: overflow promotes the whole column to f64 — values match the schema.
+    #[test]
+    fn window_cumsum_overflow_promotes_to_f64() {
+        let t = Table {
+            columns: vec![
+                Column { name: "g".into(), dtype: "utf8".into() },
+                Column { name: "ts".into(), dtype: "i64".into() },
+                Column { name: "amount".into(), dtype: "i64".into() },
+            ],
+            rows: (1..=3)
+                .map(|i| {
+                    vec![
+                        Value::Str("a".into()),
+                        Value::I64(i),
+                        Value::I64(4_611_686_018_427_387_904), // 2^62
+                    ]
+                })
+                .collect(),
+        };
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"cumsum","column":"amount","by":["g"],"orderBy":{"column":"ts"},"as":"cum"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        assert_eq!(out.table.columns[3].dtype, "f64");
+        for (i, row) in out.table.rows.iter().enumerate() {
+            assert!(
+                matches!(row[3], Value::F64(_)),
+                "row {i}: declared f64 but value {:?}",
+                row[3]
+            );
+        }
+        match out.table.rows[2][3] {
+            Value::F64(v) => assert_eq!(v, 1.383_505_805_528_216_4e19),
+            ref other => panic!("{other:?}"),
+        }
     }
 }

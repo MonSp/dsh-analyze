@@ -257,7 +257,7 @@ Spec key shapes (enforced by the CLI and by tool-layer `validateAggSpec`):
   `{"by":[col…1..8],"k":int 1..1000,"orderBy":{"column":…,"desc":bool}?}` —
   a row stage (after `window`, before `mutate`) keeping ≤ `k` rows per `by`
   key combination (Null its own group), ordered by `orderBy` (input order
-  default). Wrong shapes fail with `analysis/invalid-args`.
+  default). Wrong shapes fail with `analysis/invalid-args` — including a key that is present with the wrong JSON type (e.g. window `by` as a string, `orderBy` as a string), which is never treated as missing.
 - Unknown top-level spec keys are rejected
   (`analysis/invalid-args: unknown spec key …`), never silently dropped.
 
@@ -271,7 +271,7 @@ mutate → group/agg → having → select → orderBy → limit`.
 |---|---|---|
 | `rank` | `by` 1..8, `orderBy`, `as` | Competition rank within partition (1,1,3). Null sort key last. |
 | `row_number` | same | Strict 1..n within partition after orderBy (nulls last, stable input order on ties). |
-| `cumsum` | `by`, `column`, `orderBy`, `as` | Running sum in orderBy order; **null source contributes 0**. Output `i64` if every non-null source is I64, else `f64` — decided once for the whole column, so value variants always match the declared dtype. First non-null row amount → first cell equals that amount. |
+| `cumsum` | `by`, `column`, `orderBy`, `as` | Running sum in orderBy order; **null source contributes 0**. Output `i64` if every non-null source is I64 **and every running sum fits i64** (integral sources accumulate exactly in i128; overflow promotes the whole column to `f64`), else `f64` — decided once for the whole column, so value variants always match the declared dtype. First non-null row amount → first cell equals that amount. |
 | `ewm` | `column`, `orderBy`, `as`, `alpha`; `by` optional (default whole table) | `y0 = x0` (first non-null); `y_t = (1-α)·y_{t-1} + α·x_t`. Null `x` leaves `y` unchanged; before first non-null → Null. Output `f64`. `alpha ∈ (0,1]`. |
 
 Shared: `as` matches `[A-Za-z_][A-Za-z0-9_]*` ≤64, no collision with existing
@@ -643,8 +643,8 @@ Flags: `--dataset-id` (required), `--output <path>` (required), `--format csv|xl
     multi-sheet.
   - `parquet` — type map inverse of ingest (i64→INT64, f64→DOUBLE, bool→BOOLEAN,
     utf8→STRING/BYTE_ARRAY). Round-trips through `ingest --format parquet`.
-    Empty tables write each column with its declared dataset dtype (never
-    all-Boolean).
+    Columns with no value evidence — empty tables and all-null columns —
+    write each column with its declared dataset dtype (never all-Boolean).
 - Unknown `--format` → `analysis/invalid-args: bad format … (csv|xlsx|parquet)` (exit 2).
 - Explicit `--format` wins over extension mismatch.
 

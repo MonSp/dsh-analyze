@@ -992,7 +992,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             type: 'string',
             description:
               'Optional file name (or workspace-relative path; the file name is kept). ' +
-              'Always written under .dsh-analyze/outputs/. Defaults to <datasetId>.csv.',
+              'Always written under .dsh-analyze/outputs/. Defaults to <datasetId> plus the extension implied by format (.csv / .xlsx / .parquet).',
           },
           format: {
             type: 'string',
@@ -1027,10 +1027,20 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
         const a = args as { datasetId: string; outPath?: string; format?: string }
         validateDatasetId(a.datasetId)
+        let fmt: string | undefined
+        if (a.format !== undefined && a.format !== null) {
+          fmt = typeof a.format === 'string' ? a.format.toLowerCase() : ''
+          if (!['csv', 'xlsx', 'parquet'].includes(fmt)) {
+            throw invalidArgs('format must be csv|xlsx|parquet')
+          }
+        }
+        // K4: the default file name follows the format (never xlsx/parquet
+        // bytes in a *.csv name).
+        const ext = fmt === 'xlsx' ? '.xlsx' : fmt === 'parquet' ? '.parquet' : '.csv'
         const outPath =
           typeof a.outPath === 'string' && a.outPath.trim()
             ? a.outPath.trim()
-            : `.dsh-analyze/outputs/${a.datasetId}.csv`
+            : `.dsh-analyze/outputs/${a.datasetId}${ext}`
         if (outPath.length > MAX_PATH_LEN) {
           const err = new Error('analysis/invalid-args: outPath too long') as Error & { code?: string }
           err.code = 'analysis/invalid-args'
@@ -1039,13 +1049,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         // Double-check destination stays in workspace before spawning CLI.
         resolveInWorkspace(ws, outPath)
         const cliArgs = ['export', '--dataset-id', a.datasetId, '--output', outPath]
-        if (a.format !== undefined && a.format !== null) {
-          const fmt = typeof a.format === 'string' ? a.format.toLowerCase() : ''
-          if (!['csv', 'xlsx', 'parquet'].includes(fmt)) {
-            throw invalidArgs('format must be csv|xlsx|parquet')
-          }
-          cliArgs.push('--format', fmt)
-        }
+        if (fmt) cliArgs.push('--format', fmt)
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },

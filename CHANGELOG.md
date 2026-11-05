@@ -27,11 +27,20 @@ renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
   Interval, Float16, Dictionary value type, …) are rejected with
   `analysis/invalid-args: parquet type not supported for column …` (exit 2)
   instead of being silently read as null.
-- `export --format parquet` on an empty table writes each column with its
-  declared dataset dtype instead of collapsing every column to Boolean.
+- `export --format parquet`: columns with no value evidence (empty tables,
+  all-null columns) write each column with its declared dataset dtype instead
+  of collapsing to Boolean.
 - `agg` `window` cumsum: declared dtype is decided once for the whole column
-  and shared by every partition, so value variants always match the schema
-  on mixed i64/f64 data.
+  and shared by every partition (mixed i64/f64 data), and integral overflow
+  promotes the whole column to `f64` — value variants always match the schema.
+- `agg` `window`: a `by` / `orderBy` key present with the wrong JSON type
+  (e.g. `"by":"acc"`) is `analysis/invalid-args` instead of being treated as
+  missing — ewm no longer silently computes a global window.
+- `corr` `pValue`: corrected the `ln_gamma` constant (`ln(2π)` → `½ln(2π)`)
+  so p-values match the documented Student-t / incomplete-beta formula;
+  closed-form reference tests added (df=1 exact identity, known table point).
+- `dataset_export`: the default `outPath` follows `format`
+  (`.xlsx` / `.parquet` / `.csv`) instead of always `.csv`.
 - `dataset_crosstab` render: third responses now surface `thirdTruncated`,
   per-table `truncated`, and `nullThirdCount`.
 - `--format` / `format` is case-insensitive on ingest and export (CLI and
@@ -39,6 +48,12 @@ renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
   exit-4 limit instead of `bad format`.
 - `export --format xlsx`: integers beyond 2^53 are written as text cells
   instead of silently losing precision as numbers.
+
+### Design notes
+
+Review findings are fixed against a unified design (K1 ground-truth tests for
+numeric helpers; K2 strict JSON shapes; K3 declared-dtype = value-variant
+invariant; K4 defaults follow the primary flag) — see the local feature doc.
 
 ## 0.1.9
 

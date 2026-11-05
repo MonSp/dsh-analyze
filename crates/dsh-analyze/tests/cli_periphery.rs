@@ -455,6 +455,45 @@ fn export_parquet_empty_table_keeps_schema_dtypes() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+/// K3: an all-null column has no value evidence either — export must honor
+/// the declared dtype (utf8 here), not collapse to Boolean.
+#[test]
+fn export_parquet_all_null_column_uses_declared_dtype() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let ws = temp_workspace();
+    write_file(&ws, "an.csv", "a,b\n1,\n2,\n3,\n");
+    let out = ingest(&ws, "an.csv", "ds_aabbccdd11223344");
+    assert!(out.contains("\"name\":\"b\",\"dtype\":\"utf8\""), "{out}");
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/an.parquet",
+            "--format",
+            "parquet",
+        ],
+    );
+    assert!(pq.contains("\"ok\":true"), "{pq}");
+
+    let file = fs::File::open(ws.join(".dsh-analyze/outputs/an.parquet")).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = builder.schema();
+    let b = schema.field_with_name("b").unwrap();
+    assert_eq!(
+        b.data_type(),
+        &arrow_schema::DataType::Utf8,
+        "all-null column should keep declared utf8, got {:?}",
+        b.data_type()
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
 /// `--format` is case-insensitive on ingest and export; `XLSX` hits the
 /// exit-4 limit (not `bad format`).
 #[test]

@@ -251,9 +251,12 @@ fn write_export_parquet(path: &Path, table: &crate::dataset::Table) -> Result<u6
     let mut arrays: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(table.columns.len());
     for (i, col) in table.columns.iter().enumerate() {
         let rows = &table.rows;
-        if rows.is_empty() {
-            // No values to infer from: honor the declared column dtype so
-            // empty exports don't collapse every column to Boolean.
+        // K3: no value evidence (empty table or all-null column) -> honor the
+        // declared column dtype. Never let "saw nothing" collapse to Boolean.
+        let has_non_null = rows
+            .iter()
+            .any(|r| matches!(r.get(i), Some(v) if !matches!(v, Value::Null)));
+        if !has_non_null {
             let dt = match col.dtype.as_str() {
                 "bool" => DataType::Boolean,
                 "i64" => DataType::Int64,
@@ -261,17 +264,16 @@ fn write_export_parquet(path: &Path, table: &crate::dataset::Table) -> Result<u6
                 _ => DataType::Utf8,
             };
             fields.push(Field::new(&col.name, dt.clone(), true));
+            let n = rows.len();
             match dt {
                 DataType::Boolean => {
-                    arrays.push(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())))
+                    arrays.push(Arc::new(BooleanArray::from(vec![None::<bool>; n])))
                 }
-                DataType::Int64 => {
-                    arrays.push(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())))
-                }
+                DataType::Int64 => arrays.push(Arc::new(Int64Array::from(vec![None::<i64>; n]))),
                 DataType::Float64 => {
-                    arrays.push(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())))
+                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>; n])))
                 }
-                _ => arrays.push(Arc::new(StringArray::from(Vec::<Option<String>>::new()))),
+                _ => arrays.push(Arc::new(StringArray::from(vec![None::<String>; n]))),
             }
             continue;
         }

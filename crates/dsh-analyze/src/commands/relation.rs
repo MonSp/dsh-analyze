@@ -206,7 +206,7 @@ fn ln_gamma(z: f64) -> f64 {
         x += g / (z + i as f64);
     }
     let t = z + 7.5;
-    (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + x.ln()
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + x.ln()
 }
 
 pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -817,4 +817,62 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
         third_truncated,
         null_third_count
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K1: numeric helpers ship with ground-truth assertions, not range checks.
+
+    #[test]
+    fn ln_gamma_matches_known_values() {
+        // Independent reference values (math.lgamma, double precision).
+        for (z, want) in [
+            (0.5, 0.5723649429247001),  // ln(sqrt(pi))
+            (1.5, -0.1207822376352452), // ln(sqrt(pi)/2)
+            (2.0, 0.0),
+            (3.5, 1.2009736023470738),
+            (10.0, 12.801827480081469),
+        ] {
+            let got = ln_gamma(z);
+            assert!((got - want).abs() < 1e-12, "ln_gamma({z}) = {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn p_value_df1_closed_form() {
+        // For df = 1 (n = 3) the two-sided p-value is exactly (2/pi)*atan(1/|t|),
+        // t = r/sqrt(1-r^2). Validates the whole beta pipeline independently.
+        for r in [0.1f64, 0.3, 0.5, 0.8, 0.9, 0.99, -0.5, -0.9] {
+            let t = r.abs() / (1.0 - r * r).sqrt();
+            let want = 2.0 / std::f64::consts::PI * (1.0 / t).atan();
+            let got = p_value_from_r(Some(r), 3).expect("p");
+            assert!((got - want).abs() < 1e-12, "r={r}: p={got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn p_value_reference_points() {
+        // Independent numeric-integration reference (two-sided t tail, df=3).
+        let got = p_value_from_r(Some(0.9), 5).expect("p");
+        assert!((got - 0.03738571).abs() < 1e-6, "r=0.9 n=5: p={got}");
+
+        let got = p_value_from_r(Some(0.9), 50).expect("p");
+        assert!(got < 1e-15, "r=0.9 n=50: p={got}");
+    }
+
+    #[test]
+    fn p_value_boundaries() {
+        assert_eq!(p_value_from_r(None, 10), None);
+        assert_eq!(p_value_from_r(Some(0.5), 2), None); // n < 3
+        assert_eq!(p_value_from_r(Some(1.0), 5), Some(0.0));
+        assert_eq!(p_value_from_r(Some(-1.0), 5), Some(0.0));
+        let p0 = p_value_from_r(Some(0.0), 5).expect("p");
+        assert!((p0 - 1.0).abs() < 1e-12, "r=0 -> p=1, got {p0}");
+        // symmetric in sign(r)
+        let a = p_value_from_r(Some(0.7), 12).expect("p");
+        let b = p_value_from_r(Some(-0.7), 12).expect("p");
+        assert!((a - b).abs() < 1e-15);
+    }
 }

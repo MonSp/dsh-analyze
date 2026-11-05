@@ -1774,6 +1774,17 @@ test('R-23: dataset_export accepts format csv|xlsx|parquet; rejects bad format',
       format: 'xlsx',
     })
     assert.equal(xlsx.format, 'xlsx')
+    // K4: default outPath follows the format (no xlsx/parquet bytes in *.csv).
+    const autoXlsx = await defs.dataset_export.execute({
+      datasetId: ing.datasetId,
+      format: 'xlsx',
+    })
+    assert.match(String(autoXlsx.outputPath), /\.xlsx$/)
+    const autoParquet = await defs.dataset_export.execute({
+      datasetId: ing.datasetId,
+      format: 'parquet',
+    })
+    assert.match(String(autoParquet.outputPath), /\.parquet$/)
     await assert.rejects(
       () => defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'xml' }),
       /format must be csv\|xlsx\|parquet/,
