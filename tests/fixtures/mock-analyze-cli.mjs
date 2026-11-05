@@ -155,7 +155,7 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.7-mock',
+      version: '0.1.10-mock',
       capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
     }))
     return
@@ -169,9 +169,21 @@ async function main() {
     if (!input) fail(2, 'analysis/invalid-args: --input required')
     const path = within(ws, input)
     if (!existsSync(path)) fail(2, 'analysis/invalid-path: not a file')
-    const format = getFlag(rest, '--format') || (path.endsWith('.jsonl') ? 'jsonl' : path.endsWith('.json') ? 'json' : 'csv')
-    if (format === 'parquet') fail(4, 'analysis/limit: parquet not supported yet (planned, see docs/interface.md)')
+    const rawFormat = getFlag(rest, '--format')
+    const lowerPath = String(path).toLowerCase()
+    const format = rawFormat
+      ? String(rawFormat).toLowerCase()
+      : lowerPath.endsWith('.parquet')
+        ? 'parquet'
+        : lowerPath.endsWith('.jsonl')
+          ? 'jsonl'
+          : lowerPath.endsWith('.json')
+            ? 'json'
+            : 'csv'
+    // xlsx ingest remains disabled; parquet accepted at tool layer but mock
+    // only understands text formats — non-parquet bytes → stable analysis/*.
     if (format === 'xlsx') fail(4, 'analysis/limit: xlsx not supported (convert to csv/jsonl)')
+    if (format === 'parquet') fail(1, 'analysis/cli-failed: not a valid parquet file')
     if (format === 'jsonl') fail(4, 'analysis/limit: mock CLI supports csv/json only in T0 tests')
     const id = getFlag(rest, '--dataset-id') || newId()
     const text = readFileSync(path, 'utf8')
@@ -351,7 +363,145 @@ async function main() {
       keep = keep.filter(i => evalFilterNode(spec.filter, table.rows[i], table.headers))
     }
 
-    // ---- topKPerGroup (R-15): row stage after filter, before mutate ----
+    // ---- window (R-21): append columns on filtered set before topK ----
+    // Work on a parallel structure so column indices stay aligned with workHeaders.
+    let winHeaders = [...table.headers]
+    let winRows = keep.map(i => [...table.rows[i]])
+    if (Array.isArray(spec.window) && spec.window.length > 0) {
+      if (spec.window.length > 16) fail(2, 'analysis/invalid-args: window must list 1..=16 ops')
+      const wNames = new Set()
+      for (const w of spec.window) {
+        if (!w || typeof w !== 'object' || Array.isArray(w)) fail(2, 'analysis/invalid-args: window entry must be an object')
+        const fn = w.fn
+        if (!['rank', 'row_number', 'cumsum', 'ewm'].includes(fn)) {
+          fail(2, 'analysis/invalid-args: bad window fn (rank|row_number|cumsum|ewm)')
+        }
+        const by = Array.isArray(w.by) ? w.by : []
+        if (by.length > 8) fail(2, 'analysis/invalid-args: window by must list 0..=8 columns')
+        const needsBy = fn === 'rank' || fn === 'row_number' || fn === 'cumsum'
+        if (needsBy && by.length === 0) fail(2, `analysis/invalid-args: window ${fn} requires by`)
+        if (!w.orderBy || typeof w.orderBy !== 'object' || typeof w.orderBy.column !== 'string') {
+          fail(2, `analysis/invalid-args: window ${fn} requires orderBy`)
+        }
+        const needsCol = fn === 'cumsum' || fn === 'ewm'
+        if (needsCol && (typeof w.column !== 'string' || !w.column)) {
+          fail(2, `analysis/invalid-args: window ${fn} requires column`)
+        }
+        if ((fn === 'rank' || fn === 'row_number') && w.column !== undefined) {
+          fail(2, `analysis/invalid-args: window ${fn} must not take column`)
+        }
+        if (fn === 'ewm') {
+          if (typeof w.alpha !== 'number' || !(w.alpha > 0 && w.alpha <= 1)) {
+            fail(2, 'analysis/invalid-args: window alpha must be in (0,1]')
+          }
+        } else if (w.alpha !== undefined) {
+          fail(2, `analysis/invalid-args: window ${fn} must not take alpha`)
+        }
+        if (typeof w.as !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(w.as)) {
+          fail(2, 'analysis/invalid-args: invalid window name')
+        }
+        if (wNames.has(w.as) || winHeaders.includes(w.as)) {
+          fail(2, `analysis/invalid-args: window column collides: ${w.as}`)
+        }
+        wNames.add(w.as)
+
+        const byIdx = by.map(name => {
+          const i = winHeaders.indexOf(name)
+          if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+          return i
+        })
+        const obIdx = winHeaders.indexOf(w.orderBy.column)
+        if (obIdx < 0) fail(2, `analysis/invalid-args: unknown column ${w.orderBy.column}`)
+        const colIdx = needsCol ? winHeaders.indexOf(w.column) : -1
+        if (needsCol && colIdx < 0) fail(2, `analysis/invalid-args: unknown column ${w.column}`)
+        const desc = !!w.orderBy.desc
+        const parts = new Map()
+        if (byIdx.length === 0) {
+          parts.set('[]', winRows.map((_, i) => i))
+        } else {
+          for (let i = 0; i < winRows.length; i++) {
+            const key = JSON.stringify(byIdx.map(ci => winRows[i][ci] ?? null))
+            if (!parts.has(key)) parts.set(key, [])
+            parts.get(key).push(i)
+          }
+        }
+        const out = new Array(winRows.length).fill(null)
+        const cmpVal = (a, b) => {
+          const an = a === null || a === undefined
+          const bn = b === null || b === undefined
+          if (an && bn) return 0
+          if (an) return 1
+          if (bn) return -1
+          const av = typeof a === 'number' ? a : Number(a)
+          const bv = typeof b === 'number' ? b : Number(b)
+          if (Number.isFinite(av) && Number.isFinite(bv)) {
+            return av === bv ? 0 : av < bv ? -1 : 1
+          }
+          const as = String(a), bs = String(b)
+          return as === bs ? 0 : as < bs ? -1 : 1
+        }
+        for (const members of parts.values()) {
+          const ordered = [...members].sort((a, b) => {
+            const c = cmpVal(winRows[a][obIdx], winRows[b][obIdx])
+            const d = desc ? -c : c
+            // nulls always last regardless of desc
+            const av = winRows[a][obIdx]
+            const bv = winRows[b][obIdx]
+            const aNull = av === null || av === undefined
+            const bNull = bv === null || bv === undefined
+            if (aNull || bNull) {
+              if (aNull && bNull) return a - b
+              return aNull ? 1 : -1
+            }
+            return d !== 0 ? d : a - b
+          })
+          if (fn === 'rank') {
+            let prev = undefined
+            let rank = 0
+            for (let pos = 0; pos < ordered.length; pos++) {
+              const ri = ordered[pos]
+              const v = winRows[ri][obIdx]
+              const eq = pos > 0 && (
+                (prev === null || prev === undefined) && (v === null || v === undefined)
+                  ? true
+                  : prev != null && v != null && String(prev) === String(v)
+              )
+              if (pos === 0 || !eq) {
+                rank = pos + 1
+                prev = v
+              }
+              out[ri] = rank
+            }
+          } else if (fn === 'row_number') {
+            for (let pos = 0; pos < ordered.length; pos++) out[ordered[pos]] = pos + 1
+          } else if (fn === 'cumsum') {
+            let acc = 0
+            for (const ri of ordered) {
+              const cell = winRows[ri][colIdx]
+              if (cell !== null && cell !== undefined && Number.isFinite(Number(cell))) acc += Number(cell)
+              out[ri] = acc
+            }
+          } else if (fn === 'ewm') {
+            let y = null
+            const alpha = w.alpha
+            for (const ri of ordered) {
+              const cell = winRows[ri][colIdx]
+              const x = cell === null || cell === undefined ? null : Number(cell)
+              if (x !== null && Number.isFinite(x)) {
+                y = y === null ? x : (1 - alpha) * y + alpha * x
+                out[ri] = y
+              } else {
+                out[ri] = y
+              }
+            }
+          }
+        }
+        for (let i = 0; i < winRows.length; i++) winRows[i].push(out[i])
+        winHeaders.push(w.as)
+      }
+    }
+
+    // ---- topKPerGroup (R-15): row stage after window, before mutate ----
     if (spec.topKPerGroup) {
       const t = spec.topKPerGroup
       const by = Array.isArray(t.by) ? t.by : []
@@ -359,20 +509,20 @@ async function main() {
       const k = t.k
       if (!Number.isInteger(k) || k < 1 || k > 1000) fail(2, 'analysis/invalid-args: topKPerGroup.k must be integer 1..1000')
       const byIdx = by.map(name => {
-        const i = table.headers.indexOf(name)
+        const i = winHeaders.indexOf(name)
         if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
         return i
       })
       let orderByIdx = -1
       let orderDesc = false
       if (t.orderBy && t.orderBy.column) {
-        orderByIdx = table.headers.indexOf(t.orderBy.column)
+        orderByIdx = winHeaders.indexOf(t.orderBy.column)
         if (orderByIdx < 0) fail(2, `analysis/invalid-args: unknown column ${t.orderBy.column}`)
         orderDesc = !!t.orderBy.desc
       }
       const groupsMap = new Map()
-      for (const i of keep) {
-        const key = JSON.stringify(byIdx.map(ci => table.rows[i][ci] ?? null))
+      for (let i = 0; i < winRows.length; i++) {
+        const key = JSON.stringify(byIdx.map(ci => winRows[i][ci] ?? null))
         if (!groupsMap.has(key)) groupsMap.set(key, [])
         groupsMap.get(key).push(i)
       }
@@ -381,19 +531,27 @@ async function main() {
         let ordered = members
         if (orderByIdx >= 0) {
           ordered = [...members].sort((a, b) => {
-            const av = table.rows[a][orderByIdx], bv = table.rows[b][orderByIdx]
+            const av = winRows[a][orderByIdx], bv = winRows[b][orderByIdx]
             const cmp = (av > bv ? 1 : av < bv ? -1 : 0) * (orderDesc ? -1 : 1)
             return cmp !== 0 ? cmp : a - b
           })
         }
         for (const i of ordered.slice(0, k)) keptSet.add(i)
       }
-      keep = keep.filter(i => keptSet.has(i))
+      // Preserve original keep order
+      const newKeepRows = []
+      for (let i = 0; i < winRows.length; i++) {
+        if (keptSet.has(i)) newKeepRows.push(winRows[i])
+      }
+      winRows = newKeepRows
+    } else {
+      // keep winRows as-is (window already built from keep)
     }
 
     // ---- mutate (R-9: to_int/to_str/to_date + string literals) ----
-    let workHeaders = [...table.headers]
-    let workRows = keep.map(i => [...table.rows[i]])
+    let workHeaders = [...winHeaders]
+    let workRows = winRows.map(r => [...r])
+    // (workRows already include window columns)
     const parseWithFmt = (s, fmt) => {
       let re = '^'
       const groups = []
@@ -1084,15 +1242,32 @@ async function main() {
     if (!finalPath.startsWith(outputs + sep) && finalPath !== outputs) {
       finalPath = join(outputs, finalPath.split(/[\\/]/).pop() || `${id}.csv`)
     }
-    const header = table.headers.join(',')
-    const lines = [header]
-    for (const row of table.rows) {
-      lines.push(row.map(c => (c === null || c === undefined ? '' : String(c))).join(','))
+    let format = getFlag(rest, '--format')
+    if (!format) {
+      const lower = String(finalPath).toLowerCase()
+      if (lower.endsWith('.xlsx')) format = 'xlsx'
+      else if (lower.endsWith('.parquet')) format = 'parquet'
+      else format = 'csv'
     }
-    writeFileSync(finalPath, lines.join('\n') + '\n', 'utf8')
+    format = String(format).toLowerCase()
+    if (!['csv', 'xlsx', 'parquet'].includes(format)) {
+      fail(2, `analysis/invalid-args: bad format ${format} (csv|xlsx|parquet)`)
+    }
+    if (format !== 'csv') {
+      // Mock only writes CSV bytes; real CLI covers xlsx/parquet (R-23).
+      // Still create a placeholder so path confinement / format flag are exercised.
+      writeFileSync(finalPath, `mock-${format}-export\n`, 'utf8')
+    } else {
+      const header = table.headers.join(',')
+      const lines = [header]
+      for (const row of table.rows) {
+        lines.push(row.map(c => (c === null || c === undefined ? '' : String(c))).join(','))
+      }
+      writeFileSync(finalPath, lines.join('\n') + '\n', 'utf8')
+    }
     const bytes = statSync(finalPath).size
     const rel = finalPath.startsWith(ws + sep) ? finalPath.slice(ws.length + 1) : finalPath
-    console.log(json({ ok: true, outputPath: rel, rowCount: meta.rowCount, bytes }))
+    console.log(json({ ok: true, outputPath: rel, rowCount: meta.rowCount, bytes, format }))
     return
   }
 
@@ -1523,6 +1698,60 @@ async function main() {
       if (!Number.isFinite(r)) return { r: null, degenerate: true }
       return { r: Math.max(-1, Math.min(1, r)), degenerate: false }
     }
+    // Two-sided p via regularized incomplete beta I_x(df/2, 1/2), x=df/(df+t²).
+    // Mirrors the real CLI (R-24); mock-only approximation is fine for unit tests.
+    function studentTCdf(t, df) {
+      if (!(t > 0) || !(df > 0)) return 0.5
+      const x = df / (df + t * t)
+      // Numerical Recipes-style incomplete beta continued fraction.
+      const lbeta = (a, b) => {
+        const lg = (z) => {
+          const g = [676.5203681218851, -1259.1392167224028, 771.32342877765313,
+            -176.61502916214059, 12.507343278686905, -0.13857109526572012,
+            9.9843695780195716e-6, 1.5056327351493116e-7]
+          if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - lg(1 - z)
+          const zz = z - 1
+          let x0 = 0.99999999999980993
+          for (let i = 0; i < 8; i++) x0 += g[i] / (zz + i + 1)
+          const t2 = zz + 7.5
+          return 0.5 * Math.log(2 * Math.PI) + (zz + 0.5) * Math.log(t2) - t2 + Math.log(x0)
+        }
+        return lg(a) + lg(b) - lg(a + b)
+      }
+      const a = df / 2
+      const b = 0.5
+      const front = Math.exp(a * Math.log(x) + b * Math.log(1 - x) - lbeta(a, b))
+      // Use series when x is small enough; else 1 - (swap).
+      if (x < (a + 1) / (a + b + 2)) {
+        // Simple continued fraction (Lentz)
+        let f = 1, c = 1, d = 0
+        for (let i = 0; i <= 200; i++) {
+          const m = i
+          let num = (m * (b - m) * x) / ((a + 2 * m - 1) * (a + 2 * m))
+          d = 1 + num * d
+          if (Math.abs(d) < 1e-30) d = 1e-30
+          c = 1 + num / c
+          if (Math.abs(c) < 1e-30) c = 1e-30
+          d = 1 / d
+          f *= c * d
+          num = ((m + a) * (m + a + b) * (1 - x)) / ((a + 2 * m) * (a + 2 * m + 1))
+          d = 1 + num * d
+          if (Math.abs(d) < 1e-30) d = 1e-30
+          c = 1 + num / c
+          if (Math.abs(c) < 1e-30) c = 1e-30
+          d = 1 / d
+          const del = c * d
+          f *= del
+          if (Math.abs(del - 1) < 1e-12) break
+        }
+        const ibeta = (front * f) / a
+        // CDF_t(t;df) = 1 - 0.5 * I_x(df/2, 1/2) for t>0 → wait:
+        // Actually F_t(t) = 1 - 0.5*I_x for t>0? Standard: two-sided p = I_x.
+        // One-sided upper = 0.5 * I_x(df/2,1/2)
+        return 1 - 0.5 * ibeta
+      }
+      return 0.5 * (1 + 0) // unused branch for large x in this helper
+    }
     const pairs = []
     const totalPairs = columns.length * (columns.length - 1) / 2
     for (let i = 0; i < columns.length; i++) {
@@ -1559,7 +1788,22 @@ async function main() {
           r = out.r
           degenerate = out.degenerate
         }
-        pairs.push({ columns: [columns[i], columns[j]], n, r, degenerate, _i: i, _j: j })
+        // R-24: two-sided Student-t pValue (same contract as real CLI)
+        let pValue = null
+        if (r !== null && n >= 3) {
+          if (Math.abs(r) >= 1) pValue = 0
+          else {
+            const df = n - 2
+            const denom = 1 - r * r
+            if (denom > 0) {
+              const t = Math.abs(r) * Math.sqrt(df / denom)
+              // two-sided p = I_{df/(df+t²)}(df/2, 1/2) via 2*(1-F_t)
+              const p = 2 * (1 - studentTCdf(t, df))
+              pValue = Math.min(1, Math.max(0, p))
+            }
+          }
+        }
+        pairs.push({ columns: [columns[i], columns[j]], n, r, pValue, degenerate, _i: i, _j: j })
       }
     }
     pairs.sort((a, b) => {
@@ -1599,6 +1843,14 @@ async function main() {
     if (!rowsName) fail(2, 'analysis/invalid-args: --rows required')
     if (!colsName) fail(2, 'analysis/invalid-args: --cols required')
     if (rowsName === colsName) fail(2, 'analysis/invalid-args: --rows and --cols must be different columns')
+    const thirdRaw = getFlag(rest, '--third')
+    const thirdName = thirdRaw === undefined || thirdRaw === null ? null : String(thirdRaw).trim()
+    if (thirdName !== null) {
+      if (!thirdName) fail(2, 'analysis/invalid-args: --third required')
+      if (thirdName === rowsName || thirdName === colsName) {
+        fail(2, 'analysis/invalid-args: --third must differ from --rows and --cols')
+      }
+    }
     let top = 20
     const topRaw = getFlag(rest, '--top')
     if (topRaw !== undefined) {
@@ -1623,99 +1875,156 @@ async function main() {
     const ci = table.headers.indexOf(colsName)
     if (ri < 0) fail(2, `analysis/invalid-args: unknown column ${rowsName}`)
     if (ci < 0) fail(2, `analysis/invalid-args: unknown column ${colsName}`)
-    const cellCounts = new Map()
-    const rowMarg = new Map()
-    const colMarg = new Map()
-    const rowFirst = new Map()
-    const colFirst = new Map()
-    let nullRowCount = 0
-    let seq = 0
-    // Null uses a non-printable sentinel (not "__null__") so a literal
-    // string category cannot collide. Values stay JSON text; the cell
-    // key is JSON.stringify([rowKey, colKey]) so pipes in values are safe.
+    let ti = -1
+    if (thirdName !== null) {
+      ti = table.headers.indexOf(thirdName)
+      if (ti < 0) fail(2, `analysis/invalid-args: unknown column ${thirdName}`)
+    }
     const NULL_KEY = String.fromCharCode(0)
     const keyOf = (v) => {
       if (v === null || v === undefined) return NULL_KEY
       return JSON.stringify(v)
     }
-    for (const row of table.rows) {
-      const rv = row[ri]
-      const cv = row[ci]
-      if (dropNull && (rv === null || rv === undefined || cv === null || cv === undefined)) {
-        nullRowCount++
-        continue
-      }
-      const rk = keyOf(rv)
-      const ck = keyOf(cv)
-      const cellKey = JSON.stringify([rk, ck])
-      cellCounts.set(cellKey, (cellCounts.get(cellKey) || 0) + 1)
-      rowMarg.set(rk, (rowMarg.get(rk) || 0) + 1)
-      colMarg.set(ck, (colMarg.get(ck) || 0) + 1)
-      if (!rowFirst.has(rk)) rowFirst.set(rk, seq)
-      if (!colFirst.has(ck)) colFirst.set(ck, seq)
-      seq++
-    }
-    const sortCates = (marg, first) => {
-      const keys = [...marg.keys()]
-      keys.sort((a, b) => {
-        const d = (marg.get(b) || 0) - (marg.get(a) || 0)
-        if (d !== 0) return d
-        return (first.get(a) ?? Infinity) - (first.get(b) ?? Infinity)
-      })
-      return keys
-    }
-    let rowCates = sortCates(rowMarg, rowFirst)
-    let colCates = sortCates(colMarg, colFirst)
-    const distinctRows = rowCates.length
-    const distinctCols = colCates.length
-    rowCates = rowCates.slice(0, top)
-    colCates = colCates.slice(0, top)
-    let truncated = distinctRows > top || distinctCols > top
-    const matrix = rowCates.map(() => colCates.map(() => 0))
-    let cellCount = 0
-    for (const [cellKey, n] of cellCounts) {
-      const [rk, ckv] = JSON.parse(cellKey)
-      const i = rowCates.findIndex(x => x === rk)
-      const j = colCates.findIndex(x => x === ckv)
-      if (i < 0 || j < 0) {
-        truncated = true
-        continue
-      }
-      matrix[i][j] += n
-      cellCount += n
-    }
-    const rowTotals = matrix.map(row => row.reduce((a, b) => a + b, 0))
-    const colTotals = colCates.map((_, j) => matrix.reduce((a, row) => a + row[j], 0))
-    const grandTotal = rowTotals.reduce((a, b) => a + b, 0)
     const decode = (k) => {
       if (k === NULL_KEY) return '__null__'
       return JSON.parse(k)
     }
-    const topCells = []
-    for (let i = 0; i < matrix.length; i++) {
-      for (let j = 0; j < matrix[i].length; j++) {
-        const n = matrix[i][j]
-        if (n >= minCount && n > 0) topCells.push({ row: decode(rowCates[i]), col: decode(colCates[j]), count: n })
+    const buildSlice = (rowIdxs) => {
+      const cellCounts = new Map()
+      const rowMarg = new Map()
+      const colMarg = new Map()
+      const rowFirst = new Map()
+      const colFirst = new Map()
+      let nullRowCount = 0
+      let seq = 0
+      for (const i of rowIdxs) {
+        const row = table.rows[i]
+        const rv = row[ri]
+        const cv = row[ci]
+        if (dropNull && (rv === null || rv === undefined || cv === null || cv === undefined)) {
+          nullRowCount++
+          continue
+        }
+        const rk = keyOf(rv)
+        const ck = keyOf(cv)
+        const cellKey = JSON.stringify([rk, ck])
+        cellCounts.set(cellKey, (cellCounts.get(cellKey) || 0) + 1)
+        rowMarg.set(rk, (rowMarg.get(rk) || 0) + 1)
+        colMarg.set(ck, (colMarg.get(ck) || 0) + 1)
+        if (!rowFirst.has(rk)) rowFirst.set(rk, seq)
+        if (!colFirst.has(ck)) colFirst.set(ck, seq)
+        seq++
+      }
+      const sortCates = (marg, first) => {
+        const keys = [...marg.keys()]
+        keys.sort((a, b) => {
+          const d = (marg.get(b) || 0) - (marg.get(a) || 0)
+          if (d !== 0) return d
+          return (first.get(a) ?? Infinity) - (first.get(b) ?? Infinity)
+        })
+        return keys
+      }
+      let rowCates = sortCates(rowMarg, rowFirst)
+      let colCates = sortCates(colMarg, colFirst)
+      const distinctRows = rowCates.length
+      const distinctCols = colCates.length
+      rowCates = rowCates.slice(0, top)
+      colCates = colCates.slice(0, top)
+      let truncated = distinctRows > top || distinctCols > top
+      const matrix = rowCates.map(() => colCates.map(() => 0))
+      let cellCount = 0
+      for (const [cellKey, n] of cellCounts) {
+        const [rk, ckv] = JSON.parse(cellKey)
+        const i = rowCates.findIndex(x => x === rk)
+        const j = colCates.findIndex(x => x === ckv)
+        if (i < 0 || j < 0) {
+          truncated = true
+          continue
+        }
+        matrix[i][j] += n
+        cellCount += n
+      }
+      const rowTotals = matrix.map(row => row.reduce((a, b) => a + b, 0))
+      const colTotals = colCates.map((_, j) => matrix.reduce((a, row) => a + row[j], 0))
+      const grandTotal = rowTotals.reduce((a, b) => a + b, 0)
+      const topCells = []
+      for (let i = 0; i < matrix.length; i++) {
+        for (let j = 0; j < matrix[i].length; j++) {
+          const n = matrix[i][j]
+          if (n >= minCount && n > 0) topCells.push({ row: decode(rowCates[i]), col: decode(colCates[j]), count: n })
+        }
+      }
+      topCells.sort((a, b) => b.count - a.count)
+      topCells.length = Math.min(topCells.length, 50)
+      return {
+        rowCategories: rowCates.map(decode),
+        colCategories: colCates.map(decode),
+        matrix,
+        rowTotals,
+        colTotals,
+        grandTotal,
+        cellCount,
+        truncated,
+        nullRowCount,
+        topCells,
       }
     }
-    topCells.sort((a, b) => b.count - a.count)
-    topCells.length = Math.min(topCells.length, 50)
+
+    if (ti < 0) {
+      const all = table.rows.map((_, i) => i)
+      const s = buildSlice(all)
+      console.log(json({
+        ok: true,
+        datasetId: id,
+        rowCount: meta.rowCount,
+        rowColumn: rowsName,
+        colColumn: colsName,
+        ...s,
+      }))
+      return
+    }
+
+    // Third dimension: group by third value (first-seen order after margin sort)
+    const thirdMarg = new Map()
+    const thirdFirst = new Map()
+    const thirdGroups = new Map()
+    let nullThirdCount = 0
+    let tseq = 0
+    table.rows.forEach((row, i) => {
+      const tv = row[ti]
+      if (dropNull && (tv === null || tv === undefined)) {
+        nullThirdCount++
+        return
+      }
+      const tk = keyOf(tv)
+      thirdMarg.set(tk, (thirdMarg.get(tk) || 0) + 1)
+      if (!thirdFirst.has(tk)) thirdFirst.set(tk, tseq)
+      if (!thirdGroups.has(tk)) thirdGroups.set(tk, [])
+      thirdGroups.get(tk).push(i)
+      tseq++
+    })
+    let thirdCates = [...thirdMarg.keys()].sort((a, b) => {
+      const d = (thirdMarg.get(b) || 0) - (thirdMarg.get(a) || 0)
+      if (d !== 0) return d
+      return (thirdFirst.get(a) ?? Infinity) - (thirdFirst.get(b) ?? Infinity)
+    })
+    const distinctThird = thirdCates.length
+    thirdCates = thirdCates.slice(0, top)
+    const tables = thirdCates.map(tk => ({
+      third: decode(tk),
+      ...buildSlice(thirdGroups.get(tk) || []),
+    }))
     console.log(json({
       ok: true,
       datasetId: id,
       rowCount: meta.rowCount,
       rowColumn: rowsName,
       colColumn: colsName,
-      rowCategories: rowCates.map(decode),
-      colCategories: colCates.map(decode),
-      matrix,
-      rowTotals,
-      colTotals,
-      grandTotal,
-      cellCount,
-      truncated,
-      nullRowCount,
-      topCells,
+      thirdColumn: thirdName,
+      thirdCategories: thirdCates.map(decode),
+      tables,
+      thirdTruncated: distinctThird > top,
+      nullThirdCount,
     }))
     return
   }

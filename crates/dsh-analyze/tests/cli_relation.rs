@@ -439,7 +439,7 @@ fn version_capabilities_include_corr_crosstab() {
         assert!(out.status.success(), "version failed");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(out.contains("\"0.1.7\""), "got: {out}");
+    assert!(out.contains("\"0.1.10\""), "got: {out}");
     for tok in [
         "\"ingest\"",
         "\"head\"",
@@ -833,6 +833,141 @@ fn corr_df_zero_when_n_below_two() {
     );
     assert!(out.contains("\"n\":1"), "got: {out}");
     assert!(out.contains("\"df\":0"), "n<2 must give df=0: {out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn corr_pvalue_significant_and_null_when_r_null() {
+    let ws = temp_workspace();
+    // Strong linear n=50 → tiny p; independent-ish noise → larger p.
+    let mut body = String::from("x,y\n");
+    for i in 0..50i64 {
+        body.push_str(&format!("{i},{}\n", 2 * i + (i % 3)));
+    }
+    write_csv(&ws, "lin.csv", &body);
+    run_ok(
+        &ws,
+        &["ingest", "--input", "data/lin.csv", "--dataset-id", "ds_aabbccdd11223344"],
+    );
+    let out = run_ok(
+        &ws,
+        &["corr", "--dataset-id", "ds_aabbccdd11223344", "--columns", "x,y"],
+    );
+    assert!(out.contains("\"pValue\":"), "pValue field required: {out}");
+    let p = json_f64_field(&out, "pValue").expect("pValue");
+    assert!(p < 1e-6, "linear n=50 should be highly significant, p={p}\n{out}");
+
+    // r null (constant y) → pValue null
+    write_csv(&ws, "const.csv", "x,y\n1,5\n2,5\n3,5\n");
+    run_ok(
+        &ws,
+        &["ingest", "--input", "data/const.csv", "--dataset-id", "ds_aabbccdd11223355"],
+    );
+    let out2 = run_ok(
+        &ws,
+        &["corr", "--dataset-id", "ds_aabbccdd11223355", "--columns", "x,y"],
+    );
+    assert!(out2.contains("\"r\":null"), "got: {out2}");
+    assert!(out2.contains("\"pValue\":null"), "p null when r null: {out2}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn crosstab_third_returns_tables_and_unknown_names_column() {
+    let ws = temp_workspace();
+    write_csv(
+        &ws,
+        "t.csv",
+        "region,channel,month,n\nN1,app,2026-01,2\nN1,app,2026-02,3\nN1,web,2026-01,1\nS1,app,2026-01,4\n",
+    );
+    run_ok(
+        &ws,
+        &["ingest", "--input", "data/t.csv", "--dataset-id", "ds_aabbccdd11223344"],
+    );
+
+    // Without third: legacy flat shape
+    let flat = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "region",
+            "--cols",
+            "channel",
+        ],
+    );
+    assert!(flat.contains("\"matrix\":["), "legacy shape: {flat}");
+    assert!(!flat.contains("\"tables\":["), "no tables without third: {flat}");
+
+    // With third: tables array
+    let out = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "region",
+            "--cols",
+            "channel",
+            "--third",
+            "month",
+        ],
+    );
+    assert!(out.contains("\"thirdColumn\":\"month\""), "got: {out}");
+    assert!(out.contains("\"tables\":["), "got: {out}");
+    assert!(out.contains("\"third\":\"2026-01\"") || out.contains("\"third\":\"2026-02\""), "got: {out}");
+    // Top-level shape uses tables[]; flat matrix key is not a sibling of thirdColumn.
+    // (tables[].matrix is nested and expected.)
+    let third_key = out.find("\"thirdColumn\"").unwrap();
+    let tables_key = out.find("\"tables\":[").expect("tables after thirdColumn");
+    assert!(tables_key > third_key, "tables must follow thirdColumn: {out}");
+    // No top-level "rowCategories" before tables (legacy flat shape).
+    let before_tables = &out[..tables_key];
+    assert!(
+        !before_tables.contains("\"rowCategories\":"),
+        "legacy flat rowCategories must be omitted: {out}"
+    );
+
+    // Unknown third column names the column
+    let err = run_fail(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "region",
+            "--cols",
+            "channel",
+            "--third",
+            "nope",
+        ],
+        2,
+    );
+    assert!(err.contains("unknown column nope"), "stderr={err}");
+
+    // third equal to rows rejected
+    let err2 = run_fail(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "region",
+            "--cols",
+            "channel",
+            "--third",
+            "region",
+        ],
+        2,
+    );
+    assert!(err2.contains("--third must differ"), "stderr={err2}");
 
     let _ = fs::remove_dir_all(&ws);
 }

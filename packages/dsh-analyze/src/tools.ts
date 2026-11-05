@@ -436,16 +436,94 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
   const obj = parsed as Record<string, unknown>
   const knownSpecKeys = new Set([
     'select', 'filter', 'mutate', 'groupBy', 'aggs', 'orderBy', 'limit',
-    'having', 'topKPerGroup',
+    'having', 'topKPerGroup', 'window',
   ])
   for (const key of Object.keys(obj)) {
     if (!knownSpecKeys.has(key)) {
       throw invalidArgs(`unknown spec key ${key}`)
     }
   }
-  for (const key of ['select', 'mutate', 'groupBy', 'aggs', 'orderBy']) {
+  for (const key of ['select', 'mutate', 'groupBy', 'aggs', 'orderBy', 'window']) {
     if (obj[key] !== undefined && !Array.isArray(obj[key])) {
       throw invalidArgs(`${key} must be an array`)
+    }
+  }
+  if (Array.isArray(obj.window)) {
+    const wOps = obj.window as unknown[]
+    if (wOps.length > 16) {
+      throw invalidArgs('window must list 1..=16 ops')
+    }
+    const wNames = new Set<string>()
+    for (const w of wOps) {
+      if (!w || typeof w !== 'object' || Array.isArray(w)) {
+        throw invalidArgs('window entry must be an object')
+      }
+      const wo = w as Record<string, unknown>
+      for (const k of Object.keys(wo)) {
+        if (!['fn', 'by', 'orderBy', 'column', 'alpha', 'as'].includes(k)) {
+          throw invalidArgs(`unknown window key ${k}`)
+        }
+      }
+      const fn = wo.fn
+      if (typeof fn !== 'string' || !['rank', 'row_number', 'cumsum', 'ewm'].includes(fn)) {
+        throw invalidArgs('bad window fn (rank|row_number|cumsum|ewm)')
+      }
+      const by = wo.by
+      let byList: string[] = []
+      if (by !== undefined) {
+        // K2: wrong JSON shape is invalid-args, never "missing" — wording
+        // matches the CLI (array vs column-name element errors stay distinct).
+        if (!Array.isArray(by)) {
+          throw invalidArgs('window by must be an array')
+        }
+        if (by.some((b) => typeof b !== 'string' || !b)) {
+          throw invalidArgs('window by must be column names')
+        }
+        byList = by as string[]
+        if (byList.length > 8) {
+          throw invalidArgs('window by must list 0..=8 columns')
+        }
+      }
+      const needsBy = fn === 'rank' || fn === 'row_number' || fn === 'cumsum'
+      if (needsBy && byList.length === 0) {
+        throw invalidArgs(`window ${fn} requires by`)
+      }
+      if (wo.orderBy === undefined) {
+        throw invalidArgs(`window ${fn} requires orderBy`)
+      }
+      const ob = wo.orderBy
+      if (ob === null || typeof ob !== 'object' || Array.isArray(ob)) {
+        throw invalidArgs('window orderBy must be an object')
+      }
+      const obO = ob as Record<string, unknown>
+      if (typeof obO.column !== 'string' || !obO.column) {
+        throw invalidArgs('window orderBy needs a column name')
+      }
+      if (obO.desc !== undefined && typeof obO.desc !== 'boolean') {
+        throw invalidArgs('window orderBy desc must be boolean')
+      }
+      const needsCol = fn === 'cumsum' || fn === 'ewm'
+      if (needsCol && (typeof wo.column !== 'string' || !wo.column)) {
+        throw invalidArgs(`window ${fn} requires column`)
+      }
+      if ((fn === 'rank' || fn === 'row_number') && wo.column !== undefined) {
+        throw invalidArgs(`window ${fn} must not take column`)
+      }
+      if (fn === 'ewm') {
+        const alpha = wo.alpha
+        if (typeof alpha !== 'number' || !(alpha > 0 && alpha <= 1)) {
+          throw invalidArgs('window alpha must be in (0,1]')
+        }
+      } else if (wo.alpha !== undefined) {
+        throw invalidArgs(`window ${fn} must not take alpha`)
+      }
+      if (typeof wo.as !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(wo.as)) {
+        throw invalidArgs('invalid window name')
+      }
+      if (wNames.has(wo.as)) {
+        throw invalidArgs(`duplicate window name ${wo.as}`)
+      }
+      wNames.add(wo.as)
     }
   }
   if (obj.limit !== undefined) {
@@ -694,11 +772,14 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         }
         const abs = resolveInWorkspace(ws, a.path)
         assertNotSensitiveSource(abs, config.profileRoot)
-        if (a.format === 'parquet') {
-          throw limitError('parquet not supported yet (planned, see docs/interface.md)')
+        // parquet is enabled (R-22); xlsx remains rejected pre-spawn.
+        // Format is case-insensitive (parity with the CLI).
+        const format = typeof a.format === 'string' && a.format ? a.format.toLowerCase() : undefined
+        if (format === 'xlsx') {
+          throw limitError('xlsx not supported (convert to csv/jsonl)')
         }
         const cliArgs = ['ingest', '--input', a.path, '--dataset-id', newDatasetId()]
-        if (a.format) cliArgs.push('--format', a.format)
+        if (format) cliArgs.push('--format', format)
         if (a.label) cliArgs.push('--label', a.label)
         const result = await run(cliArgs, exec?.signal)
         return result.data
@@ -908,7 +989,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_export: {
       name: 'dataset_export',
       description:
-        'Export a dataset to CSV under the session analysis root outputs/ (.dsh-analyze/outputs/). ' +
+        'Export a dataset to CSV / XLSX / Parquet under the session analysis root outputs/ (.dsh-analyze/outputs/). ' +
         'Returns outputPath relative to the workspace — does not print rows. ' +
         'Use when another tool or human needs the full table on disk.',
       parameters: {
@@ -919,7 +1000,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             type: 'string',
             description:
               'Optional file name (or workspace-relative path; the file name is kept). ' +
-              'Always written under .dsh-analyze/outputs/. Defaults to <datasetId>.csv.',
+              'Always written under .dsh-analyze/outputs/. Defaults to <datasetId> plus the extension implied by format (.csv / .xlsx / .parquet).',
+          },
+          format: {
+            type: 'string',
+            enum: ['csv', 'xlsx', 'parquet'],
+            description: 'Export format; default csv (or inferred from outPath extension).',
           },
         },
         required: ['datasetId'],
@@ -932,6 +1018,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             outputPath: { type: 'string' },
             rowCount: { type: 'number' },
             bytes: { type: 'number' },
+            format: { type: 'string' },
           },
           required: ['outputPath', 'rowCount'],
           additionalProperties: true,
@@ -946,12 +1033,22 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
-        const a = args as { datasetId: string; outPath?: string }
+        const a = args as { datasetId: string; outPath?: string; format?: string }
         validateDatasetId(a.datasetId)
+        let fmt: string | undefined
+        if (a.format !== undefined && a.format !== null) {
+          fmt = typeof a.format === 'string' ? a.format.toLowerCase() : ''
+          if (!['csv', 'xlsx', 'parquet'].includes(fmt)) {
+            throw invalidArgs('format must be csv|xlsx|parquet')
+          }
+        }
+        // K4: the default file name follows the format (never xlsx/parquet
+        // bytes in a *.csv name).
+        const ext = fmt === 'xlsx' ? '.xlsx' : fmt === 'parquet' ? '.parquet' : '.csv'
         const outPath =
           typeof a.outPath === 'string' && a.outPath.trim()
             ? a.outPath.trim()
-            : `.dsh-analyze/outputs/${a.datasetId}.csv`
+            : `.dsh-analyze/outputs/${a.datasetId}${ext}`
         if (outPath.length > MAX_PATH_LEN) {
           const err = new Error('analysis/invalid-args: outPath too long') as Error & { code?: string }
           err.code = 'analysis/invalid-args'
@@ -959,10 +1056,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         }
         // Double-check destination stays in workspace before spawning CLI.
         resolveInWorkspace(ws, outPath)
-        const result = await run(
-          ['export', '--dataset-id', a.datasetId, '--output', outPath],
-          exec?.signal,
-        )
+        const cliArgs = ['export', '--dataset-id', a.datasetId, '--output', outPath]
+        if (fmt) cliArgs.push('--format', fmt)
+        const result = await run(cliArgs, exec?.signal)
         return result.data
       },
     },
@@ -1062,8 +1158,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       name: 'transform_agg',
       description:
         'Filter / project / group-by / aggregate a dataset. ' +
-        'spec may include mutate derived columns, time-period groupBy objects, having, and topKPerGroup. ' +
-        'Pipeline order: filter → topKPerGroup → mutate → group/agg → having → select → orderBy → limit. ' +
+        'spec may include window ops, mutate derived columns, time-period groupBy objects, having, and topKPerGroup. ' +
+        'Pipeline order: filter → window → topKPerGroup → mutate → group/agg → having → select → orderBy → limit. ' +
         'Returns at most `limit` rows (default 1000). ' +
         'Set outLabel to persist a new datasetId for further steps.',
       parameters: {
@@ -1073,12 +1169,15 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           spec: {
             type: 'string',
             description:
-              'JSON string: { select?, filter?, topKPerGroup?, mutate?, groupBy?, aggs?, having?, orderBy?, limit? }. ' +
+              'JSON string: { select?, filter?, window?, topKPerGroup?, mutate?, groupBy?, aggs?, having?, orderBy?, limit? }. ' +
               'filter/having are predicate arrays (all-AND) or nested groups ' +
               '{"all":[…]} | {"any":[…]} | {"not":…} (depth ≤8; empty all=true, empty any=false). ' +
               'Predicate: {column, op, value?}; filter ops: eq/ne/gt/gte/lt/lte/in/contains/is_null/not_null. ' +
               'value: scalar (op in also accepts an array of scalars; every member matches). ' +
-              'topKPerGroup: {by:[col…1..8], k:1..1000, orderBy?:{column,desc?}} — keep ≤k rows per group, after filter. ' +
+              'window: [{fn:rank|row_number|cumsum|ewm, by?, orderBy:{column,desc?}, column?, alpha?, as}] — writes new columns, row count unchanged. ' +
+              'rank/row_number/cumsum need by; cumsum/ewm need column; ewm needs alpha in (0,1]; by optional for ewm (whole table). ' +
+              'cumsum: null source contributes 0. ewm: y0=first non-null; null x leaves y unchanged. ' +
+              'topKPerGroup: {by:[col…1..8], k:1..1000, orderBy?:{column,desc?}} — keep ≤k rows per group, after window. ' +
               'agg fns: count/sum/mean/min/max/median/std/count_distinct/percentile/first/last/count_if. ' +
               'percentile needs p in (0,1); count_if needs {where:<predicate|group>} and no column; ' +
               'count_distinct/first/last need column. ' +
@@ -1688,8 +1787,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       name: 'dataset_corr',
       description:
         'Pairwise correlations among numeric-capable columns (Pearson or Spearman). ' +
-        'Returns top pairs sorted by |r| with sample size n — never a full matrix dump beyond the pair cap. ' +
-        'Use to find co-moving numeric signals before deeper agg.',
+        'Returns top pairs sorted by |r| with sample size n and two-sided pValue (Student-t approx) — never a full matrix dump beyond the pair cap. ' +
+        'Use to find co-moving numeric signals before deeper agg; treat n<30 or large p as weak evidence.',
       parameters: {
         type: 'object',
         properties: {
@@ -1736,13 +1835,15 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: string
             method?: string
             pairwise?: string
-            pairs?: Array<{ columns: string[]; n: number; r: number | null; degenerate?: boolean }>
+            pairs?: Array<{ columns: string[]; n: number; r: number | null; pValue?: number | null; degenerate?: boolean }>
             truncated?: boolean
           }
-          const lines = (v.pairs ?? []).map((p) =>
-            `- ${p.columns.join('×')}: r=${p.r == null ? 'null' : p.r} n=${p.n}` +
-              (p.degenerate ? ' (degenerate)' : ''),
-          )
+          const lines = (v.pairs ?? []).map((p) => {
+            const pval = (p as { pValue?: number | null }).pValue
+            const pStr = pval == null ? 'p=null' : `p=${pval}`
+            return `- ${p.columns.join('×')}: r=${p.r == null ? 'null' : p.r} n=${p.n} ${pStr}` +
+              (p.degenerate ? ' (degenerate)' : '')
+          })
           return textRender(withWarnings(
             `corr ${v.datasetId} method=${v.method ?? 'pearson'} pairwise=${v.pairwise ?? 'complete'}` +
               (v.truncated ? ' [pairs truncated]' : '') +
@@ -1819,8 +1920,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
     dataset_crosstab: {
       name: 'dataset_crosstab',
       description:
-        'Two-column contingency table (frequency cross-tab). Returns top categories per dimension, ' +
+        'Two- or three-column contingency table (frequency cross-tab). Returns top categories per dimension, ' +
         'a compact matrix, margins, and top cells — never a full cartesian dump. ' +
+        'Optional `third` splits into multiple 2-D tables in one call (region × channel × month). ' +
         'Use to compare two categorical / low-cardinality columns.',
       parameters: {
         type: 'object',
@@ -1828,6 +1930,10 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           datasetId: { type: 'string' },
           rows: { type: 'string', description: 'Row category column name.' },
           cols: { type: 'string', description: 'Column category column name (must differ from rows).' },
+          third: {
+            type: 'string',
+            description: 'Optional third dimension column (must differ from rows and cols). Response uses tables[].',
+          },
           top: {
             type: 'number',
             description: '1–50 categories per dimension (default 20).',
@@ -1838,7 +1944,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           },
           dropNull: {
             type: 'boolean',
-            description: 'Default true: exclude rows with null on either side (counted in nullRowCount).',
+            description: 'Default true: exclude rows with null on any dimension (counted in nullRowCount / nullThirdCount).',
           },
         },
         required: ['datasetId', 'rows', 'cols'],
@@ -1851,14 +1957,19 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: { type: 'string' },
             rowColumn: { type: 'string' },
             colColumn: { type: 'string' },
+            thirdColumn: { type: 'string' },
             rowCategories: { type: 'array' },
             colCategories: { type: 'array' },
+            thirdCategories: { type: 'array' },
             matrix: { type: 'array', items: { type: 'array', items: { type: 'number' } } },
+            tables: { type: 'array', items: { type: 'object', additionalProperties: true } },
             topCells: { type: 'array', items: { type: 'object', additionalProperties: true } },
             truncated: { type: 'boolean' },
+            thirdTruncated: { type: 'boolean' },
             nullRowCount: { type: 'number' },
+            nullThirdCount: { type: 'number' },
           },
-          required: ['datasetId', 'rowColumn', 'colColumn', 'matrix'],
+          required: ['datasetId', 'rowColumn', 'colColumn'],
           additionalProperties: true,
         },
         render(_args: unknown, value: unknown) {
@@ -1866,12 +1977,35 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             datasetId: string
             rowColumn: string
             colColumn: string
+            thirdColumn?: string
             rowCategories?: unknown[]
             colCategories?: unknown[]
             matrix?: number[][]
+            tables?: Array<{ third: unknown; rowCategories?: unknown[]; colCategories?: unknown[]; matrix?: number[][]; truncated?: boolean }>
             grandTotal?: number
             truncated?: boolean
+            thirdTruncated?: boolean
             nullRowCount?: number
+            nullThirdCount?: number
+          }
+          if (Array.isArray(v.tables) && v.tables.length > 0) {
+            const parts = v.tables.map((t) => {
+              const rows = (t.rowCategories ?? []).map(String)
+              const cols = (t.colCategories ?? []).map(String)
+              const header = ['', ...cols].join('\t')
+              const body = rows
+                .map((r, i) => [r, ...(t.matrix?.[i] ?? [])].join('\t'))
+                .join('\n')
+              return `third=${String(t.third)}${t.truncated ? ' [truncated]' : ''}\n${header}\n${body}`
+            })
+            return textRender(withWarnings(
+              `crosstab ${v.datasetId}: ${v.rowColumn} × ${v.colColumn} × ${v.thirdColumn ?? 'third'} ` +
+                `(${v.tables.length} tables` +
+                (v.thirdTruncated ? ', third truncated' : '') +
+                `, nulls=${v.nullThirdCount ?? 0})\n` +
+                parts.join('\n\n'),
+              value,
+            ))
           }
           const rows = (v.rowCategories ?? []).map(String)
           const cols = (v.colCategories ?? []).map(String)
@@ -1896,6 +2030,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           datasetId: string
           rows: string
           cols: string
+          third?: string
           top?: number
           minCount?: number
           dropNull?: boolean
@@ -1915,6 +2050,18 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           const err = new Error('analysis/invalid-args: rows and cols must be different columns') as Error & { code?: string }
           err.code = 'analysis/invalid-args'
           throw err
+        }
+        if (a.third !== undefined && a.third !== null) {
+          if (typeof a.third !== 'string' || !a.third.trim()) {
+            const err = new Error('analysis/invalid-args: third must be a non-empty string') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (a.third.trim() === a.rows.trim() || a.third.trim() === a.cols.trim()) {
+            const err = new Error('analysis/invalid-args: third must differ from rows and cols') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
         }
         const top = a.top === undefined || a.top === null ? 20 : Number(a.top)
         if (!Number.isInteger(top) || top < 1 || top > limits.maxCrosstabTop) {
@@ -1939,13 +2086,18 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           a.rows.trim(),
           '--cols',
           a.cols.trim(),
+        ]
+        if (a.third !== undefined && a.third !== null) {
+          cliArgs.push('--third', a.third.trim())
+        }
+        cliArgs.push(
           '--top',
           String(top),
           '--min-count',
           String(minCount),
           '--drop-null',
           dropNull ? 'true' : 'false',
-        ]
+        )
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },

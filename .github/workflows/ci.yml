@@ -65,4 +65,4 @@ jobs:
           INV_TEST_NODE: ${{ env.NODE }}
         run: |
           export INV_TEST_NODE="$(command -v node)"
-          node --test tests/analysis-policy.test.mjs tests/analysis-tools.test.mjs
+          node --test tests/analysis-policy.test.mjs tests/analysis-tools.test.mjs tests/analysis-schema.test.mjs

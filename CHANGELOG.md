@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.1.10
+
+P2 gap list (R-24..R-26) from the post-v0.1.7 requirement batch (targets
+renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
+
+### Added
+
+- `corr` / `dataset_corr` pairs report `pValue` (two-sided Student-t
+  approximation via regularized incomplete beta; `r` null or `n < 3` → null).
+- `crosstab` / `dataset_crosstab` optional `--third` / `third`: one call
+  returns `thirdColumn`, `thirdCategories`, and `tables[]` of 2-D slices.
+  Without `third`, response shape is unchanged from v0.1.7.
+
+### Changed
+
+- Interface documents a frozen head/sample/values caps table (R-26; no
+  behavior change). Tool descriptions match `requestedN` / `requestedLimit`.
+- Version and `version` capabilities: `0.1.10` (token list unchanged).
+- Public contract updated in `docs/interface.md` (v0.1.10).
+- Package version `dsh-analyze@0.1.10`.
+
+### Fixed
+
+- Parquet ingest: types outside the documented map (Decimal, Time, Duration,
+  Interval, Float16, Dictionary value type, …) are rejected with
+  `analysis/invalid-args: parquet type not supported for column …` (exit 2)
+  instead of being silently read as null.
+- `export --format parquet`: columns with no value evidence (empty tables,
+  all-null columns) write each column with its declared dataset dtype instead
+  of collapsing to Boolean.
+- `agg` `window` cumsum: declared dtype is decided once for the whole column
+  and shared by every partition (mixed i64/f64 data), and integral overflow
+  promotes the whole column to `f64` — value variants always match the schema.
+- `agg` `window`: a `by` / `orderBy` key present with the wrong JSON type
+  (e.g. `"by":"acc"`) is `analysis/invalid-args` instead of being treated as
+  missing — ewm no longer silently computes a global window.
+- `corr` `pValue`: corrected the `ln_gamma` constant (`ln(2π)` → `½ln(2π)`)
+  so p-values match the documented Student-t / incomplete-beta formula;
+  closed-form reference tests added (df=1 exact identity, known table point).
+- `dataset_export`: the default `outPath` follows `format`
+  (`.xlsx` / `.parquet` / `.csv`) instead of always `.csv`.
+- `dataset_crosstab` render: third responses now surface `thirdTruncated`,
+  per-table `truncated`, and `nullThirdCount`.
+- `--format` / `format` is case-insensitive on ingest and export (CLI and
+  tool layer), matching the documented behavior; `XLSX` ingest reaches the
+  exit-4 limit instead of `bad format`.
+- `export --format xlsx`: integers beyond 2^53 are written as text cells
+  instead of silently losing precision as numbers.
+
+### Design notes
+
+Review findings are fixed against a unified design (K1 ground-truth tests for
+numeric helpers; K2 strict JSON shapes; K3 declared-dtype = value-variant
+invariant; K4 defaults follow the primary flag).
+
+## 0.1.9
+
+Delivery-chain increment (R-23): multi-format export.
+
+### Added
+
+- `export` / `dataset_export`: `--format` / `format` `csv|xlsx|parquet`
+  (default `csv`; extension may infer when `--format` omitted).
+  - `xlsx`: single sheet `data`, header, true cell types (numbers/bools).
+  - `parquet`: same type map as ingest; round-trips through parquet ingest.
+- Response includes `"format"` alongside `outputPath` / `rowCount` / `bytes`.
+- Unknown format → `analysis/invalid-args` (exit 2).
+
+### Changed
+
+- Version and `version` capabilities: `0.1.9`.
+- Public contract updated in `docs/interface.md` (v0.1.9 section).
+
+## 0.1.8
+
+P0 gap list (R-21..R-22): window operators + Parquet ingest.
+
+### Added
+
+- `agg` spec `window` array: `rank` (competition 1,1,3) / `row_number` /
+  `cumsum` (null source contributes 0) / `ewm` (`alpha ∈ (0,1]`; null x
+  leaves y unchanged). Writes new columns; row count unchanged. Pipeline:
+  `filter → window → topKPerGroup → mutate → group/agg → having → select →
+  orderBy → limit`.
+- `ingest --format parquet` and `.parquet` extension auto-detect. Type map
+  for bool/i64/f64/utf8/timestamp/date; nested list/struct/map rejected with
+  `analysis/invalid-args`; corrupt files → stable `analysis/cli-failed`
+  (no OS text). `xlsx` ingest remains exit 4.
+
+### Changed
+
+- Version and `version` capabilities: `0.1.8` (token list unchanged).
+- Public contract updated in `docs/interface.md` (v0.1.8).
+- Workspace / package version: intermediate `0.1.8` (final branch ships 0.1.10).
+
 ## 0.1.7
 
 Full v0.1.6-联调 requirement list (R-1..R-20): correctness hardening, analysis

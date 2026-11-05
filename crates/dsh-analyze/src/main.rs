@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use cli::fail;
 
 const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\",\"corr\",\"crosstab\",\"series\",\"union\",\"diff\",\"pivot\"";
-const VERSION: &str = "0.1.7";
+const VERSION: &str = "0.1.10";
 
 const USAGE: &str = "\
 dsh-analyze — workspace-confined dataset analysis (stdout: one JSON line per run)
@@ -38,13 +38,14 @@ Commands:
   diff      --left <id> --right <id> [--on k1[:k2],…] [--sample-limit <N>]
   pivot     --dataset-id <id> --index <col,…> --columns <col> --values <col> --agg sum|mean|min|max|count [--out <label>]
   list      [--label-like <substr>] [--produced-by <name>] [--since <YYYY-MM-DD[THH:MM:SS]>]
-  export    --dataset-id <id> --output <path>
+  export    --dataset-id <id> --output <path> [--format csv|xlsx|parquet]
   rm        --dataset-id <id>
   version
 
 Key flags:
   --ops accepts a JSON array OR a workspace path; --spec likewise (a JSON object OR a workspace path).
-  --format csv|json|jsonl — parquet/xlsx not enabled (ingest reports analysis/limit for them).
+  --format csv|json|jsonl|parquet (ingest); export --format csv|xlsx|parquet (default csv).
+  xlsx ingest still reports analysis/limit (convert to csv/jsonl).
   Errors go to stderr as analysis/* messages; exit codes: 0 ok, 1 cli-failed, 2 invalid args/path,
   3 limit, 4 unsupported format limit, 5 unknown dataset.
 ";

@@ -148,6 +148,84 @@ fn export_escape_is_invalid_path() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+// ------------------------------------------------------------- R-23 export formats
+
+#[test]
+fn export_csv_xlsx_parquet_same_shape_and_bad_format() {
+    let ws = temp_workspace();
+    write_file(&ws, "d.csv", "id,amount,ok\n1,10.5,true\n2,20,false\n3,,\n");
+    let out = ingest(&ws, "d.csv", "ds_aabbccdd11223344");
+    assert!(out.contains("\"ok\":true"), "{out}");
+
+    let csv = run_ok(
+        &ws,
+        &["export", "--dataset-id", "ds_aabbccdd11223344", "--output", "outputs/r.csv"],
+    );
+    assert!(csv.contains("\"format\":\"csv\"") || csv.contains("\"ok\":true"), "{csv}");
+    let csv_body = fs::read_to_string(ws.join(".dsh-analyze/outputs/r.csv")).unwrap();
+    assert!(csv_body.starts_with("id,amount,ok"), "{csv_body}");
+    assert_eq!(csv_body.lines().count(), 4); // header + 3
+
+    let xlsx = run_ok(
+        &ws,
+        &["export", "--dataset-id", "ds_aabbccdd11223344", "--output", "outputs/r.xlsx"],
+    );
+    assert!(xlsx.contains("\"ok\":true"), "{xlsx}");
+    let xlsx_path = ws.join(".dsh-analyze/outputs/r.xlsx");
+    assert!(xlsx_path.exists());
+    // xlsx is a zip (PK header)
+    let magic = fs::read(&xlsx_path).unwrap();
+    assert_eq!(&magic[..2], b"PK", "xlsx zip magic");
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/r.parquet",
+            "--format",
+            "parquet",
+        ],
+    );
+    assert!(pq.contains("\"ok\":true"), "{pq}");
+    let pq_path = ws.join(".dsh-analyze/outputs/r.parquet");
+    assert!(pq_path.exists());
+
+    // Round-trip parquet → ingest
+    // Copy into data/ for ingest confinement
+    fs::copy(&pq_path, ws.join("data").join("rt.parquet")).unwrap();
+    let back = run_ok(&ws, &["ingest", "--input", "data/rt.parquet"]);
+    assert!(back.contains("\"rowCount\":3"), "{back}");
+    assert!(back.contains("\"columnCount\":3"), "{back}");
+
+    // Same rows/cols: schema names match
+    let sch = run_ok(
+        &ws,
+        &["schema", "--dataset-id", "ds_aabbccdd11223344"],
+    );
+    assert!(sch.contains("\"name\":\"id\""), "{sch}");
+
+    // Invalid format → exit 2
+    let err = run_fail(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/bad.csv",
+            "--format",
+            "xml",
+        ],
+        2,
+    );
+    assert!(err.contains("analysis/invalid-args: bad format"), "stderr={err}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
 // ------------------------------------------------------------- R-11/R-17 json
 
 #[test]
@@ -195,7 +273,7 @@ fn ingest_json_bad_record_names_index() {
 }
 
 #[test]
-fn ingest_xlsx_and_parquet_report_limit() {
+fn ingest_xlsx_still_limits_parquet_rejects_corrupt() {
     let ws = temp_workspace();
     write_file(&ws, "w.xlsx", "dummy");
     write_file(&ws, "w.parquet", "dummy");
@@ -210,15 +288,285 @@ fn ingest_xlsx_and_parquet_report_limit() {
         "stderr={err}"
     );
 
-    let err2 = run_fail(
+    // Non-parquet masquerade → stable analysis/*, no OS text, exit 1
+    let err2 = run_fail(&ws, &["ingest", "--input", "data/w.parquet"], 1);
+    assert!(
+        err2.contains("analysis/cli-failed: not a valid parquet file"),
+        "stderr={err2}"
+    );
+    assert!(!err2.to_lowercase().contains("os error"), "stderr={err2}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Build a small parquet in the workspace via the export path of a temp CSV…
+/// Actually write parquet with the parquet crate directly in the test.
+#[test]
+fn ingest_parquet_types_and_roundtrip() {
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let ws = temp_workspace();
+    let path = ws.join("data").join("types.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("i", DataType::Int64, true),
+        Field::new("f", DataType::Float64, true),
+        Field::new("b", DataType::Boolean, true),
+        Field::new("s", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+    let batch = arrow_array::RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1i64), Some(2), None])),
+            Arc::new(Float64Array::from(vec![Some(1.5f64), None, Some(3.25)])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_700_000_000_000_000i64),
+                None,
+                Some(1_700_000_001_000_000),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let file = fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let out = run_ok(
         &ws,
-        &["ingest", "--input", "data/w.parquet"],
+        &["ingest", "--input", "data/types.parquet", "--label", "t"],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    assert!(out.contains("\"name\":\"i\""), "{out}");
+    assert!(out.contains("\"dtype\":\"i64\""), "{out}");
+    assert!(out.contains("\"dtype\":\"f64\""), "{out}");
+    assert!(out.contains("\"dtype\":\"bool\""), "{out}");
+    assert!(out.contains("\"dtype\":\"utf8\""), "{out}");
+
+    // Extract datasetId
+    let id = out
+        .split("\"datasetId\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("datasetId")
+        .to_string();
+
+    let head = run_ok(&ws, &["head", "--dataset-id", &id, "--n", "3"]);
+    assert!(head.contains("1.5") || head.contains("1"), "{head}");
+    assert!(head.contains("2023-11-14T") || head.contains("2023-11-1"), "ts readable: {head}");
+
+    let schema_out = run_ok(&ws, &["schema", "--dataset-id", &id]);
+    assert!(schema_out.contains("\"rowCount\":3"), "{schema_out}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Decimal128 must be rejected explicitly — never silently read as null.
+#[test]
+fn ingest_parquet_unsupported_decimal_rejected() {
+    use arrow_array::{Decimal128Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let ws = temp_workspace();
+    let path = ws.join("data").join("dec.parquet");
+
+    let schema = Schema::new(vec![Field::new(
+        "price",
+        DataType::Decimal128(10, 2),
+        true,
+    )]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(
+            Decimal128Array::from(vec![12_345i128, 67_890, 11_111])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        )],
+    )
+    .unwrap();
+
+    let file = fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let err = run_fail(&ws, &["ingest", "--input", "data/dec.parquet"], 2);
+    assert!(
+        err.contains(
+            "analysis/invalid-args: parquet type not supported for column price"
+        ),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Empty table parquet export must honor declared dtypes, not all-Boolean.
+#[test]
+fn export_parquet_empty_table_keeps_schema_dtypes() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let ws = temp_workspace();
+    write_file(&ws, "empty.csv", "a,b,c\n");
+    let out = ingest(&ws, "empty.csv", "ds_aabbccdd11223344");
+    assert!(out.contains("\"rowCount\":0"), "{out}");
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/e.parquet",
+            "--format",
+            "parquet",
+        ],
+    );
+    assert!(pq.contains("\"ok\":true"), "{pq}");
+
+    let file = fs::File::open(ws.join(".dsh-analyze/outputs/e.parquet")).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = builder.schema();
+    assert_eq!(schema.fields().len(), 3);
+    for field in schema.fields() {
+        assert_eq!(
+            field.data_type(),
+            &arrow_schema::DataType::Utf8,
+            "empty export column {} should keep utf8, got {:?}",
+            field.name(),
+            field.data_type()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// K3: an all-null column has no value evidence either — export must honor
+/// the declared dtype (utf8 here), not collapse to Boolean.
+#[test]
+fn export_parquet_all_null_column_uses_declared_dtype() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let ws = temp_workspace();
+    write_file(&ws, "an.csv", "a,b\n1,\n2,\n3,\n");
+    let out = ingest(&ws, "an.csv", "ds_aabbccdd11223344");
+    assert!(out.contains("\"name\":\"b\",\"dtype\":\"utf8\""), "{out}");
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/an.parquet",
+            "--format",
+            "parquet",
+        ],
+    );
+    assert!(pq.contains("\"ok\":true"), "{pq}");
+
+    let file = fs::File::open(ws.join(".dsh-analyze/outputs/an.parquet")).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = builder.schema();
+    let b = schema.field_with_name("b").unwrap();
+    assert_eq!(
+        b.data_type(),
+        &arrow_schema::DataType::Utf8,
+        "all-null column should keep declared utf8, got {:?}",
+        b.data_type()
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// `--format` is case-insensitive on ingest and export; `XLSX` hits the
+/// exit-4 limit (not `bad format`).
+#[test]
+fn format_flags_are_case_insensitive() {
+    let ws = temp_workspace();
+    write_file(&ws, "d.csv", "a,b\n1,2\n");
+    write_file(&ws, "w.xlsx", "dummy");
+
+    let out = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/d.csv",
+            "--format",
+            "CSV",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+
+    let err = run_fail(
+        &ws,
+        &["ingest", "--input", "data/w.xlsx", "--format", "XLSX"],
         4,
     );
     assert!(
-        err2.contains("analysis/limit: parquet not supported yet (planned, see docs/interface.md)"),
-        "stderr={err2}"
+        err.contains("analysis/limit: xlsx not supported (convert to csv/jsonl)"),
+        "stderr={err}"
     );
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/c.parquet",
+            "--format",
+            "PARQUET",
+        ],
+    );
+    assert!(pq.contains("\"format\":\"parquet\""), "{pq}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Integers beyond 2^53 export to xlsx as text cells (no silent precision
+/// loss); the file must still be written as a valid workbook.
+#[test]
+fn export_xlsx_large_int_writes_text_cell() {
+    let ws = temp_workspace();
+    write_file(&ws, "big.csv", "n\n9007199254740993\n");
+    ingest(&ws, "big.csv", "ds_aabbccdd11223344");
+
+    let out = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/big.xlsx",
+            "--format",
+            "xlsx",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let path = ws.join(".dsh-analyze/outputs/big.xlsx");
+    let magic = fs::read(&path).unwrap();
+    assert_eq!(&magic[..2], b"PK", "xlsx zip magic");
 
     let _ = fs::remove_dir_all(&ws);
 }
@@ -316,8 +664,8 @@ fn help_states_ops_forms_and_formats() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("--ops accepts a JSON array OR a workspace path"), "{text}");
     assert!(text.contains("--spec likewise"), "{text}");
-    assert!(text.contains("--format csv|json|jsonl"), "{text}");
-    assert!(text.contains("parquet/xlsx not enabled"), "{text}");
+    assert!(text.contains("--format csv|json|jsonl|parquet"), "{text}");
+    assert!(text.contains("xlsx ingest still reports analysis/limit"), "{text}");
     for cmd in ["ingest", "union", "diff", "pivot", "list", "export"] {
         assert!(text.contains(cmd), "missing {cmd} in usage: {text}");
     }
@@ -432,7 +780,7 @@ fn version_capabilities_include_new_commands() {
         assert!(o.status.success());
         String::from_utf8(o.stdout).unwrap()
     };
-    assert!(out.contains("\"version\":\"0.1.7\""), "{out}");
+    assert!(out.contains("\"version\":\"0.1.10\""), "{out}");
     for tok in ["\"union\"", "\"diff\"", "\"pivot\""] {
         assert!(out.contains(tok), "missing {tok}: {out}");
     }
