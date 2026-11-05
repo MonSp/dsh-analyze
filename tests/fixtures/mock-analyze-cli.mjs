@@ -776,16 +776,19 @@ async function main() {
         if (g && g.dateColumn && g.period) {
           if (!['day', 'week', 'month'].includes(g.period)) fail(2, `analysis/invalid-args: bad period ${g.period}`)
           // R-29: optional tz → minutes east of UTC (default 0 = UTC).
+          // Present-but-non-string (incl. null) is rejected — CLI/TS/mock align.
           let tzMin = 0
-          if (g.tz !== undefined && g.tz !== null) tzMin = resolveTzMin(g.tz)
+          if (g.tz !== undefined) tzMin = resolveTzMin(g.tz)
           return { kind: 'time', name: `${g.dateColumn}_${g.period}`, ci: widx(g.dateColumn), period: g.period, tz: tzMin }
         }
         fail(2, 'analysis/invalid-args: bad groupBy entry')
       })
       const parseTs = (s, period, tzMin) => {
         const t = String(s).trim()
-        const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?(Z|z|[+-]\d{2}:?\d{2})?$/)
-          || t.match(/^(\d{4})\/(\d{2})\/(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/)
+        // Shapes mirror the Rust parser: T/t/space separator, optional seconds
+        // (fraction allowed), offset only together with a time-of-day part.
+        const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?(Z|z|[+-]\d{2}:?\d{2})?)?$/)
+          || t.match(/^(\d{4})\/(\d{2})\/(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?(Z|z|[+-]\d{2}:?\d{2})?)?$/)
           || t.match(/^(\d{4})(\d{2})(\d{2})$/)
         if (!m) return null
         let y = +m[1], mo = +m[2], d = +m[3]

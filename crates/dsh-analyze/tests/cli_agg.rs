@@ -752,21 +752,33 @@ fn r29_tz_date_only_and_naive_local() {
 fn r29_bad_tz_exits_2() {
     let ws = temp_workspace();
     ingest_rich(&ws);
-    for tz in ["Asia/Tokyo", "+15:00"] {
-        let out = run_agg(
-            &ws,
-            &format!(
-                r#"{{"groupBy":[{{"dateColumn":"day","period":"day","tz":"{tz}"}}],"aggs":[{{"fn":"count","as":"n"}}]}}"#
-            ),
-        );
-        assert_eq!(out.status.code(), Some(2), "tz {tz} must exit 2");
+    let check = |spec: String, show: &str| {
+        let out = run_agg(&ws, &spec);
+        assert_eq!(out.status.code(), Some(2), "tz {show} must exit 2");
         let err = stderr_of(&out);
         assert!(
             err.contains(&format!(
-                "analysis/invalid-args: bad tz \"{tz}\" (expected +HH:MM or Asia/Shanghai)"
+                "analysis/invalid-args: bad tz \"{show}\" (expected +HH:MM or Asia/Shanghai)"
             )),
-            "tz={tz} stderr={err}"
+            "tz={show} stderr={err}"
         );
-        assert!(!stdout_of(&out).contains("\"ok\":true"), "tz={tz}");
+        assert!(!stdout_of(&out).contains("\"ok\":true"), "tz={show}");
+    };
+    for tz in ["Asia/Tokyo", "+15:00"] {
+        check(
+            format!(
+                r#"{{"groupBy":[{{"dateColumn":"day","period":"day","tz":"{tz}"}}],"aggs":[{{"fn":"count","as":"n"}}]}}"#
+            ),
+            tz,
+        );
+    }
+    // present-but-non-string tz: rejected like the tool layer (was silently UTC)
+    for tz in ["null", "480"] {
+        check(
+            format!(
+                r#"{{"groupBy":[{{"dateColumn":"day","period":"day","tz":{tz}}}],"aggs":[{{"fn":"count","as":"n"}}]}}"#
+            ),
+            tz,
+        );
     }
 }

@@ -1909,7 +1909,7 @@ test('R-29: validateAggSpec accepts valid tz (fixed offset + whitelist)', () => 
 
 test('R-29: validateAggSpec rejects bad tz with analysis/invalid-args', () => {
   const limits = DEFAULT_ANALYSIS_LIMITS
-  for (const tz of ['Asia/Tokyo', '+15:00', '08:00', 480]) {
+  for (const tz of ['Asia/Tokyo', '+15:00', '08:00', 480, null, true]) {
     assert.throws(
       () => validateAggSpec(JSON.stringify({ groupBy: [{ dateColumn: 'ts', period: 'day', tz }] }), limits),
       (err) => {
@@ -1963,6 +1963,38 @@ test('R-29: transform_agg day buckets with/without tz via mock CLI (§7.1 both s
       [['2026-09-30', 10, 1], ['2026-10-01', 50, 2]],
       JSON.stringify(noTz.rows),
     )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-29: mock timestamp shapes mirror Rust (slash+offset, optional seconds, date-only+offset parse-fail)', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'shapes.csv'),
+      'ts\n' +
+        '2026/10/04 23:30:00+00:00\n' + // slash datetime with offset → 2026-10-05 under +08:00
+        '2026-10-01T00:30\n' + // seconds optional, naive → stays 2026-10-01
+        '2026-10-01+08:00\n', // date-only with offset → parse-fail (Rust parity)
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/shapes.csv', format: 'csv' })
+    const res = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: [{ dateColumn: 'ts', period: 'day', tz: '+08:00' }],
+        aggs: [{ fn: 'count', as: 'n' }],
+      }),
+    })
+    assert.deepEqual(
+      res.rows,
+      [['2026-10-05', 1], ['2026-10-01', 1], [null, 1]],
+      JSON.stringify(res.rows),
+    )
+    assert.equal(res.parseFailCount, 1)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

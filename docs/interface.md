@@ -96,19 +96,21 @@ Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-inse
 
 - `--input` must resolve inside `--workspace`.
 - CSV text encoding (v0.1.11, R-30):
-  - `utf-8` (default): strict UTF-8; a UTF-8 BOM is stripped from the header.
-    Decode failure → `analysis/invalid-args: file is not valid UTF-8 (re-save
-    as CSV UTF-8, or pass --encoding gbk)` (**exit 2** — previously exit 1
-    `cli-failed: … read failed`). Real I/O errors (not found / permission)
-    remain `analysis/cli-failed: cannot read file: {reason}` (exit 1).
+  - `utf-8` (default): strict UTF-8. Decode failure → `analysis/invalid-args:
+    file is not valid UTF-8 (re-save as CSV UTF-8, or pass --encoding gbk)`
+    (**exit 2** — previously exit 1 `cli-failed: … read failed`). Real I/O
+    errors (not found / permission) remain
+    `analysis/cli-failed: cannot read file: {reason}` (exit 1).
   - `gbk` / `gb18030`: whole file decoded fatal (no replacement characters);
     both flags share the WHATWG GBK/GB18030 decoder. Decode failure →
     `analysis/invalid-args: file is not valid GB18030` (exit 2).
-  - `auto`: UTF-8 BOM → utf-8; else strict UTF-8; on failure GB18030
-    fallback. Fallback success adds
-    `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`.
+  - `auto`: strict UTF-8 first; on failure GB18030 fallback. Fallback success
+    adds `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`.
     Explicit `--encoding gbk|gb18030` does **not** warn. Both decoders fail →
     the Plan B UTF-8 message (exit 2).
+  - In every mode a leading UTF-8 BOM is stripped before decoding (encoding
+    marker, not data — it never surfaces as garbage). The GB18030 fallback in
+    `auto` applies even when a BOM was present: the BOM does not suppress it.
   - Never lossy: corrupt bytes are rejected in every mode; no U+FFFD
     substitution, no garbage dataset.
   - `--encoding` with any non-csv `--format` →
@@ -376,9 +378,9 @@ A `groupBy` array element is either:
 | fixed offset | `"+08:00"`, `"-05:30"` | `±HH:MM`, HH `00..=14`, MM `00..=59` |
 | IANA whitelist v1 | `"Asia/Shanghai"` | fixed `+08:00`, no DST; hand-rolled, no tz database |
 
-Any other `tz` value → `analysis/invalid-args: bad tz "…" (expected +HH:MM
-or Asia/Shanghai)` (exit 2). Tool-layer `validateAggSpec` rejects the same
-set before spawn.
+Any other `tz` value — including non-strings such as `null` or `480` — →
+`analysis/invalid-args: bad tz "…" (expected +HH:MM or Asia/Shanghai)`
+(exit 2). Tool-layer `validateAggSpec` rejects the same set before spawn.
 
 Output column name is `"<dateColumn>_<period>"` (e.g. `created_at_day`).
 

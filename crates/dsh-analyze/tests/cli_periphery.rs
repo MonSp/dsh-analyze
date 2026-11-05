@@ -60,14 +60,6 @@ fn run_fail(ws: &Path, args: &[&str], expect_code: i32) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn json_str_field(line: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = line.find(&needle)? + needle.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
 fn json_usize_field(line: &str, field: &str) -> Option<usize> {
     let needle = format!("\"{field}\":");
     let start = line.find(&needle)? + needle.len();
@@ -938,6 +930,79 @@ fn ingest_utf8_with_and_without_bom_default_and_auto_no_warning() {
         assert_eq!(json_usize_field(&out2, "rowCount"), Some(2), "{name}: {out2}");
         assert!(!out2.contains("warnings"), "auto on utf-8 must not warn: {out2}");
     }
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_bom_is_never_data_in_any_mode() {
+    let ws = temp_workspace();
+    let gbk_body = gbk_fixture(GBK_FIXTURE);
+    let mut bom_gbk = vec![0xEF, 0xBB, 0xBF];
+    bom_gbk.extend_from_slice(&gbk_body);
+    write_bytes(&ws, "bom-gbk.csv", &bom_gbk);
+
+    // (a) explicit gbk: the BOM is stripped, never decoded into garbage chars
+    let out = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/bom-gbk.csv",
+            "--encoding",
+            "gbk",
+            "--dataset-id",
+            "ds_bomgbk0000000001",
+        ],
+    );
+    assert_eq!(json_usize_field(&out, "rowCount"), Some(2), "{out}");
+    let head = run_ok(&ws, &["head", "--dataset-id", "ds_bomgbk0000000001", "--n", "5"]);
+    assert!(head.contains("地区") && head.contains("东省"), "header: {head}");
+
+    // (b) auto: BOM no longer suppresses the GB18030 fallback
+    let out2 = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/bom-gbk.csv",
+            "--encoding",
+            "auto",
+            "--dataset-id",
+            "ds_bomgbk0000000002",
+        ],
+    );
+    assert_eq!(json_usize_field(&out2, "rowCount"), Some(2), "{out2}");
+    assert!(
+        out2.contains(
+            "\"warnings\":[{\"code\":\"encoding-fallback\",\"encoding\":\"gb18030\"}]"
+        ),
+        "auto must fall back past a BOM: {out2}"
+    );
+    let head2 = run_ok(&ws, &["head", "--dataset-id", "ds_bomgbk0000000002", "--n", "5"]);
+    assert!(head2.contains("地区") && head2.contains("东省"), "{head2}");
+
+    // (c) auto + BOM + corrupt body: still Plan B, no dataset
+    let bom_bad = vec![0xEF, 0xBB, 0xBF, b'i', b'd', b',', b'x', b'\n', 0xFF, b'\n'];
+    write_bytes(&ws, "bom-bad.csv", &bom_bad);
+    let err = run_fail(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/bom-bad.csv",
+            "--encoding",
+            "auto",
+            "--dataset-id",
+            "ds_bomgbk0000000003",
+        ],
+        2,
+    );
+    assert!(err.contains(PLAN_B_UTF8), "stderr={err}");
+    assert!(
+        !ws.join(".dsh-analyze/datasets/ds_bomgbk0000000003.meta.json").exists(),
+        "meta must not exist after decode failure"
+    );
 
     let _ = fs::remove_dir_all(&ws);
 }

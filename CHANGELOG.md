@@ -12,12 +12,13 @@ timezone-aware day boundaries and Chinese-locale CSV ingest.
   → +08:00, hand-rolled). `day` / `week` (Monday) / `month` bucket on the
   target timezone's calendar. Default remains UTC; date-only values never
   shift; naive date-times with `tz` set are treated as local wall-clock.
-  Invalid `tz` → `analysis/invalid-args` (exit 2); `validateAggSpec` mirrors
-  the grammar before spawn.
+  Invalid `tz` — including non-string values — → `analysis/invalid-args`
+  (exit 2), uniformly across CLI, `validateAggSpec`, and the mock.
 - `ingest --encoding utf-8|gbk|gb18030|auto` (R-30, csv only, default
-  `utf-8`). `auto` = BOM sniff → strict UTF-8 → fatal GB18030 fallback with
-  `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`. Decoding is
-  never lossy.
+  `utf-8`). `auto` = strict UTF-8 → fatal GB18030 fallback with
+  `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`. A leading
+  UTF-8 BOM is stripped in every mode and never suppresses the fallback.
+  Decoding is never lossy.
 
 ### Changed
 

@@ -1723,14 +1723,24 @@ fn parse_group_by(arr: &str) -> Result<Vec<GroupKeySpec>, String> {
             let period = Period::parse(&period_s).ok_or_else(|| {
                 format!("analysis/invalid-args: bad period {period_s} (day|week|month)")
             })?;
-            // R-29: optional `tz` (extract-only like dateColumn; unknown keys stay tolerated).
-            let tz_offset_min = match extract_string_field(t, "tz")? {
+            // R-29: optional `tz` (extract-only like dateColumn; unknown keys
+            // stay tolerated). Present-but-non-string is rejected so CLI, tool
+            // layer, and mock share one contract.
+            let tz_offset_min = match extract_json_value(t, "tz")? {
                 None => 0,
-                Some(v) => parse_tz(&v).ok_or_else(|| {
-                    format!(
-                        "analysis/invalid-args: bad tz \"{v}\" (expected +HH:MM or Asia/Shanghai)"
-                    )
-                })?,
+                Some(raw) => {
+                    let Some(v) = extract_string_field(t, "tz")? else {
+                        return Err(format!(
+                            "analysis/invalid-args: bad tz \"{}\" (expected +HH:MM or Asia/Shanghai)",
+                            raw.trim()
+                        ));
+                    };
+                    parse_tz(&v).ok_or_else(|| {
+                        format!(
+                            "analysis/invalid-args: bad tz \"{v}\" (expected +HH:MM or Asia/Shanghai)"
+                        )
+                    })?
+                }
             };
             out.push(GroupKeySpec::Period {
                 date_column,
@@ -2585,6 +2595,20 @@ mod tests {
         for tz in ["Asia/Tokyo", "+15:00"] {
             let err = parse_spec_json(&format!(
                 r#"{{"groupBy":[{{"dateColumn":"d","period":"day","tz":"{tz}"}}]}}"#
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "analysis/invalid-args: bad tz \"{tz}\" (expected +HH:MM or Asia/Shanghai)"
+                ),
+                "tz={tz}"
+            );
+        }
+        // present-but-non-string tz is rejected the same way (CLI/TS/mock align)
+        for tz in ["null", "480", "true"] {
+            let err = parse_spec_json(&format!(
+                r#"{{"groupBy":[{{"dateColumn":"d","period":"day","tz":{tz}}}]}}"#
             ))
             .unwrap_err();
             assert_eq!(

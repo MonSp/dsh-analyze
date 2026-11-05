@@ -414,28 +414,27 @@ fn parse_csv_reader<R: BufRead>(mut reader: R) -> Result<Table, String> {
 
 /// Decode whole-file CSV bytes per `--encoding` mode (R-30 / S2.5).
 /// Never lossy: malformed bytes are rejected, never replaced with U+FFFD.
+/// A leading UTF-8 BOM is an encoding marker, not data — stripped before
+/// every mode so it can never surface as garbage.
 /// Returns `(utf-8 text, used_gb18030_fallback)`; the fallback flag is only
 /// ever true for `auto`.
 pub fn decode_csv_bytes(bytes: &[u8], encoding: &str) -> Result<(String, bool), String> {
     const PLAN_B: &str = "analysis/invalid-args: file is not valid UTF-8 (re-save as CSV UTF-8, or pass --encoding gbk)";
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
     match encoding {
-        "gbk" | "gb18030" => decode_gb18030(bytes).map(|s| (s, false)),
+        "gbk" | "gb18030" => decode_gb18030(body).map(|s| (s, false)),
         "auto" => {
-            // UTF-8 BOM declares utf-8 (stripped later by the CSV header step);
-            // otherwise strict UTF-8 with a fatal GB18030 fallback (S2.5).
-            let try_utf8 = |b: &[u8]| std::str::from_utf8(b).map(|s| s.to_string());
-            if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                return try_utf8(bytes).map(|s| (s, false)).map_err(|_| PLAN_B.to_string());
+            // Strict UTF-8 first; fatal GB18030 fallback (S2.5) either way —
+            // a BOM never suppresses the fallback (its declaration failed).
+            if let Ok(s) = std::str::from_utf8(body) {
+                return Ok((s.to_string(), false));
             }
-            if let Ok(s) = try_utf8(bytes) {
-                return Ok((s, false));
-            }
-            decode_gb18030(bytes)
+            decode_gb18030(body)
                 .map(|s| (s, true))
                 .map_err(|_| PLAN_B.to_string())
         }
         // Default `utf-8`: strict, as before.
-        _ => std::str::from_utf8(bytes)
+        _ => std::str::from_utf8(body)
             .map(|s| (s.to_string(), false))
             .map_err(|_| PLAN_B.to_string()),
     }
