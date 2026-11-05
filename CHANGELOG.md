@@ -53,7 +53,7 @@ renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
 
 Review findings are fixed against a unified design (K1 ground-truth tests for
 numeric helpers; K2 strict JSON shapes; K3 declared-dtype = value-variant
-invariant; K4 defaults follow the primary flag) — see the local feature doc.
+invariant; K4 defaults follow the primary flag).
 
 ## 0.1.9
 

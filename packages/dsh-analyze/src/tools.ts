@@ -471,7 +471,12 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
       const by = wo.by
       let byList: string[] = []
       if (by !== undefined) {
-        if (!Array.isArray(by) || by.some((b) => typeof b !== 'string' || !b)) {
+        // K2: wrong JSON shape is invalid-args, never "missing" — wording
+        // matches the CLI (array vs column-name element errors stay distinct).
+        if (!Array.isArray(by)) {
+          throw invalidArgs('window by must be an array')
+        }
+        if (by.some((b) => typeof b !== 'string' || !b)) {
           throw invalidArgs('window by must be column names')
         }
         byList = by as string[]
@@ -483,9 +488,12 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
       if (needsBy && byList.length === 0) {
         throw invalidArgs(`window ${fn} requires by`)
       }
-      const ob = wo.orderBy
-      if (!ob || typeof ob !== 'object' || Array.isArray(ob)) {
+      if (wo.orderBy === undefined) {
         throw invalidArgs(`window ${fn} requires orderBy`)
+      }
+      const ob = wo.orderBy
+      if (ob === null || typeof ob !== 'object' || Array.isArray(ob)) {
+        throw invalidArgs('window orderBy must be an object')
       }
       const obO = ob as Record<string, unknown>
       if (typeof obO.column !== 'string' || !obO.column) {

@@ -1727,6 +1727,20 @@ test('R-21: validateAggSpec window accepts good ops / rejects bad', () => {
     () => validateAggSpec(JSON.stringify({ window: [{ fn: 'nope', by: ['g'], orderBy: { column: 'v' }, as: 'x' }] }), limits),
     /bad window fn/,
   )
+  // K2: present-but-wrong-shape keys are invalid-args, never "missing" --
+  // wording matches the CLI.
+  assert.throws(
+    () =>
+      validateAggSpec(
+        JSON.stringify({ window: [{ fn: 'ewm', column: 'v', alpha: 0.5, by: 'g', orderBy: { column: 't' }, as: 'e' }] }),
+        limits,
+      ),
+    /window by must be an array/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ window: [{ fn: 'rank', by: ['g'], orderBy: 't', as: 'x' }] }), limits),
+    /window orderBy must be an object/,
+  )
 })
 
 test('R-21: transform_agg window via mock CLI keeps row count', async () => {
