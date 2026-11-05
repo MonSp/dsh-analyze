@@ -438,6 +438,243 @@ pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {
     finish_table(headers, rows)
 }
 
+/// Read a Parquet file into a Table (R-22). Nested list/struct/map are rejected.
+/// Errors are stable `analysis/*` strings (never raw OS / parquet Display leakage
+/// beyond our own mapping).
+pub fn parse_parquet_path(path: &Path) -> Result<Table, String> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = fs::File::open(path)
+        .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|_| "analysis/cli-failed: not a valid parquet file".to_string())?;
+    let schema = builder.schema().clone();
+
+    // Reject nested types up front (T0: no list/struct/map).
+    for field in schema.fields() {
+        if is_nested_parquet_type(field.data_type()) {
+            return Err(format!(
+                "analysis/invalid-args: parquet nested type not supported for column {}",
+                field.name()
+            ));
+        }
+    }
+
+    // Map Arrow schema → our dtypes + physical/logical info for value conversion.
+    let mut col_names: Vec<String> = Vec::new();
+    let mut col_dtypes: Vec<String> = Vec::new();
+    let mut col_kinds: Vec<ParquetColKind> = Vec::new();
+    for field in schema.fields() {
+        col_names.push(field.name().clone());
+        let (dtype, kind) = parquet_field_map(field.data_type());
+        col_dtypes.push(dtype);
+        col_kinds.push(kind);
+    }
+
+    let reader = builder
+        .build()
+        .map_err(|_| "analysis/cli-failed: not a valid parquet file".to_string())?;
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|_| "analysis/cli-failed: not a valid parquet file".to_string())?;
+        let n = batch.num_rows();
+        for r in 0..n {
+            let mut row = Vec::with_capacity(col_names.len());
+            for (c, kind) in col_kinds.iter().enumerate() {
+                let col = batch.column(c);
+                row.push(parquet_value_at(col, r, kind));
+            }
+            rows.push(row);
+        }
+    }
+    // Schema dtypes are re-inferred by finish_table from values (parity with csv).
+    let _ = col_dtypes;
+    finish_table(col_names, rows)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParquetColKind {
+    Bool,
+    I64,
+    F64,
+    Str,
+    /// TIMESTAMP_* rendered as UTC ISO-8601 string.
+    Timestamp,
+    /// DATE as `YYYY-MM-DD`.
+    Date,
+}
+
+fn is_nested_parquet_type(dt: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    matches!(
+        dt,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    )
+}
+
+fn parquet_field_map(dt: &arrow_schema::DataType) -> (String, ParquetColKind) {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Boolean => ("bool".into(), ParquetColKind::Bool),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            ("i64".into(), ParquetColKind::I64)
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            ("i64".into(), ParquetColKind::I64)
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            ("f64".into(), ParquetColKind::F64)
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            ("utf8".into(), ParquetColKind::Str)
+        }
+        DataType::Timestamp(_, _) => ("utf8".into(), ParquetColKind::Timestamp),
+        DataType::Date32 | DataType::Date64 => ("utf8".into(), ParquetColKind::Date),
+        DataType::Null => ("utf8".into(), ParquetColKind::Str),
+        _ => ("utf8".into(), ParquetColKind::Str),
+    }
+}
+
+fn parquet_value_at(col: &arrow_array::ArrayRef, row: usize, kind: &ParquetColKind) -> Value {
+    use arrow_array::*;
+    if col.is_null(row) {
+        return Value::Null;
+    }
+    match kind {
+        ParquetColKind::Bool => {
+            if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+                Value::Bool(a.value(row))
+            } else {
+                Value::Null
+            }
+        }
+        ParquetColKind::I64 => {
+            macro_rules! as_i64 {
+                ($t:ty) => {{
+                    if let Some(a) = col.as_any().downcast_ref::<$t>() {
+                        Some(a.value(row) as i64)
+                    } else {
+                        None
+                    }
+                }};
+            }
+            let v = as_i64!(Int64Array)
+                .or_else(|| as_i64!(Int32Array))
+                .or_else(|| as_i64!(Int16Array))
+                .or_else(|| as_i64!(Int8Array))
+                .or_else(|| as_i64!(UInt64Array))
+                .or_else(|| as_i64!(UInt32Array))
+                .or_else(|| as_i64!(UInt16Array))
+                .or_else(|| as_i64!(UInt8Array));
+            v.map(Value::I64).unwrap_or(Value::Null)
+        }
+        ParquetColKind::F64 => {
+            macro_rules! as_f64 {
+                ($t:ty) => {{
+                    if let Some(a) = col.as_any().downcast_ref::<$t>() {
+                        Some(a.value(row) as f64)
+                    } else {
+                        None
+                    }
+                }};
+            }
+            let v = as_f64!(Float64Array).or_else(|| as_f64!(Float32Array));
+            v.map(Value::F64).unwrap_or(Value::Null)
+        }
+        ParquetColKind::Str => {
+            if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                Value::Str(a.value(row).to_string())
+            } else if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
+                Value::Str(String::from_utf8_lossy(a.value(row)).into_owned())
+            } else if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+                Value::Str(a.value(row).to_string())
+            } else {
+                Value::Null
+            }
+        }
+        ParquetColKind::Timestamp => {
+            macro_rules! ts_str {
+                ($t:ty, $unit:expr) => {{
+                    if let Some(a) = col.as_any().downcast_ref::<$t>() {
+                        Some(format_ts_micros(a.value(row), $unit))
+                    } else {
+                        None
+                    }
+                }};
+            }
+            let v = ts_str!(TimestampMicrosecondArray, "us")
+                .or_else(|| ts_str!(TimestampMillisecondArray, "ms"))
+                .or_else(|| ts_str!(TimestampNanosecondArray, "ns"))
+                .or_else(|| ts_str!(TimestampSecondArray, "s"));
+            if let Some(s) = v {
+                Value::Str(s)
+            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                Value::Str(format_ts_micros(a.value(row), "us"))
+            } else {
+                Value::Null
+            }
+        }
+        ParquetColKind::Date => {
+            if let Some(a) = col.as_any().downcast_ref::<Date32Array>() {
+                Value::Str(format_date32(a.value(row)))
+            } else if let Some(a) = col.as_any().downcast_ref::<Date64Array>() {
+                Value::Str(format_date32((a.value(row) / 86_400_000) as i32))
+            } else {
+                Value::Null
+            }
+        }
+    }
+}
+
+fn format_ts_micros(v: i64, unit: &str) -> String {
+    let micros = match unit {
+        "s" => v.saturating_mul(1_000_000),
+        "ms" => v.saturating_mul(1_000),
+        "ns" => v / 1_000,
+        _ => v,
+    };
+    let secs = micros.div_euclid(1_000_000);
+    let frac = micros.rem_euclid(1_000_000);
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+    if frac == 0 {
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    } else {
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{frac:06}Z")
+    }
+}
+
+fn format_date32(days: i32) -> String {
+    let secs = i64::from(days) * 86_400;
+    let (y, mo, d, _, _, _) = civil_from_unix(secs);
+    format!("{y:04}-{mo:02}-{d:02}")
+}
+
+/// Days-from-civil algorithm (Howard Hinnant) → UTC calendar parts.
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, h, mi, s)
+}
+
 /// Parse a `--format json` file: top-level array `[{…},…]` or `{"records":[…]}`.
 /// Columns are the key union in first-seen order; dtype rules match jsonl.
 pub fn parse_json_path(path: &Path) -> Result<Table, String> {

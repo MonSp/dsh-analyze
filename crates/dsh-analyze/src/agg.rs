@@ -83,6 +83,17 @@ pub struct TopKPerGroup {
     pub order_by: Option<OrderBy>,
 }
 
+/// Window op (R-21): writes a new column; never changes row count.
+#[derive(Debug, Clone)]
+pub struct WindowOp {
+    pub r#fn: String,
+    pub by: Vec<String>,
+    pub order_by: OrderBy,
+    pub column: Option<String>,
+    pub alpha: Option<f64>,
+    pub r#as: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub select: Option<Vec<SelectEntry>>,
@@ -94,6 +105,7 @@ pub struct Spec {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub top_k_per_group: Option<TopKPerGroup>,
+    pub window: Vec<WindowOp>,
 }
 
 /// One `warnings[]` entry (R-20); `message` is omitted in the agg response.
@@ -147,6 +159,12 @@ const MAX_FILTER_DEPTH: usize = 8;
 const MAX_TOPK_BY: usize = 8;
 const MAX_TOPK_K: usize = 1000;
 const MAX_PARSE_FAIL_SAMPLES: usize = 10;
+const MAX_WINDOW_OPS: usize = 16;
+const MAX_WINDOW_BY: usize = 8;
+
+pub fn validate_window_fn(f: &str) -> bool {
+    matches!(f, "rank" | "row_number" | "cumsum" | "ewm")
+}
 
 pub fn run_agg(
     table: &Table,
@@ -186,23 +204,40 @@ pub fn run_agg(
         }
     }
 
-    // topKPerGroup (R-15): row stage between filter and mutate
-    if let Some(tk) = &spec.top_k_per_group {
-        for c in &tk.by {
-            idx(c)?;
-        }
-        if let Some(ob) = &tk.order_by {
-            idx(&ob.column)?;
-        }
-        keep = top_k_rows(table, &keep, tk);
-    }
-
-    // Working table after filter (clone rows we need for mutate + group).
+    // Working table after filter (window → topK → mutate + group).
     let mut work_cols: Vec<Column> = table.columns.clone();
     let mut work_rows: Vec<Vec<Value>> = keep
         .iter()
         .map(|&i| table.rows[i].clone())
         .collect();
+
+    // window (R-21): append columns on the filtered set before topK drops rows.
+    if !spec.window.is_empty() {
+        apply_window(&mut work_cols, &mut work_rows, &spec.window)?;
+    }
+
+    // topKPerGroup (R-15): row stage between window and mutate
+    if let Some(tk) = &spec.top_k_per_group {
+        for c in &tk.by {
+            work_cols
+                .iter()
+                .position(|col| &col.name == c)
+                .ok_or_else(|| format!("analysis/invalid-args: unknown column {c}"))?;
+        }
+        if let Some(ob) = &tk.order_by {
+            work_cols
+                .iter()
+                .position(|col| col.name == ob.column)
+                .ok_or_else(|| format!("analysis/invalid-args: unknown column {}", ob.column))?;
+        }
+        let snap = Table {
+            columns: work_cols.clone(),
+            rows: work_rows.clone(),
+        };
+        let all: Vec<usize> = (0..work_rows.len()).collect();
+        let selected = top_k_rows(&snap, &all, tk);
+        work_rows = selected.into_iter().map(|i| work_rows[i].clone()).collect();
+    }
 
     // mutate (derived columns, sequential visibility); static type-check first (R-1)
     let mut name_set: Vec<String> = work_cols.iter().map(|c| c.name.clone()).collect();
@@ -951,6 +986,7 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
                 | "orderBy"
                 | "limit"
                 | "topKPerGroup"
+                | "window"
         ) {
             return Err(format!("analysis/invalid-args: unknown spec key {key}"));
         }
@@ -966,6 +1002,7 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
         order_by: Vec::new(),
         limit: None,
         top_k_per_group: None,
+        window: Vec::new(),
     };
 
     if let Some(arr) = extract_array(s, "select")? {
@@ -1039,7 +1076,299 @@ pub fn parse_spec_json(input: &str) -> Result<Spec, String> {
     } else if has("topKPerGroup") {
         return Err("analysis/invalid-args: topKPerGroup must be an object".into());
     }
+    if let Some(arr) = extract_array(s, "window")? {
+        for obj in split_top_objects(&arr)? {
+            spec.window.push(parse_window(&obj)?);
+        }
+        if spec.window.len() > MAX_WINDOW_OPS {
+            return Err(format!(
+                "analysis/invalid-args: window must list 1..={MAX_WINDOW_OPS} ops"
+            ));
+        }
+    } else if has("window") {
+        return Err("analysis/invalid-args: window must be an array".into());
+    }
     Ok(spec)
+}
+
+fn parse_window(obj: &str) -> Result<WindowOp, String> {
+    let t = obj.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return Err("analysis/invalid-args: window entry must be an object".into());
+    }
+    // Reject unknown keys on the window object.
+    for key in top_level_keys(t)? {
+        if !matches!(
+            key.as_str(),
+            "fn" | "by" | "orderBy" | "column" | "alpha" | "as"
+        ) {
+            return Err(format!("analysis/invalid-args: unknown window key {key}"));
+        }
+    }
+    let fn_name = extract_string_field(t, "fn")?
+        .ok_or_else(|| "analysis/invalid-args: window fn required".to_string())?;
+    if !validate_window_fn(&fn_name) {
+        return Err(format!(
+            "analysis/invalid-args: bad window fn {fn_name} (rank|row_number|cumsum|ewm)"
+        ));
+    }
+    let by = match extract_array(t, "by")? {
+        Some(arr) => parse_string_array(&arr)?,
+        None => Vec::new(),
+    };
+    if by.len() > MAX_WINDOW_BY {
+        return Err(format!(
+            "analysis/invalid-args: window by must list 0..={MAX_WINDOW_BY} columns"
+        ));
+    }
+    let needs_by = matches!(fn_name.as_str(), "rank" | "row_number" | "cumsum");
+    if needs_by && by.is_empty() {
+        return Err(format!("analysis/invalid-args: window {fn_name} requires by"));
+    }
+    let order_by = match extract_json_value(t, "orderBy")? {
+        Some(ob) => parse_order_by(&ob)?,
+        None => {
+            return Err(format!(
+                "analysis/invalid-args: window {fn_name} requires orderBy"
+            ))
+        }
+    };
+    let column = extract_string_field(t, "column")?;
+    let needs_column = matches!(fn_name.as_str(), "cumsum" | "ewm");
+    if needs_column && column.is_none() {
+        return Err(format!(
+            "analysis/invalid-args: window {fn_name} requires column"
+        ));
+    }
+    if matches!(fn_name.as_str(), "rank" | "row_number") && column.is_some() {
+        return Err(format!(
+            "analysis/invalid-args: window {fn_name} must not take column"
+        ));
+    }
+    let alpha = if find_key(t, "\"alpha\"").is_some() {
+        let v = extract_number(t, "alpha")?
+            .ok_or_else(|| "analysis/invalid-args: window alpha must be a number".to_string())?;
+        if !(0.0 < v && v <= 1.0) {
+            return Err("analysis/invalid-args: window alpha must be in (0,1]".into());
+        }
+        Some(v)
+    } else {
+        None
+    };
+    if fn_name == "ewm" && alpha.is_none() {
+        return Err("analysis/invalid-args: window ewm requires alpha".into());
+    }
+    if fn_name != "ewm" && alpha.is_some() {
+        return Err(format!(
+            "analysis/invalid-args: window {fn_name} must not take alpha"
+        ));
+    }
+    let as_name = extract_string_field(t, "as")?
+        .ok_or_else(|| "analysis/invalid-args: window as required".to_string())?;
+    if !expr::validate_as_name(&as_name) {
+        return Err(format!(
+            "analysis/invalid-args: invalid window name {as_name}"
+        ));
+    }
+    Ok(WindowOp {
+        r#fn: fn_name,
+        by,
+        order_by,
+        column,
+        alpha,
+        r#as: as_name,
+    })
+}
+
+/// Compare order keys with nulls last (series parity); `desc` reverses non-null only.
+fn cmp_window_key(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        _ => {
+            let ord = cmp_values(a, b);
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
+}
+
+/// Apply all window ops: push one output column (and values) per op.
+fn apply_window(
+    cols: &mut Vec<Column>,
+    rows: &mut Vec<Vec<Value>>,
+    ops: &[WindowOp],
+) -> Result<(), String> {
+    // Collision check against source and prior window outputs.
+    let mut names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+    for w in ops {
+        if names.contains(&w.r#as) {
+            return Err(format!(
+                "analysis/invalid-args: window column collides: {}",
+                w.r#as
+            ));
+        }
+        names.push(w.r#as.clone());
+    }
+
+    for w in ops {
+        // Resolve all indices before any mutation of `cols`.
+        let mut by_idx = Vec::with_capacity(w.by.len());
+        for c in &w.by {
+            by_idx.push(resolve_col(cols, c)?);
+        }
+        let ob_i = resolve_col(cols, &w.order_by.column)?;
+        let col_i = match &w.column {
+            Some(c) => Some(resolve_col(cols, c)?),
+            None => None,
+        };
+
+        // Partition row indices by `by` keys (empty by → single partition).
+        let mut parts: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+        if by_idx.is_empty() {
+            parts.insert(Vec::new(), (0..rows.len()).collect());
+        } else {
+            for (i, row) in rows.iter().enumerate() {
+                let key: Vec<Value> = by_idx
+                    .iter()
+                    .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null))
+                    .collect();
+                parts.entry(key).or_default().push(i);
+            }
+        }
+
+        let mut out = vec![Value::Null; rows.len()];
+        for members in parts.values_mut() {
+            // Stable sort by orderBy (nulls last), ties keep input index order.
+            members.sort_by(|&a, &b| {
+                let va = rows[a].get(ob_i).unwrap_or(&Value::Null);
+                let vb = rows[b].get(ob_i).unwrap_or(&Value::Null);
+                cmp_window_key(va, vb, w.order_by.desc).then_with(|| a.cmp(&b))
+            });
+            match w.r#fn.as_str() {
+                "rank" => {
+                    // Competition ranking on the raw order key: 1,1,3
+                    let mut prev: Option<Value> = None;
+                    let mut rank: i64 = 0;
+                    for (pos, &ri) in members.iter().enumerate() {
+                        let v = rows[ri].get(ob_i).cloned().unwrap_or(Value::Null);
+                        if pos == 0 || !values_eq_for_rank(prev.as_ref(), &v) {
+                            rank = (pos as i64) + 1;
+                            prev = Some(v);
+                        }
+                        out[ri] = Value::I64(rank);
+                    }
+                }
+                "row_number" => {
+                    for (pos, &ri) in members.iter().enumerate() {
+                        out[ri] = Value::I64(pos as i64 + 1);
+                    }
+                }
+                "cumsum" => {
+                    let ci = col_i.expect("cumsum column");
+                    let all_i64 = members.iter().all(|&ri| {
+                        matches!(
+                            rows[ri].get(ci),
+                            None | Some(Value::Null) | Some(Value::I64(_))
+                        )
+                    });
+                    let mut acc: f64 = 0.0;
+                    for &ri in members.iter() {
+                        let cell = rows[ri].get(ci).cloned().unwrap_or(Value::Null);
+                        if let Some(n) = cell.as_f64() {
+                            if n.is_finite() {
+                                acc += n;
+                            }
+                        }
+                        // null contributes 0 (already skipped)
+                        out[ri] = if all_i64 && acc.fract() == 0.0 && acc.abs() < i64::MAX as f64
+                        {
+                            Value::I64(acc as i64)
+                        } else {
+                            Value::F64(acc)
+                        };
+                    }
+                }
+                "ewm" => {
+                    let ci = col_i.expect("ewm column");
+                    let alpha = w.alpha.expect("ewm alpha");
+                    let mut y: Option<f64> = None;
+                    for &ri in members.iter() {
+                        let cell = rows[ri].get(ci).cloned().unwrap_or(Value::Null);
+                        match cell.as_f64().filter(|n| n.is_finite()) {
+                            Some(x) => {
+                                y = Some(match y {
+                                    None => x,
+                                    Some(prev) => (1.0 - alpha) * prev + alpha * x,
+                                });
+                                out[ri] = Value::F64(y.unwrap());
+                            }
+                            None => {
+                                // null leaves y unchanged (still null before first non-null)
+                                out[ri] = match y {
+                                    Some(v) => Value::F64(v),
+                                    None => Value::Null,
+                                };
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!("analysis/invalid-args: bad window fn {other}"));
+                }
+            }
+        }
+        let dtype = match w.r#fn.as_str() {
+            "rank" | "row_number" => "i64".to_string(),
+            "cumsum" => {
+                let ci = col_i.expect("cumsum column");
+                let all_i64 = (0..rows.len()).all(|ri| {
+                    matches!(
+                        rows[ri].get(ci),
+                        None | Some(Value::Null) | Some(Value::I64(_))
+                    )
+                });
+                if all_i64 { "i64" } else { "f64" }.to_string()
+            }
+            _ => "f64".to_string(),
+        };
+        cols.push(Column {
+            name: w.r#as.clone(),
+            dtype,
+        });
+        for (row, v) in rows.iter_mut().zip(out) {
+            row.push(v);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_col(cols: &[Column], name: &str) -> Result<usize, String> {
+    cols.iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| format!("analysis/invalid-args: unknown column {name}"))
+}
+
+/// Equality used for competition-rank grouping of order keys (numeric-aware).
+fn values_eq_for_rank(prev: Option<&Value>, cur: &Value) -> bool {
+    let Some(p) = prev else {
+        return false;
+    };
+    match (p, cur) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => match (p.as_f64(), cur.as_f64()) {
+            (Some(a), Some(b)) => a == b,
+            _ => p.to_json() == cur.to_json(),
+        },
+    }
 }
 
 fn parse_order_by(obj: &str) -> Result<OrderBy, String> {
@@ -2359,5 +2688,161 @@ mod tests {
         let spec = parse_spec_json(r#"{"aggs":[{"fn":"count","as":"n"}]}"#).unwrap();
         let out = run_agg(&t, &spec, 1000, 5000).unwrap();
         assert!(out.warnings.is_empty());
+    }
+
+    /// Three accounts × 10 rows for R-21 acceptance.
+    fn ledger() -> Table {
+        let mut columns = vec![
+            Column { name: "account".into(), dtype: "utf8".into() },
+            Column { name: "ts".into(), dtype: "i64".into() },
+            Column { name: "amount".into(), dtype: "i64".into() },
+        ];
+        let mut rows = Vec::new();
+        for (ai, acct) in ["acc1", "acc2", "acc3"].iter().enumerate() {
+            for t in 1..=10i64 {
+                rows.push(vec![
+                    Value::Str(acct.to_string()),
+                    Value::I64(t),
+                    Value::I64(ai as i64 * 100 + t),
+                ]);
+            }
+        }
+        columns.shrink_to_fit();
+        Table { columns, rows }
+    }
+
+    #[test]
+    fn window_rank_row_number_cumsum_ewm() {
+        let t = ledger();
+        let spec = parse_spec_json(
+            r#"{"window":[
+                {"fn":"rank","by":["account"],"orderBy":{"column":"amount","desc":true},"as":"r_amount"},
+                {"fn":"row_number","by":["account"],"orderBy":{"column":"ts"},"as":"rn"},
+                {"fn":"cumsum","column":"amount","by":["account"],"orderBy":{"column":"ts"},"as":"cum_amt"},
+                {"fn":"ewm","column":"amount","alpha":0.3,"by":["account"],"orderBy":{"column":"ts"},"as":"amt_ewm"}
+            ]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        // Row count unchanged; original columns kept; 4 new columns appended.
+        assert_eq!(out.table.rows.len(), 30);
+        assert_eq!(out.table.columns.len(), 7);
+        assert_eq!(out.table.columns[0].name, "account");
+        assert_eq!(out.table.columns[3].name, "r_amount");
+        assert_eq!(out.table.columns[4].name, "rn");
+        assert_eq!(out.table.columns[5].name, "cum_amt");
+        assert_eq!(out.table.columns[6].name, "amt_ewm");
+        assert_eq!(out.table.columns[5].dtype, "i64");
+        assert_eq!(out.table.columns[6].dtype, "f64");
+
+        // acc1 first row: amount=1 → desc rank 10, rn 1, cum 1, ewm 1
+        let r0 = &out.table.rows[0];
+        assert_eq!(r0[0], Value::Str("acc1".into()));
+        assert_eq!(r0[3], Value::I64(10));
+        assert_eq!(r0[4], Value::I64(1));
+        assert_eq!(r0[5], Value::I64(1));
+        match r0[6] {
+            Value::F64(v) => assert_eq!(v, 1.0),
+            Value::I64(v) => assert_eq!(v, 1),
+            ref other => panic!("ewm first {other:?}"),
+        }
+
+        // Second acc1 row ts=2 amount=2: cum=3, rn=2, rank=9, ewm=1.3
+        let r1 = &out.table.rows[1];
+        assert_eq!(r1[3], Value::I64(9));
+        assert_eq!(r1[4], Value::I64(2));
+        assert_eq!(r1[5], Value::I64(3));
+        match r1[6] {
+            Value::F64(v) => assert!((v - 1.3).abs() < 1e-9, "ewm={v}"),
+            ref other => panic!("ewm second {other:?}"),
+        }
+
+        // Global ewm (no by): first value = first row amount after orderBy
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"ewm","column":"amount","alpha":0.5,"orderBy":{"column":"ts"},"as":"e"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        // sorted by ts only: three accounts' ts=1 first (stable): amounts 1,101,201
+        // row0 amount=1 is first → e=1
+        match out.table.rows[0][3] {
+            Value::F64(v) => assert_eq!(v, 1.0),
+            ref other => panic!("{other:?}"),
+        }
+
+        // Competition rank ties: v=1,3,5,5 → desc ranks 4,3,1,1
+        let t2 = Table {
+            columns: vec![
+                Column { name: "g".into(), dtype: "utf8".into() },
+                Column { name: "v".into(), dtype: "i64".into() },
+            ],
+            rows: vec![
+                vec![Value::Str("x".into()), Value::I64(1)],
+                vec![Value::Str("x".into()), Value::I64(3)],
+                vec![Value::Str("x".into()), Value::I64(5)],
+                vec![Value::Str("x".into()), Value::I64(5)],
+            ],
+        };
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":["g"],"orderBy":{"column":"v","desc":true},"as":"r"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t2, &spec, 1000, 5000).unwrap();
+        assert_eq!(out.table.rows[0][2], Value::I64(4));
+        assert_eq!(out.table.rows[1][2], Value::I64(3));
+        assert_eq!(out.table.rows[2][2], Value::I64(1));
+        assert_eq!(out.table.rows[3][2], Value::I64(1));
+        assert_eq!(out.table.rows.len(), 4);
+    }
+
+    #[test]
+    fn window_parse_errors() {
+        let err = parse_spec_json(r#"{"window":[{"fn":"nope","by":["a"],"orderBy":{"column":"b"},"as":"x"}]}"#)
+            .unwrap_err();
+        assert!(err.contains("bad window fn"), "err={err}");
+
+        let err = parse_spec_json(r#"{"window":[{"fn":"rank","orderBy":{"column":"b"},"as":"x"}]}"#)
+            .unwrap_err();
+        assert!(err.contains("requires by"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":["a"],"orderBy":{"column":"b"},"as":"x","alpha":0.5}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("must not take alpha"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"ewm","column":"a","orderBy":{"column":"b"},"as":"x"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires alpha"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"ewm","column":"a","alpha":0,"orderBy":{"column":"b"},"as":"x"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("alpha must be in"), "err={err}");
+
+        let err = parse_spec_json(
+            r#"{"window":[{"fn":"cumsum","column":"a","by":["a"],"orderBy":{"column":"b"},"as":"x","zz":1}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown window key"), "err={err}");
+
+        // unknown column at runtime
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":["nope"],"orderBy":{"column":"hits"},"as":"x"}]}"#,
+        )
+        .unwrap();
+        let err = run_agg(&table(), &spec, 1000, 5000).unwrap_err();
+        assert!(err.contains("unknown column nope"), "err={err}");
+
+        // collision
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"rank","by":["region"],"orderBy":{"column":"hits"},"as":"hits"}]}"#,
+        )
+        .unwrap();
+        let err = run_agg(&table(), &spec, 1000, 5000).unwrap_err();
+        assert!(err.contains("collides"), "err={err}");
     }
 }

@@ -1623,9 +1623,15 @@ test('R-11: dataset_ingest accepts json (array and records forms) via mock CLI',
     const rec = await defs.dataset_ingest.execute({ path: 'data/b.json' })
     assert.equal(rec.rowCount, 3)
 
+    // parquet format is allowed past the tool layer (R-22); mock rejects
+    // non-parquet bytes with a stable analysis/cli-failed message.
     await assert.rejects(
       () => defs.dataset_ingest.execute({ path: 'data/a.json', format: 'parquet' }),
-      /parquet not supported/,
+      /not a valid parquet file/, 
+    )
+    await assert.rejects(
+      () => defs.dataset_ingest.execute({ path: 'data/a.json', format: 'xlsx' }),
+      /xlsx not supported/,
     )
   } finally {
     rmSync(ws, { recursive: true, force: true })
@@ -1666,6 +1672,139 @@ test('R-19: dataset_list labelLike/producedBy/since filters + createdAt render v
 
     const rendered = defs.dataset_list.output.render({}, all).map(p => p.text).join('')
     assert.match(rendered, /@ /)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+// ---------- v0.1.8–v0.1.10 acceptance (R-21…R-26 tool layer) ----------
+
+test('R-21: validateAggSpec window accepts good ops / rejects bad', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(
+    JSON.stringify({
+      window: [
+        { fn: 'rank', by: ['g'], orderBy: { column: 'v', desc: true }, as: 'r' },
+        { fn: 'cumsum', column: 'v', by: ['g'], orderBy: { column: 't' }, as: 'c' },
+        { fn: 'ewm', column: 'v', alpha: 0.5, orderBy: { column: 't' }, as: 'e' },
+      ],
+    }),
+    limits,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ window: [{ fn: 'rank', orderBy: { column: 'v' }, as: 'x' }] }), limits),
+    /requires by/,
+  )
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ window: [{ fn: 'nope', by: ['g'], orderBy: { column: 'v' }, as: 'x' }] }), limits),
+    /bad window fn/,
+  )
+})
+
+test('R-21: transform_agg window via mock CLI keeps row count', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'w.csv'), 'g,t,v\na,1,10\na,2,20\nb,1,5\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/w.csv' })
+    const out = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        window: [
+          { fn: 'row_number', by: ['g'], orderBy: { column: 't' }, as: 'rn' },
+          { fn: 'cumsum', column: 'v', by: ['g'], orderBy: { column: 't' }, as: 'cum' },
+        ],
+      }),
+    })
+    assert.equal(out.rowCount, 3)
+    assert.ok(out.columns.includes('rn'), JSON.stringify(out.columns))
+    assert.ok(out.columns.includes('cum'), JSON.stringify(out.columns))
+    const aRows = out.rows.filter(r => r[0] === 'a')
+    assert.equal(aRows.length, 2)
+    const rnIdx = out.columns.indexOf('rn')
+    const cumIdx = out.columns.indexOf('cum')
+    assert.deepEqual(aRows.map(r => r[rnIdx]).sort(), [1, 2])
+    assert.deepEqual(aRows.map(r => r[cumIdx]).sort((x, y) => x - y), [10, 30])
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-23: dataset_export accepts format csv|xlsx|parquet; rejects bad format', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'e.csv'), 'a,b\n1,2\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/e.csv' })
+    const csv = await defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'csv' })
+    assert.equal(csv.format, 'csv')
+    const xlsx = await defs.dataset_export.execute({
+      datasetId: ing.datasetId,
+      outPath: 'outputs/e.xlsx',
+      format: 'xlsx',
+    })
+    assert.equal(xlsx.format, 'xlsx')
+    await assert.rejects(
+      () => defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'xml' }),
+      /format must be csv\|xlsx\|parquet/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-25: dataset_crosstab third returns tables; unknown third names column', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 't.csv'),
+      'region,channel,month,n\nN1,app,2026-01,2\nN1,web,2026-01,1\nS1,app,2026-02,4\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/t.csv' })
+    const flat = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'region',
+      cols: 'channel',
+    })
+    assert.ok(Array.isArray(flat.matrix))
+    assert.equal(flat.thirdColumn, undefined)
+
+    const three = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'region',
+      cols: 'channel',
+      third: 'month',
+    })
+    assert.equal(three.thirdColumn, 'month')
+    assert.ok(Array.isArray(three.tables) && three.tables.length >= 1)
+    assert.ok(three.tables[0].third)
+
+    await assert.rejects(
+      () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'region', cols: 'channel', third: 'nope' }),
+      /unknown column nope/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-24: dataset_corr pairs carry pValue via mock', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'c.csv'), 'x,y\n1,2\n2,4\n3,6\n4,8\n5,10\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/c.csv' })
+    const res = await defs.dataset_corr.execute({ datasetId: ing.datasetId, columns: ['x', 'y'] })
+    assert.equal(res.pairs.length, 1)
+    assert.ok('pValue' in res.pairs[0], JSON.stringify(res.pairs[0]))
+    assert.ok(typeof res.pairs[0].pValue === 'number')
+    assert.ok(res.pairs[0].pValue < 0.01, 'p=' + res.pairs[0].pValue)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

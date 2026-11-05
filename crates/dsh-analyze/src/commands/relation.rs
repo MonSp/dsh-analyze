@@ -83,7 +83,130 @@ struct PairOut {
     col_j: usize,
     n: usize,
     r: Option<f64>,
+    p_value: Option<f64>,
     degenerate: bool,
+}
+
+/// Two-sided p-value for Pearson/Spearman r via Student-t approximation.
+/// df = n - 2; t = r * sqrt(df / (1 - r^2)). |r|==1 → p=0 when n>=3;
+/// r null or df < 1 → null.
+fn p_value_from_r(r: Option<f64>, n: usize) -> Option<f64> {
+    let r = r?;
+    if n < 3 {
+        return None;
+    }
+    let df = (n - 2) as f64;
+    if r.abs() >= 1.0 {
+        return Some(0.0);
+    }
+    let denom = 1.0 - r * r;
+    if denom <= 0.0 {
+        return Some(0.0);
+    }
+    let t = r.abs() * (df / denom).sqrt();
+    if !t.is_finite() {
+        return None;
+    }
+    // Two-sided p = I_{df/(df+t^2)}(df/2, 1/2)  (regularized incomplete beta).
+    let x = df / (df + t * t);
+    let p = regularized_beta(x, df / 2.0, 0.5);
+    Some(p.clamp(0.0, 1.0))
+}
+
+/// Regularized incomplete beta I_x(a,b) via Lentz continued fraction.
+fn regularized_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let front = (a * x.ln() + b * (1.0 - x).ln()
+        - (ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b)))
+        .exp();
+    // Use the standard NR-style branch for numerical stability.
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+    .clamp(0.0, 1.0)
+}
+
+/// Continued fraction for incomplete beta (Lentz's method).
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const MAXIT: u32 = 300;
+    const EPS: f64 = 3e-14;
+    const FPMIN: f64 = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0f64;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=MAXIT {
+        let m = m as f64;
+        // even step
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        // odd step
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// Lanczos approximation of ln Γ(z) for z > 0.
+fn ln_gamma(z: f64) -> f64 {
+    const G: [f64; 9] = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+    if z < 0.5 {
+        // reflection formula
+        return (std::f64::consts::PI / (std::f64::consts::PI * z).sin()).ln() - ln_gamma(1.0 - z);
+    }
+    let z = z - 1.0;
+    let mut x = G[0];
+    for (i, g) in G.iter().enumerate().skip(1) {
+        x += g / (z + i as f64);
+    }
+    let t = z + 7.5;
+    (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + x.ln()
 }
 
 pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -230,11 +353,13 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
             } else {
                 pearson(&xs, &ys)
             };
+            let p_value = p_value_from_r(r, n);
             results.push(PairOut {
                 col_i: i,
                 col_j: j,
                 n,
                 r,
+                p_value,
                 degenerate,
             });
         }
@@ -268,13 +393,15 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         .iter()
         .map(|p| {
             let r_s = p.r.map(json_f64).unwrap_or_else(|| "null".into());
+            let p_s = p.p_value.map(json_f64).unwrap_or_else(|| "null".into());
             format!(
-                "{{\"columns\":[{},{}],\"n\":{},\"df\":{},\"r\":{},\"degenerate\":{}}}",
+                "{{\"columns\":[{},{}],\"n\":{},\"df\":{},\"r\":{},\"pValue\":{},\"degenerate\":{}}}",
                 json_string(&columns[p.col_i]),
                 json_string(&columns[p.col_j]),
                 p.n,
                 p.n.saturating_sub(2),
                 r_s,
+                p_s,
                 p.degenerate
             )
         })
@@ -305,75 +432,28 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
 // crosstab
 // ---------------------------------------------------------------------------
 
-pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, u8> {
-    let id = match flag_value(args, "--dataset-id") {
-        Some(v) => v.to_string(),
-        None => return fail(2, "analysis/invalid-args: --dataset-id required"),
-    };
-    let rows_raw = match flag_value(args, "--rows") {
-        Some(v) => v.to_string(),
-        None => return fail(2, "analysis/invalid-args: --rows required"),
-    };
-    let cols_raw = match flag_value(args, "--cols") {
-        Some(v) => v.to_string(),
-        None => return fail(2, "analysis/invalid-args: --cols required"),
-    };
-    let rows_name = rows_raw.trim();
-    let cols_name = cols_raw.trim();
-    if rows_name.is_empty() {
-        return fail(2, "analysis/invalid-args: --rows required");
-    }
-    if cols_name.is_empty() {
-        return fail(2, "analysis/invalid-args: --cols required");
-    }
-    if rows_name == cols_name {
-        return fail(
-            2,
-            "analysis/invalid-args: --rows and --cols must be different columns",
-        );
-    }
-    let top: usize = match flag_value(args, "--top") {
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= 50 => n,
-            _ => return fail(2, "analysis/invalid-args: --top must be integer 1..=50"),
-        },
-        None => 20,
-    };
-    let min_count: usize = match flag_value(args, "--min-count") {
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => return fail(2, "analysis/invalid-args: --min-count must be integer >= 1"),
-        },
-        None => 1,
-    };
-    let drop_null = match flag_value(args, "--drop-null") {
-        Some("true") | Some("True") | Some("1") => true,
-        Some("false") | Some("False") | Some("0") => false,
-        Some(_) => return fail(2, "analysis/invalid-args: --drop-null must be true|false"),
-        None => true,
-    };
-
-    let (meta, table) = load_or_fail(workspace, &id)?;
-    let row_count = meta.row_count.max(table.rows.len());
-
-    let ri = table
-        .columns
-        .iter()
-        .position(|c| &c.name == rows_name)
-        .ok_or_else(|| {
-            eprintln!("analysis/invalid-args: unknown column {rows_name}");
-            2u8
-        })?;
-    let ci = table
-        .columns
-        .iter()
-        .position(|c| &c.name == cols_name)
-        .ok_or_else(|| {
-            eprintln!("analysis/invalid-args: unknown column {cols_name}");
-            2u8
-        })?;
-
-    // One pass: count cells + track first-seen order.
+/// Build one 2-D contingency slice over selected rows of `table`.
+#[allow(clippy::too_many_arguments)]
+fn crosstab_slice(
+    table: &crate::dataset::Table,
+    ri: usize,
+    ci: usize,
+    keep: &[usize],
+    top: usize,
+    min_count: usize,
+    drop_null: bool,
+) -> (
+    Vec<Value>,
+    Vec<Value>,
+    Vec<Vec<usize>>,
+    Vec<usize>,
+    Vec<usize>,
+    usize,
+    usize,
+    bool,
+    usize,
+    Vec<(usize, usize, usize)>,
+) {
     let mut cell_counts: HashMap<(Value, Value), usize> = HashMap::new();
     let mut row_marg: HashMap<Value, usize> = HashMap::new();
     let mut col_marg: HashMap<Value, usize> = HashMap::new();
@@ -382,7 +462,8 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
     let mut null_row_count = 0usize;
     let mut seq = 0usize;
 
-    for row in &table.rows {
+    for &ri_row in keep {
+        let row = &table.rows[ri_row];
         let rv = row.get(ri).cloned().unwrap_or(Value::Null);
         let cv = row.get(ci).cloned().unwrap_or(Value::Null);
         let r_is_null = matches!(rv, Value::Null);
@@ -391,9 +472,6 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
             null_row_count += 1;
             continue;
         }
-        // When drop_null=false, keep Value::Null as its own map key so it
-        // cannot collide with the literal string "__null__"; JSON label is
-        // still `__null__` via category_json.
         let r_key = rv;
         let c_key = cv;
         *cell_counts.entry((r_key.clone(), c_key.clone())).or_insert(0) += 1;
@@ -404,7 +482,6 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
         seq += 1;
     }
 
-    // Select top categories per dimension.
     let mut row_cates: Vec<Value> = row_marg.keys().cloned().collect();
     row_cates.sort_by(|a, b| {
         let ca = row_marg.get(a).copied().unwrap_or(0);
@@ -437,7 +514,6 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
 
     let mut truncated = distinct_rows > top || distinct_cols > top;
 
-    // Build matrix over selected categories only.
     let mut matrix: Vec<Vec<usize>> = vec![vec![0usize; col_cates.len()]; row_cates.len()];
     let mut cell_count = 0usize;
     for ((r, c), n) in &cell_counts {
@@ -456,9 +532,7 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
     let col_totals: Vec<usize> = (0..col_cates.len())
         .map(|j| matrix.iter().map(|row| row[j]).sum())
         .collect();
-    let grand_total: usize = row_totals.iter().sum();
 
-    // topCells from matrix cells with count >= min_count, cap 50.
     let mut cells: Vec<(usize, usize, usize)> = Vec::new();
     for (i, row) in matrix.iter().enumerate() {
         for (j, &n) in row.iter().enumerate() {
@@ -467,72 +541,280 @@ pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, 
             }
         }
     }
-    // count desc, then first-seen (i then j preserves scan order for ties after stable sort by count)
     cells.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1)));
-    let top_cells_total = cells.len();
     cells.truncate(50);
 
-    let row_cates_json = row_cates
-        .iter()
-        .map(category_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    let col_cates_json = col_cates
-        .iter()
-        .map(category_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    let matrix_json = matrix
-        .iter()
-        .map(|row| {
-            let cells = row.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-            format!("[{cells}]")
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let row_totals_json = row_totals
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let col_totals_json = col_totals
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let top_cells_json = cells
-        .iter()
-        .map(|&(i, j, n)| {
-            format!(
-                "{{\"row\":{},\"col\":{},\"count\":{}}}",
-                category_json(&row_cates[i]),
-                category_json(&col_cates[j]),
-                n
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+    (
+        row_cates,
+        col_cates,
+        matrix,
+        row_totals,
+        col_totals,
+        cell_count,
+        null_row_count,
+        truncated,
+        0,
+        cells,
+    )
+}
 
-    // topCells cap note: if more cells existed before truncate, still truncated via matrix flags.
-    // Surface cell-list truncation as truncated=true only if we want — matrix truncation is primary.
-    // Spec: truncated covers category/grid drop. Cell list is a sample of matrix — no extra flag.
-    let _ = top_cells_total;
+pub(crate) fn cmd_crosstab(workspace: &Path, args: &[String]) -> Result<String, u8> {
+    let id = match flag_value(args, "--dataset-id") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --dataset-id required"),
+    };
+    let rows_raw = match flag_value(args, "--rows") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --rows required"),
+    };
+    let cols_raw = match flag_value(args, "--cols") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --cols required"),
+    };
+    let rows_name = rows_raw.trim();
+    let cols_name = cols_raw.trim();
+    if rows_name.is_empty() {
+        return fail(2, "analysis/invalid-args: --rows required");
+    }
+    if cols_name.is_empty() {
+        return fail(2, "analysis/invalid-args: --cols required");
+    }
+    if rows_name == cols_name {
+        return fail(
+            2,
+            "analysis/invalid-args: --rows and --cols must be different columns",
+        );
+    }
+    let third_name = flag_value(args, "--third").map(|s| s.trim().to_string());
+    if let Some(t) = &third_name {
+        if t.is_empty() {
+            return fail(2, "analysis/invalid-args: --third required");
+        }
+        if t == rows_name || t == cols_name {
+            return fail(
+                2,
+                "analysis/invalid-args: --third must differ from --rows and --cols",
+            );
+        }
+    }
+    let top: usize = match flag_value(args, "--top") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= 50 => n,
+            _ => return fail(2, "analysis/invalid-args: --top must be integer 1..=50"),
+        },
+        None => 20,
+    };
+    let min_count: usize = match flag_value(args, "--min-count") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => return fail(2, "analysis/invalid-args: --min-count must be integer >= 1"),
+        },
+        None => 1,
+    };
+    let drop_null = match flag_value(args, "--drop-null") {
+        Some("true") | Some("True") | Some("1") => true,
+        Some("false") | Some("False") | Some("0") => false,
+        Some(_) => return fail(2, "analysis/invalid-args: --drop-null must be true|false"),
+        None => true,
+    };
 
+    let (meta, table) = load_or_fail(workspace, &id)?;
+    let row_count = meta.row_count.max(table.rows.len());
+
+    let resolve = |name: &str| -> Result<usize, u8> {
+        table
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| {
+                eprintln!("analysis/invalid-args: unknown column {name}");
+                2u8
+            })
+    };
+    let ri = resolve(rows_name)?;
+    let ci = resolve(cols_name)?;
+    let ti = match &third_name {
+        Some(t) => Some(resolve(t)?),
+        None => None,
+    };
+
+    let all: Vec<usize> = (0..table.rows.len()).collect();
+
+    // --- No third dimension: legacy 2-D response (v0.1.7 shape) ---
+    if ti.is_none() {
+        let (
+            row_cates,
+            col_cates,
+            matrix,
+            row_totals,
+            col_totals,
+            cell_count,
+            null_row_count,
+            truncated,
+            _,
+            cells,
+        ) = crosstab_slice(&table, ri, ci, &all, top, min_count, drop_null);
+        let grand_total: usize = row_totals.iter().sum();
+        let row_cates_json = row_cates.iter().map(category_json).collect::<Vec<_>>().join(",");
+        let col_cates_json = col_cates.iter().map(category_json).collect::<Vec<_>>().join(",");
+        let matrix_json = matrix
+            .iter()
+            .map(|row| {
+                let cells = row.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                format!("[{cells}]")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let row_totals_json = row_totals
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let col_totals_json = col_totals
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let top_cells_json = cells
+            .iter()
+            .map(|&(i, j, n)| {
+                format!(
+                    "{{\"row\":{},\"col\":{},\"count\":{}}}",
+                    category_json(&row_cates[i]),
+                    category_json(&col_cates[j]),
+                    n
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return Ok(format!(
+            "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"rowColumn\":{},\"colColumn\":{},\"rowCategories\":[{}],\"colCategories\":[{}],\"matrix\":[{}],\"rowTotals\":[{}],\"colTotals\":[{}],\"grandTotal\":{},\"cellCount\":{},\"truncated\":{},\"nullRowCount\":{},\"topCells\":[{}]}}",
+            json_string(&id),
+            row_count,
+            json_string(rows_name),
+            json_string(cols_name),
+            row_cates_json,
+            col_cates_json,
+            matrix_json,
+            row_totals_json,
+            col_totals_json,
+            grand_total,
+            cell_count,
+            truncated,
+            null_row_count,
+            top_cells_json
+        ));
+    }
+
+    // --- Third dimension: tables[] keyed by third category ---
+    let ti = ti.expect("third index");
+    // Group row indices by third value (first-seen order of categories by margin).
+    let mut third_marg: HashMap<Value, usize> = HashMap::new();
+    let mut third_first: HashMap<Value, usize> = HashMap::new();
+    let mut third_groups: HashMap<Value, Vec<usize>> = HashMap::new();
+    let mut null_third_count = 0usize;
+    let mut seq = 0usize;
+    for (i, row) in table.rows.iter().enumerate() {
+        let tv = row.get(ti).cloned().unwrap_or(Value::Null);
+        if drop_null && matches!(tv, Value::Null) {
+            null_third_count += 1;
+            continue;
+        }
+        *third_marg.entry(tv.clone()).or_insert(0) += 1;
+        third_first.entry(tv.clone()).or_insert(seq);
+        third_groups.entry(tv).or_default().push(i);
+        seq += 1;
+    }
+    let mut third_cates: Vec<Value> = third_marg.keys().cloned().collect();
+    third_cates.sort_by(|a, b| {
+        let ca = third_marg.get(a).copied().unwrap_or(0);
+        let cb = third_marg.get(b).copied().unwrap_or(0);
+        cb.cmp(&ca).then_with(|| {
+            third_first
+                .get(a)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&third_first.get(b).copied().unwrap_or(usize::MAX))
+        })
+    });
+    let distinct_third = third_cates.len();
+    third_cates.truncate(top);
+    let third_truncated = distinct_third > top;
+
+    let mut tables_json_parts: Vec<String> = Vec::new();
+    for tv in &third_cates {
+        let members = third_groups.get(tv).cloned().unwrap_or_default();
+        let (
+            row_cates,
+            col_cates,
+            matrix,
+            row_totals,
+            col_totals,
+            cell_count,
+            null_row_count,
+            truncated,
+            _,
+            cells,
+        ) = crosstab_slice(&table, ri, ci, &members, top, min_count, drop_null);
+        let grand_total: usize = row_totals.iter().sum();
+        let row_cates_json = row_cates.iter().map(category_json).collect::<Vec<_>>().join(",");
+        let col_cates_json = col_cates.iter().map(category_json).collect::<Vec<_>>().join(",");
+        let matrix_json = matrix
+            .iter()
+            .map(|row| {
+                let cs = row.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                format!("[{cs}]")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let row_totals_json = row_totals
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let col_totals_json = col_totals
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let top_cells_json = cells
+            .iter()
+            .map(|&(i, j, n)| {
+                format!(
+                    "{{\"row\":{},\"col\":{},\"count\":{}}}",
+                    category_json(&row_cates[i]),
+                    category_json(&col_cates[j]),
+                    n
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        tables_json_parts.push(format!(
+            "{{\"third\":{},\"rowCategories\":[{}],\"colCategories\":[{}],\"matrix\":[{}],\"rowTotals\":[{}],\"colTotals\":[{}],\"grandTotal\":{},\"cellCount\":{},\"truncated\":{},\"nullRowCount\":{},\"topCells\":[{}]}}",
+            category_json(tv),
+            row_cates_json,
+            col_cates_json,
+            matrix_json,
+            row_totals_json,
+            col_totals_json,
+            grand_total,
+            cell_count,
+            truncated,
+            null_row_count,
+            top_cells_json
+        ));
+    }
+    let third_cates_json = third_cates.iter().map(category_json).collect::<Vec<_>>().join(",");
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"rowColumn\":{},\"colColumn\":{},\"rowCategories\":[{}],\"colCategories\":[{}],\"matrix\":[{}],\"rowTotals\":[{}],\"colTotals\":[{}],\"grandTotal\":{},\"cellCount\":{},\"truncated\":{},\"nullRowCount\":{},\"topCells\":[{}]}}",
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"rowColumn\":{},\"colColumn\":{},\"thirdColumn\":{},\"thirdCategories\":[{}],\"tables\":[{}],\"thirdTruncated\":{},\"nullThirdCount\":{}}}",
         json_string(&id),
         row_count,
         json_string(rows_name),
         json_string(cols_name),
-        row_cates_json,
-        col_cates_json,
-        matrix_json,
-        row_totals_json,
-        col_totals_json,
-        grand_total,
-        cell_count,
-        truncated,
-        null_row_count,
-        top_cells_json
+        json_string(third_name.as_deref().unwrap_or("")),
+        third_cates_json,
+        tables_json_parts.join(","),
+        third_truncated,
+        null_third_count
     ))
 }

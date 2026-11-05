@@ -435,6 +435,54 @@ test('R-15: topKPerGroup validates by/k/orderBy ranges', () => {
   }
 })
 
+// ---- v0.1.8 contract: window ops (R-21) ----
+
+test('R-21: validateAggSpec accepts window rank/row_number/cumsum/ewm', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  validateAggSpec(
+    JSON.stringify({
+      window: [
+        { fn: 'rank', by: ['account'], orderBy: { column: 'amount', desc: true }, as: 'r_amount' },
+        { fn: 'row_number', by: ['account'], orderBy: { column: 'ts' }, as: 'rn' },
+        { fn: 'cumsum', column: 'amount', by: ['account'], orderBy: { column: 'ts' }, as: 'cum' },
+        { fn: 'ewm', column: 'amount', alpha: 0.3, orderBy: { column: 'ts' }, as: 'e' },
+      ],
+    }),
+    limits,
+  )
+  validateAggSpec(JSON.stringify({ window: [] }), limits)
+})
+
+test('R-21: validateAggSpec rejects bad window ops', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  const cases = [
+    [{ window: [{ fn: 'nope', by: ['a'], orderBy: { column: 'b' }, as: 'x' }] }, /bad window fn/],
+    [{ window: [{ fn: 'rank', orderBy: { column: 'b' }, as: 'x' }] }, /window rank requires by/],
+    [{ window: [{ fn: 'rank', by: ['a'], orderBy: { column: 'b' }, as: 'x', alpha: 0.5 }] }, /must not take alpha/],
+    [{ window: [{ fn: 'ewm', column: 'a', orderBy: { column: 'b' }, as: 'x' }] }, /window alpha must be in/],
+    [{ window: [{ fn: 'ewm', column: 'a', alpha: 0, orderBy: { column: 'b' }, as: 'x' }] }, /window alpha must be in/],
+    [{ window: [{ fn: 'cumsum', column: 'a', by: ['a'], orderBy: { column: 'b' }, as: 'x', zz: 1 }] }, /unknown window key/],
+    [{ window: [{ fn: 'rank', by: ['a'], orderBy: { column: 'b' }, as: '1bad' }] }, /invalid window name/],
+    [{ window: { fn: 'rank' } }, /window must be an array/],
+  ]
+  for (const [spec, re] of cases) {
+    assert.throws(() => validateAggSpec(JSON.stringify(spec), limits), re)
+  }
+})
+
+// ---- v0.1.10 contract: corr pValue / crosstab third / export format ----
+
+test('R-24/R-25/R-26: tool schemas expose pValue, third, export format', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  // window key is known (not unknown-spec-key)
+  validateAggSpec(JSON.stringify({ window: [{ fn: 'row_number', by: ['g'], orderBy: { column: 't' }, as: 'rn' }] }), limits)
+  assert.throws(
+    () => validateAggSpec(JSON.stringify({ windows: [] }), limits),
+    /unknown spec key/,
+  )
+  void limits
+})
+
 // ---- v0.1.7 contract: select rename + mutate casts (R-9) ----
 
 test('R-9: select entries accept {column,as} renames and reject duplicates', () => {

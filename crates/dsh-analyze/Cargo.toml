@@ -10,5 +10,8 @@ name = "dsh-analyze"
 path = "src/main.rs"
 
 [dependencies]
-# T0 keeps a pure-std implementation so the crate builds offline.
-# T1 may add polars/parquet behind a feature flag.
+arrow-array = "55"
+arrow-schema = "55"
+# Parquet ingest/export (R-22/R-23). arrow feature for record-batch reader/writer.
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"] }
+rust_xlsxwriter = "0.67"

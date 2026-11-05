@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.1.10
+
+P2 gap list (R-24..R-26) from the post-v0.1.7 requirement batch (targets
+renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
+
+### Added
+
+- `corr` / `dataset_corr` pairs report `pValue` (two-sided Student-t
+  approximation via regularized incomplete beta; `r` null or `n < 3` → null).
+- `crosstab` / `dataset_crosstab` optional `--third` / `third`: one call
+  returns `thirdColumn`, `thirdCategories`, and `tables[]` of 2-D slices.
+  Without `third`, response shape is unchanged from v0.1.7.
+
+### Changed
+
+- Interface documents a frozen head/sample/values caps table (R-26; no
+  behavior change). Tool descriptions match `requestedN` / `requestedLimit`.
+- Version and `version` capabilities: `0.1.10` (token list unchanged).
+- Public contract updated in `docs/interface.md` (v0.1.10).
+- Package version `dsh-analyze@0.1.10`.
+
+## 0.1.9
+
+Delivery-chain increment (R-23): multi-format export.
+
+### Added
+
+- `export` / `dataset_export`: `--format` / `format` `csv|xlsx|parquet`
+  (default `csv`; extension may infer when `--format` omitted).
+  - `xlsx`: single sheet `data`, header, true cell types (numbers/bools).
+  - `parquet`: same type map as ingest; round-trips through parquet ingest.
+- Response includes `"format"` alongside `outputPath` / `rowCount` / `bytes`.
+- Unknown format → `analysis/invalid-args` (exit 2).
+
+### Changed
+
+- Version and `version` capabilities: `0.1.9`.
+- Public contract updated in `docs/interface.md` (v0.1.9 section).
+
+## 0.1.8
+
+P0 gap list (R-21..R-22): window operators + Parquet ingest.
+
+### Added
+
+- `agg` spec `window` array: `rank` (competition 1,1,3) / `row_number` /
+  `cumsum` (null source contributes 0) / `ewm` (`alpha ∈ (0,1]`; null x
+  leaves y unchanged). Writes new columns; row count unchanged. Pipeline:
+  `filter → window → topKPerGroup → mutate → group/agg → having → select →
+  orderBy → limit`.
+- `ingest --format parquet` and `.parquet` extension auto-detect. Type map
+  for bool/i64/f64/utf8/timestamp/date; nested list/struct/map rejected with
+  `analysis/invalid-args`; corrupt files → stable `analysis/cli-failed`
+  (no OS text). `xlsx` ingest remains exit 4.
+
+### Changed
+
+- Version and `version` capabilities: `0.1.8` (token list unchanged).
+- Public contract updated in `docs/interface.md` (v0.1.8).
+- Workspace / package version: intermediate `0.1.8` (final branch ships 0.1.10).
+
 ## 0.1.7
 
 Full v0.1.6-联调 requirement list (R-1..R-20): correctness hardening, analysis

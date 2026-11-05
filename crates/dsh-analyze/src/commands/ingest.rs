@@ -73,9 +73,14 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
             eprintln!("{e}");
             1u8
         })?,
-        "parquet" => {
-            return fail(4, "analysis/limit: parquet not supported yet (planned, see docs/interface.md)");
-        }
+        "parquet" => crate::dataset::parse_parquet_path(&path).map_err(|e| {
+            eprintln!("{e}");
+            if e.starts_with("analysis/invalid-args") {
+                2u8
+            } else {
+                1u8
+            }
+        })?,
         "xlsx" => {
             return fail(4, "analysis/limit: xlsx not supported (convert to csv/jsonl)");
         }
