@@ -372,6 +372,166 @@ fn ingest_parquet_types_and_roundtrip() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+/// Decimal128 must be rejected explicitly — never silently read as null.
+#[test]
+fn ingest_parquet_unsupported_decimal_rejected() {
+    use arrow_array::{Decimal128Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let ws = temp_workspace();
+    let path = ws.join("data").join("dec.parquet");
+
+    let schema = Schema::new(vec![Field::new(
+        "price",
+        DataType::Decimal128(10, 2),
+        true,
+    )]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(
+            Decimal128Array::from(vec![12_345i128, 67_890, 11_111])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        )],
+    )
+    .unwrap();
+
+    let file = fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let err = run_fail(&ws, &["ingest", "--input", "data/dec.parquet"], 2);
+    assert!(
+        err.contains(
+            "analysis/invalid-args: parquet type not supported for column price"
+        ),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Empty table parquet export must honor declared dtypes, not all-Boolean.
+#[test]
+fn export_parquet_empty_table_keeps_schema_dtypes() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let ws = temp_workspace();
+    write_file(&ws, "empty.csv", "a,b,c\n");
+    let out = ingest(&ws, "empty.csv", "ds_aabbccdd11223344");
+    assert!(out.contains("\"rowCount\":0"), "{out}");
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/e.parquet",
+            "--format",
+            "parquet",
+        ],
+    );
+    assert!(pq.contains("\"ok\":true"), "{pq}");
+
+    let file = fs::File::open(ws.join(".dsh-analyze/outputs/e.parquet")).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = builder.schema();
+    assert_eq!(schema.fields().len(), 3);
+    for field in schema.fields() {
+        assert_eq!(
+            field.data_type(),
+            &arrow_schema::DataType::Utf8,
+            "empty export column {} should keep utf8, got {:?}",
+            field.name(),
+            field.data_type()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// `--format` is case-insensitive on ingest and export; `XLSX` hits the
+/// exit-4 limit (not `bad format`).
+#[test]
+fn format_flags_are_case_insensitive() {
+    let ws = temp_workspace();
+    write_file(&ws, "d.csv", "a,b\n1,2\n");
+    write_file(&ws, "w.xlsx", "dummy");
+
+    let out = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/d.csv",
+            "--format",
+            "CSV",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+
+    let err = run_fail(
+        &ws,
+        &["ingest", "--input", "data/w.xlsx", "--format", "XLSX"],
+        4,
+    );
+    assert!(
+        err.contains("analysis/limit: xlsx not supported (convert to csv/jsonl)"),
+        "stderr={err}"
+    );
+
+    let pq = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/c.parquet",
+            "--format",
+            "PARQUET",
+        ],
+    );
+    assert!(pq.contains("\"format\":\"parquet\""), "{pq}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// Integers beyond 2^53 export to xlsx as text cells (no silent precision
+/// loss); the file must still be written as a valid workbook.
+#[test]
+fn export_xlsx_large_int_writes_text_cell() {
+    let ws = temp_workspace();
+    write_file(&ws, "big.csv", "n\n9007199254740993\n");
+    ingest(&ws, "big.csv", "ds_aabbccdd11223344");
+
+    let out = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/big.xlsx",
+            "--format",
+            "xlsx",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let path = ws.join(".dsh-analyze/outputs/big.xlsx");
+    let magic = fs::read(&path).unwrap();
+    assert_eq!(&magic[..2], b"PK", "xlsx zip magic");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
 // ------------------------------------------------------- R-12 head / R-13 values
 
 #[test]

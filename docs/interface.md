@@ -85,7 +85,7 @@ quantiles, `having`, `topKPerGroup`, select rename, join `anti`/`semi`,
 
 ### `ingest`
 
-Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet`, `--dataset-id <id>`, `--label <text>`
+Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-insensitive), `--dataset-id <id>`, `--label <text>`
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"bytesOnDisk":N}
@@ -110,7 +110,10 @@ Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet`, `--datase
 
   Dictionary encoding is decoded to the values above; nulls → `Value::Null`.
   Nested `list` / `struct` / `map` → `analysis/invalid-args: parquet nested
-  type not supported for column …` (exit 2). Corrupt / non-parquet masquerade
+  type not supported for column …` (exit 2). Any other type outside the table
+  (Decimal, Time, Duration, Interval, Float16, Dictionary value type, …) →
+  `analysis/invalid-args: parquet type not supported for column …` (exit 2) —
+  never silently read as null. Corrupt / non-parquet masquerade
   → `analysis/cli-failed: not a valid parquet file` (exit 1), no OS text.
   Dataset storage remains the CSV placeholder next to meta (parquet is a
   source format only).
@@ -268,7 +271,7 @@ mutate → group/agg → having → select → orderBy → limit`.
 |---|---|---|
 | `rank` | `by` 1..8, `orderBy`, `as` | Competition rank within partition (1,1,3). Null sort key last. |
 | `row_number` | same | Strict 1..n within partition after orderBy (nulls last, stable input order on ties). |
-| `cumsum` | `by`, `column`, `orderBy`, `as` | Running sum in orderBy order; **null source contributes 0**. Output `i64` if every non-null source is I64, else `f64`. First non-null row amount → first cell equals that amount. |
+| `cumsum` | `by`, `column`, `orderBy`, `as` | Running sum in orderBy order; **null source contributes 0**. Output `i64` if every non-null source is I64, else `f64` — decided once for the whole column, so value variants always match the declared dtype. First non-null row amount → first cell equals that amount. |
 | `ewm` | `column`, `orderBy`, `as`, `alpha`; `by` optional (default whole table) | `y0 = x0` (first non-null); `y_t = (1-α)·y_{t-1} + α·x_t`. Null `x` leaves `y` unchanged; before first non-null → Null. Output `f64`. `alpha ∈ (0,1]`. |
 
 Shared: `as` matches `[A-Za-z_][A-Za-z0-9_]*` ≤64, no collision with existing
@@ -628,7 +631,7 @@ Flags: `--label-like <substr>` (optional), `--produced-by <name>` (optional), `-
 
 ### `export`
 
-Flags: `--dataset-id` (required), `--output <path>` (required), `--format csv|xlsx|parquet` (optional; default inferred from extension, else `csv`)
+Flags: `--dataset-id` (required), `--output <path>` (required), `--format csv|xlsx|parquet` (optional, case-insensitive; default inferred from extension, else `csv`)
 
 - Output is forced under `<workspace>/.dsh-analyze/outputs/` (file name kept).
 - Missing parent directories are created before writing (v0.1.7); escapes stay
@@ -640,6 +643,8 @@ Flags: `--dataset-id` (required), `--output <path>` (required), `--format csv|xl
     multi-sheet.
   - `parquet` — type map inverse of ingest (i64→INT64, f64→DOUBLE, bool→BOOLEAN,
     utf8→STRING/BYTE_ARRAY). Round-trips through `ingest --format parquet`.
+    Empty tables write each column with its declared dataset dtype (never
+    all-Boolean).
 - Unknown `--format` → `analysis/invalid-args: bad format … (csv|xlsx|parquet)` (exit 2).
 - Explicit `--format` wins over extension mismatch.
 
@@ -736,7 +741,8 @@ profile root is known. The deny list is a defensive path guard only; see
 - UDF / JS / Python expressions
 - Full correlation-matrix export / confidence intervals / regression (pair
   `pValue` only, v0.1.10)
-- Nested parquet (list/struct/map)
+- Nested parquet (list/struct/map) and non-map parquet types (decimal/time/
+  duration/interval/…)
 - Expanding windows, centered series windows, multi-key series order
   (`agg` `window` rank/row_number/cumsum/ewm is the v0.1.8 slice)
 - MCP adapter (deferred; see TODO.md)

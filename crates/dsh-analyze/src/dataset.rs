@@ -466,7 +466,12 @@ pub fn parse_parquet_path(path: &Path) -> Result<Table, String> {
     let mut col_kinds: Vec<ParquetColKind> = Vec::new();
     for field in schema.fields() {
         col_names.push(field.name().clone());
-        let (dtype, kind) = parquet_field_map(field.data_type());
+        let (dtype, kind) = parquet_field_map(field.data_type()).map_err(|_| {
+            format!(
+                "analysis/invalid-args: parquet type not supported for column {}",
+                field.name()
+            )
+        })?;
         col_dtypes.push(dtype);
         col_kinds.push(kind);
     }
@@ -518,9 +523,12 @@ fn is_nested_parquet_type(dt: &arrow_schema::DataType) -> bool {
     )
 }
 
-fn parquet_field_map(dt: &arrow_schema::DataType) -> (String, ParquetColKind) {
+/// Map an Arrow type to our dtype + value kind. Anything outside this
+/// allowlist (Decimal, Time, Duration, Interval, Dictionary, Float16, …) is
+/// rejected by the caller — never silently read as null.
+fn parquet_field_map(dt: &arrow_schema::DataType) -> Result<(String, ParquetColKind), ()> {
     use arrow_schema::DataType;
-    match dt {
+    Ok(match dt {
         DataType::Boolean => ("bool".into(), ParquetColKind::Bool),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             ("i64".into(), ParquetColKind::I64)
@@ -528,17 +536,15 @@ fn parquet_field_map(dt: &arrow_schema::DataType) -> (String, ParquetColKind) {
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             ("i64".into(), ParquetColKind::I64)
         }
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-            ("f64".into(), ParquetColKind::F64)
-        }
+        DataType::Float32 | DataType::Float64 => ("f64".into(), ParquetColKind::F64),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
             ("utf8".into(), ParquetColKind::Str)
         }
         DataType::Timestamp(_, _) => ("utf8".into(), ParquetColKind::Timestamp),
         DataType::Date32 | DataType::Date64 => ("utf8".into(), ParquetColKind::Date),
         DataType::Null => ("utf8".into(), ParquetColKind::Str),
-        _ => ("utf8".into(), ParquetColKind::Str),
-    }
+        _ => return Err(()),
+    })
 }
 
 fn parquet_value_at(col: &arrow_array::ArrayRef, row: usize, kind: &ParquetColKind) -> Value {
@@ -594,6 +600,8 @@ fn parquet_value_at(col: &arrow_array::ArrayRef, row: usize, kind: &ParquetColKi
                 Value::Str(String::from_utf8_lossy(a.value(row)).into_owned())
             } else if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
                 Value::Str(a.value(row).to_string())
+            } else if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+                Value::Str(String::from_utf8_lossy(a.value(row)).into_owned())
             } else {
                 Value::Null
             }

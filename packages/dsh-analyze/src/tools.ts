@@ -765,11 +765,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         const abs = resolveInWorkspace(ws, a.path)
         assertNotSensitiveSource(abs, config.profileRoot)
         // parquet is enabled (R-22); xlsx remains rejected pre-spawn.
-        if (a.format === 'xlsx') {
+        // Format is case-insensitive (parity with the CLI).
+        const format = typeof a.format === 'string' && a.format ? a.format.toLowerCase() : undefined
+        if (format === 'xlsx') {
           throw limitError('xlsx not supported (convert to csv/jsonl)')
         }
         const cliArgs = ['ingest', '--input', a.path, '--dataset-id', newDatasetId()]
-        if (a.format) cliArgs.push('--format', a.format)
+        if (format) cliArgs.push('--format', format)
         if (a.label) cliArgs.push('--label', a.label)
         const result = await run(cliArgs, exec?.signal)
         return result.data
@@ -1038,10 +1040,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         resolveInWorkspace(ws, outPath)
         const cliArgs = ['export', '--dataset-id', a.datasetId, '--output', outPath]
         if (a.format !== undefined && a.format !== null) {
-          if (typeof a.format !== 'string' || !['csv', 'xlsx', 'parquet'].includes(a.format)) {
+          const fmt = typeof a.format === 'string' ? a.format.toLowerCase() : ''
+          if (!['csv', 'xlsx', 'parquet'].includes(fmt)) {
             throw invalidArgs('format must be csv|xlsx|parquet')
           }
-          cliArgs.push('--format', a.format)
+          cliArgs.push('--format', fmt)
         }
         const result = await run(cliArgs, exec?.signal)
         return result.data
@@ -1950,7 +1953,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             tables: { type: 'array', items: { type: 'object', additionalProperties: true } },
             topCells: { type: 'array', items: { type: 'object', additionalProperties: true } },
             truncated: { type: 'boolean' },
+            thirdTruncated: { type: 'boolean' },
             nullRowCount: { type: 'number' },
+            nullThirdCount: { type: 'number' },
           },
           required: ['datasetId', 'rowColumn', 'colColumn'],
           additionalProperties: true,
@@ -1964,10 +1969,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             rowCategories?: unknown[]
             colCategories?: unknown[]
             matrix?: number[][]
-            tables?: Array<{ third: unknown; rowCategories?: unknown[]; colCategories?: unknown[]; matrix?: number[][] }>
+            tables?: Array<{ third: unknown; rowCategories?: unknown[]; colCategories?: unknown[]; matrix?: number[][]; truncated?: boolean }>
             grandTotal?: number
             truncated?: boolean
+            thirdTruncated?: boolean
             nullRowCount?: number
+            nullThirdCount?: number
           }
           if (Array.isArray(v.tables) && v.tables.length > 0) {
             const parts = v.tables.map((t) => {
@@ -1977,11 +1984,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               const body = rows
                 .map((r, i) => [r, ...(t.matrix?.[i] ?? [])].join('\t'))
                 .join('\n')
-              return `third=${String(t.third)}\n${header}\n${body}`
+              return `third=${String(t.third)}${t.truncated ? ' [truncated]' : ''}\n${header}\n${body}`
             })
             return textRender(withWarnings(
               `crosstab ${v.datasetId}: ${v.rowColumn} × ${v.colColumn} × ${v.thirdColumn ?? 'third'} ` +
-                `(${v.tables.length} tables` + (v.truncated ? ', truncated' : '') + ')\n' +
+                `(${v.tables.length} tables` +
+                (v.thirdTruncated ? ', third truncated' : '') +
+                `, nulls=${v.nullThirdCount ?? 0})\n` +
                 parts.join('\n\n'),
               value,
             ))

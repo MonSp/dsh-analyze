@@ -21,6 +21,25 @@ renumbered from v0.2.x to v0.1.8/v0.1.9/v0.1.10).
 - Public contract updated in `docs/interface.md` (v0.1.10).
 - Package version `dsh-analyze@0.1.10`.
 
+### Fixed
+
+- Parquet ingest: types outside the documented map (Decimal, Time, Duration,
+  Interval, Float16, Dictionary value type, …) are rejected with
+  `analysis/invalid-args: parquet type not supported for column …` (exit 2)
+  instead of being silently read as null.
+- `export --format parquet` on an empty table writes each column with its
+  declared dataset dtype instead of collapsing every column to Boolean.
+- `agg` `window` cumsum: declared dtype is decided once for the whole column
+  and shared by every partition, so value variants always match the schema
+  on mixed i64/f64 data.
+- `dataset_crosstab` render: third responses now surface `thirdTruncated`,
+  per-table `truncated`, and `nullThirdCount`.
+- `--format` / `format` is case-insensitive on ingest and export (CLI and
+  tool layer), matching the documented behavior; `XLSX` ingest reaches the
+  exit-4 limit instead of `bad format`.
+- `export --format xlsx`: integers beyond 2^53 are written as text cells
+  instead of silently losing precision as numbers.
+
 ## 0.1.9
 
 Delivery-chain increment (R-23): multi-format export.

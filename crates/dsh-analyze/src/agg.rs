@@ -1228,6 +1228,21 @@ fn apply_window(
             None => None,
         };
 
+        // One dtype decision for the whole column, shared by every partition
+        // and by the declared dtype below — value variants must never disagree
+        // with the schema (mixed tables: per-partition decisions diverged).
+        let cum_all_i64 = if w.r#fn.as_str() == "cumsum" {
+            let ci = col_i.expect("cumsum column");
+            (0..rows.len()).all(|ri| {
+                matches!(
+                    rows[ri].get(ci),
+                    None | Some(Value::Null) | Some(Value::I64(_))
+                )
+            })
+        } else {
+            false
+        };
+
         // Partition row indices by `by` keys (empty by → single partition).
         let mut parts: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
         if by_idx.is_empty() {
@@ -1271,12 +1286,6 @@ fn apply_window(
                 }
                 "cumsum" => {
                     let ci = col_i.expect("cumsum column");
-                    let all_i64 = members.iter().all(|&ri| {
-                        matches!(
-                            rows[ri].get(ci),
-                            None | Some(Value::Null) | Some(Value::I64(_))
-                        )
-                    });
                     let mut acc: f64 = 0.0;
                     for &ri in members.iter() {
                         let cell = rows[ri].get(ci).cloned().unwrap_or(Value::Null);
@@ -1286,7 +1295,7 @@ fn apply_window(
                             }
                         }
                         // null contributes 0 (already skipped)
-                        out[ri] = if all_i64 && acc.fract() == 0.0 && acc.abs() < i64::MAX as f64
+                        out[ri] = if cum_all_i64 && acc.fract() == 0.0 && acc.abs() < i64::MAX as f64
                         {
                             Value::I64(acc as i64)
                         } else {
@@ -1326,14 +1335,7 @@ fn apply_window(
         let dtype = match w.r#fn.as_str() {
             "rank" | "row_number" => "i64".to_string(),
             "cumsum" => {
-                let ci = col_i.expect("cumsum column");
-                let all_i64 = (0..rows.len()).all(|ri| {
-                    matches!(
-                        rows[ri].get(ci),
-                        None | Some(Value::Null) | Some(Value::I64(_))
-                    )
-                });
-                if all_i64 { "i64" } else { "f64" }.to_string()
+                if cum_all_i64 { "i64" } else { "f64" }.to_string()
             }
             _ => "f64".to_string(),
         };
@@ -2793,6 +2795,45 @@ mod tests {
         assert_eq!(out.table.rows[2][2], Value::I64(1));
         assert_eq!(out.table.rows[3][2], Value::I64(1));
         assert_eq!(out.table.rows.len(), 4);
+    }
+
+    #[test]
+    fn window_cumsum_mixed_dtype_values_match_declared() {
+        // Group x is all-integral, group y has an F64 → declared f64 for the
+        // whole column; the all-i64 partition must still emit F64 values.
+        let t = Table {
+            columns: vec![
+                Column { name: "g".into(), dtype: "utf8".into() },
+                Column { name: "v".into(), dtype: "f64".into() },
+            ],
+            rows: vec![
+                vec![Value::Str("x".into()), Value::I64(1)],
+                vec![Value::Str("x".into()), Value::I64(2)],
+                vec![Value::Str("y".into()), Value::I64(10)],
+                vec![Value::Str("y".into()), Value::F64(0.5)],
+            ],
+        };
+        let spec = parse_spec_json(
+            r#"{"window":[{"fn":"cumsum","column":"v","by":["g"],"orderBy":{"column":"v"},"as":"c"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        assert_eq!(out.table.columns[2].dtype, "f64");
+        for (i, row) in out.table.rows.iter().enumerate() {
+            assert!(
+                matches!(row[2], Value::F64(_)),
+                "row {i}: declared f64 but value {:?}",
+                row[2]
+            );
+        }
+        match out.table.rows[0][2] {
+            Value::F64(v) => assert_eq!(v, 1.0),
+            ref other => panic!("x partition first {other:?}"),
+        }
+        match out.table.rows[1][2] {
+            Value::F64(v) => assert_eq!(v, 3.0),
+            ref other => panic!("x partition second {other:?}"),
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
         None => return fail(2, "analysis/invalid-args: --input required"),
     };
     let format = flag_value(args, "--format")
-        .map(|s| s.to_string())
+        .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| {
             let lower = input.to_ascii_lowercase();
             if lower.ends_with(".parquet") {

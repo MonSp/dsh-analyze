@@ -169,7 +169,17 @@ async function main() {
     if (!input) fail(2, 'analysis/invalid-args: --input required')
     const path = within(ws, input)
     if (!existsSync(path)) fail(2, 'analysis/invalid-path: not a file')
-    const format = getFlag(rest, '--format') || (path.endsWith('.parquet') ? 'parquet' : path.endsWith('.jsonl') ? 'jsonl' : path.endsWith('.json') ? 'json' : 'csv')
+    const rawFormat = getFlag(rest, '--format')
+    const lowerPath = String(path).toLowerCase()
+    const format = rawFormat
+      ? String(rawFormat).toLowerCase()
+      : lowerPath.endsWith('.parquet')
+        ? 'parquet'
+        : lowerPath.endsWith('.jsonl')
+          ? 'jsonl'
+          : lowerPath.endsWith('.json')
+            ? 'json'
+            : 'csv'
     // xlsx ingest remains disabled; parquet accepted at tool layer but mock
     // only understands text formats — non-parquet bytes → stable analysis/*.
     if (format === 'xlsx') fail(4, 'analysis/limit: xlsx not supported (convert to csv/jsonl)')

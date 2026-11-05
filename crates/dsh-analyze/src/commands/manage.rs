@@ -212,8 +212,15 @@ fn write_export_xlsx(path: &Path, table: &crate::dataset::Table) -> Result<u64, 
                         .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
                 }
                 Value::I64(i) => {
-                    ws.write_number(r, c, *i as f64)
-                        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+                    // Excel numbers are f64: beyond 2^53 a number cell would
+                    // silently lose precision, so write those as text.
+                    if i.unsigned_abs() > (1u64 << 53) - 1 {
+                        ws.write_string(r, c, i.to_string())
+                            .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+                    } else {
+                        ws.write_number(r, c, *i as f64)
+                            .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+                    }
                 }
                 Value::F64(f) => {
                     ws.write_number(r, c, *f)
@@ -244,6 +251,30 @@ fn write_export_parquet(path: &Path, table: &crate::dataset::Table) -> Result<u6
     let mut arrays: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(table.columns.len());
     for (i, col) in table.columns.iter().enumerate() {
         let rows = &table.rows;
+        if rows.is_empty() {
+            // No values to infer from: honor the declared column dtype so
+            // empty exports don't collapse every column to Boolean.
+            let dt = match col.dtype.as_str() {
+                "bool" => DataType::Boolean,
+                "i64" => DataType::Int64,
+                "f64" => DataType::Float64,
+                _ => DataType::Utf8,
+            };
+            fields.push(Field::new(&col.name, dt.clone(), true));
+            match dt {
+                DataType::Boolean => {
+                    arrays.push(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())))
+                }
+                DataType::Int64 => {
+                    arrays.push(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())))
+                }
+                DataType::Float64 => {
+                    arrays.push(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())))
+                }
+                _ => arrays.push(Arc::new(StringArray::from(Vec::<Option<String>>::new()))),
+            }
+            continue;
+        }
         let all_i64 = rows.iter().all(|r| {
             matches!(
                 r.get(i),

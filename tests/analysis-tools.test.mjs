@@ -1638,6 +1638,34 @@ test('R-11: dataset_ingest accepts json (array and records forms) via mock CLI',
   }
 })
 
+test('dataset_ingest/export format is case-insensitive (tool layer)', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'f.csv'), 'a,b\n1,2\n', 'utf8')
+    const defs = makeDefs(ws)
+
+    const ing = await defs.dataset_ingest.execute({ path: 'data/f.csv', format: 'CSV' })
+    assert.ok(ing.datasetId, JSON.stringify(ing))
+
+    // Uppercase XLSX must hit the documented limit error, not fall through
+    // to the CLI as `bad format`.
+    await assert.rejects(
+      () => defs.dataset_ingest.execute({ path: 'data/f.csv', format: 'XLSX' }),
+      /xlsx not supported/,
+    )
+
+    const exp = await defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'PARQUET' })
+    assert.equal(exp.format, 'parquet')
+
+    await assert.rejects(
+      () => defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'xml' }),
+      /format must be csv/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
 test('R-19: dataset_list labelLike/producedBy/since filters + createdAt render via mock CLI', async () => {
   const ws = makeWorkspace()
   try {
@@ -1783,6 +1811,25 @@ test('R-25: dataset_crosstab third returns tables; unknown third names column', 
     assert.equal(three.thirdColumn, 'month')
     assert.ok(Array.isArray(three.tables) && three.tables.length >= 1)
     assert.ok(three.tables[0].third)
+
+    // Render must surface third-level truncation + null third count
+    // (thirdTruncated / nullThirdCount live at the top level, not `truncated`).
+    const renderedFlat = defs.dataset_crosstab.output.render({}, three).map(p => p.text).join('')
+    assert.match(renderedFlat, /tables/)
+    assert.match(renderedFlat, /nulls=/)
+
+    const threeTop1 = await defs.dataset_crosstab.execute({
+      datasetId: ing.datasetId,
+      rows: 'region',
+      cols: 'channel',
+      third: 'month',
+      top: 1,
+    })
+    // 2 distinct months > top=1
+    assert.equal(threeTop1.thirdTruncated, true)
+    const rendered = defs.dataset_crosstab.output.render({}, threeTop1).map(p => p.text).join('')
+    assert.match(rendered, /third truncated/, rendered)
+    assert.match(rendered, /nulls=\d+/, rendered)
 
     await assert.rejects(
       () => defs.dataset_crosstab.execute({ datasetId: ing.datasetId, rows: 'region', cols: 'channel', third: 'nope' }),
