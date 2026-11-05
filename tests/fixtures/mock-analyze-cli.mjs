@@ -155,7 +155,7 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.10-mock',
+      version: '0.1.11-mock',
       capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
     }))
     return
@@ -216,6 +216,8 @@ async function main() {
       table = parseCsv(text)
     }
     const label = getFlag(rest, '--label')
+    // R-30: record --encoding for arg-passing tests (no real decoding in the mock).
+    const encoding = getFlag(rest, '--encoding')
     const { meta, bytes } = writeDataset(ws, id, table, {
       sourceKind: format === 'json' ? 'json' : 'csv',
       sourcePath: input,
@@ -229,6 +231,7 @@ async function main() {
       columnCount: meta.columnCount,
       columns: meta.columns,
       bytesOnDisk: bytes,
+      ...(encoding !== undefined ? { encoding: String(encoding).toLowerCase() } : {}),
     }))
     return
   }
@@ -757,34 +760,53 @@ async function main() {
       outHeaders = [...work.headers]
       outRows = work.rows.map(r => [...r])
     } else {
+      // S2.2 grammar: fixed ±HH:MM (HH 00..=14, MM 00..=59) or Asia/Shanghai → minutes.
+      const resolveTzMin = (v) => {
+        if (v === 'Asia/Shanghai') return 480
+        const m = typeof v === 'string' && v.match(/^([+-])(\d{2}):(\d{2})$/)
+        if (m) {
+          const hh = +m[2]
+          const mm = +m[3]
+          if (hh <= 14 && mm <= 59) return (m[1] === '-' ? -1 : 1) * (hh * 60 + mm)
+        }
+        fail(2, `analysis/invalid-args: bad tz "${v}" (expected +HH:MM or Asia/Shanghai)`)
+      }
       const gKeys = groupBy.map(g => {
         if (typeof g === 'string') return { kind: 'col', name: g, ci: widx(g) }
         if (g && g.dateColumn && g.period) {
           if (!['day', 'week', 'month'].includes(g.period)) fail(2, `analysis/invalid-args: bad period ${g.period}`)
-          return { kind: 'time', name: `${g.dateColumn}_${g.period}`, ci: widx(g.dateColumn), period: g.period }
+          // R-29: optional tz → minutes east of UTC (default 0 = UTC).
+          let tzMin = 0
+          if (g.tz !== undefined && g.tz !== null) tzMin = resolveTzMin(g.tz)
+          return { kind: 'time', name: `${g.dateColumn}_${g.period}`, ci: widx(g.dateColumn), period: g.period, tz: tzMin }
         }
         fail(2, 'analysis/invalid-args: bad groupBy entry')
       })
-      const parseTs = (s, period) => {
+      const parseTs = (s, period, tzMin) => {
         const t = String(s).trim()
-        const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?(?:Z|z|[+-]\d{2}:?\d{2})?$/)
+        const m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?(Z|z|[+-]\d{2}:?\d{2})?$/)
           || t.match(/^(\d{4})\/(\d{2})\/(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/)
           || t.match(/^(\d{4})(\d{2})(\d{2})$/)
         if (!m) return null
         let y = +m[1], mo = +m[2], d = +m[3]
+        // S2.3: offset-bearing values shift to E's wall clock; date-only and
+        // naive values keep their wall-clock date (tz never shifts them).
+        // Offset only applies when a time-of-day was parsed (parity with the
+        // pre-tz mock behavior for date-only / bare-date shapes).
         if (m[4] !== undefined) {
-          // apply crude offset if present (UTC default)
-          const off = t.match(/([+-])(\d{2}):?(\d{2})$/)
-          if (off) {
-            let mins = (+m[4]) * 60 + (+m[5]) + (off[1] === '-' ? -1 : 1) * ((+off[2]) * 60 + (+off[3]))
-            // shift day only for simplicity
-            const dayDelta = Math.floor(mins / 1440)
-            // normalize via Date UTC
-            const dt = new Date(Date.UTC(y, mo - 1, d, +m[4], +m[5]))
-            // subtract offset minutes to get UTC
-            dt.setUTCMinutes(dt.getUTCMinutes() - (off[1] === '-' ? -1 : 1) * ((+off[2]) * 60 + (+off[3])))
+          let off = null
+          const o = m[7]
+          if (o === 'Z' || o === 'z') off = 0
+          else if (o) {
+            const om = o.match(/^([+-])(\d{2}):?(\d{2})$/)
+            if (om) off = (om[1] === '-' ? -1 : 1) * ((+om[2]) * 60 + (+om[3]))
+          }
+          if (off !== null) {
+            // E wall minutes-from-midnight = wall + (E - value offset); day delta only.
+            const totalMin = (+m[4]) * 60 + (+m[5]) + (tzMin - off)
+            const dayDelta = Math.floor(totalMin / 1440)
+            const dt = new Date(Date.UTC(y, mo - 1, d + dayDelta))
             y = dt.getUTCFullYear(); mo = dt.getUTCMonth() + 1; d = dt.getUTCDate()
-            void dayDelta
           }
         }
         if (period === 'month') return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}`
@@ -803,7 +825,7 @@ async function main() {
           if (g.kind === 'col') return row[g.ci]
           const cell = row[g.ci]
           if (cell === null || cell === undefined || cell === '') return null
-          const b = parseTs(cell, g.period)
+          const b = parseTs(cell, g.period, g.tz ?? 0)
           if (b === null) {
             parseFailCount++
             const s = String(cell)

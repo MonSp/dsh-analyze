@@ -98,6 +98,17 @@ function limitError(message: string): Error & { code?: string } {
   return err
 }
 
+/** R-29 `tz` grammar (S2.2): fixed ±HH:MM (HH 00..=14, MM 00..=59) or Asia/Shanghai. */
+function validateTz(v: unknown): void {
+  if (v === 'Asia/Shanghai') return
+  if (typeof v === 'string' && /^[+-]\d{2}:\d{2}$/.test(v)) {
+    const hh = Number(v.slice(1, 3))
+    const mm = Number(v.slice(4, 6))
+    if (hh <= 14 && mm <= 59) return
+  }
+  throw invalidArgs(`bad tz "${String(v)}" (expected +HH:MM or Asia/Shanghai)`)
+}
+
 /** Unified `warnings[]` rendering appended to every tool result (R-20). */
 export function renderWarningsBlock(value: unknown): string {
   const w = (value as { warnings?: unknown }).warnings
@@ -589,6 +600,10 @@ export function validateAggSpec(spec: string, limits: AnalysisLimits): string {
         if (!['day', 'week', 'month'].includes(go.period)) {
           throw invalidArgs('period must be day|week|month')
         }
+        // R-29: optional tz (extract-only semantics otherwise; unknown keys stay tolerated).
+        if (go.tz !== undefined) {
+          validateTz(go.tz)
+        }
         continue
       }
       throw invalidArgs('groupBy entry must be string or object')
@@ -716,6 +731,11 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             enum: ['csv', 'json', 'jsonl', 'parquet'],
             description: 'Source format. Omit to infer from extension.',
           },
+          encoding: {
+            type: 'string',
+            enum: ['utf-8', 'gbk', 'gb18030', 'auto'],
+            description: 'CSV text encoding (csv only). Default utf-8.',
+          },
           label: { type: 'string', description: 'Optional short label for humans.' },
         },
         required: ['path'],
@@ -761,13 +781,24 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
-        const a = args as { path: string; format?: string; label?: string }
+        const a = args as { path: string; format?: string; label?: string; encoding?: string }
         if (typeof a.path !== 'string' || a.path.length === 0 || a.path.length > MAX_PATH_LEN) {
           throw invalidArgs('path length invalid')
         }
         if (a.label !== undefined && a.label !== null) {
           if (typeof a.label !== 'string' || a.label.length > MAX_LABEL_LEN) {
             throw invalidArgs(`label must be string ≤ ${MAX_LABEL_LEN}`)
+          }
+        }
+        // R-30: encoding enum pre-spawn (belt-and-suspenders; csv-only stays in the CLI).
+        let encoding: string | undefined
+        if (a.encoding !== undefined && a.encoding !== null) {
+          if (typeof a.encoding !== 'string') {
+            throw invalidArgs(`bad encoding ${String(a.encoding)}`)
+          }
+          encoding = a.encoding.toLowerCase()
+          if (!['utf-8', 'gbk', 'gb18030', 'auto'].includes(encoding)) {
+            throw invalidArgs(`bad encoding ${encoding}`)
           }
         }
         const abs = resolveInWorkspace(ws, a.path)
@@ -781,6 +812,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         const cliArgs = ['ingest', '--input', a.path, '--dataset-id', newDatasetId()]
         if (format) cliArgs.push('--format', format)
         if (a.label) cliArgs.push('--label', a.label)
+        if (encoding) cliArgs.push('--encoding', encoding)
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },
@@ -1183,7 +1215,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
               'count_distinct/first/last need column. ' +
               'mutate: [{as,expr}] whitelist arithmetic + to_int(e)/to_str(e)/to_date(e,fmt) + "string literals"; ' +
               'to_date fmt supports %Y %m %d %H %M %S directives only. ' +
-              'groupBy entries: column name or {dateColumn,period:day|week|month}. ' +
+              'groupBy entries: column name or {dateColumn,period:day|week|month,tz?:+HH:MM|Asia/Shanghai}. ' +
               'having filters result rows after group/agg (same shape as filter). ' +
               'select entries: "col" or {column,as} renames. ' +
               'Unknown top-level spec keys are rejected.',

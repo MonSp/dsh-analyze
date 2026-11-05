@@ -59,10 +59,24 @@ impl Period {
     }
 }
 
-/// Parse a timestamp into its UTC calendar date.
-/// Accepted shapes (UTC): `%Y-%m-%d`, `%Y-%m-%dT%H:%M:%S` (with `Z` / offset),
-/// `%Y/%m/%d`, `%Y/%m/%d %H:%M:%S`, `%Y%m%d`.
-pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
+/// A parsed timestamp kept rich enough to bucket in a target timezone (R-29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedTs {
+    /// Wall-clock calendar date exactly as written in the value.
+    pub wall: UtcParts,
+    /// Wall-clock hour (0 for date-only values).
+    pub hour: u32,
+    /// Wall-clock minute (0 for date-only values).
+    pub minute: u32,
+    /// `Some(offset_minutes)` when the value carried `Z` / `±HH:MM` / `±HHMM`;
+    /// `None` for date-only and naive values (never shifted by tz).
+    pub offset_minutes: Option<i64>,
+}
+
+/// Parse a timestamp keeping wall-clock fields, time-of-day, and the original
+/// offset (R-29). Accepted shapes: `%Y-%m-%d`, `%Y-%m-%dT%H:%M:%S` (with
+/// `Z` / offset), `%Y/%m/%d`, `%Y/%m/%d %H:%M:%S`, `%Y%m%d`.
+pub fn parse_timestamp(s: &str) -> Option<ParsedTs> {
     let t = s.trim();
     if t.is_empty() {
         return None;
@@ -72,7 +86,13 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
         let year: i32 = t.get(0..4)?.parse().ok()?;
         let month: u32 = t.get(4..6)?.parse().ok()?;
         let day: u32 = t.get(6..8)?.parse().ok()?;
-        return valid_date(year, month, day);
+        let wall = valid_date(year, month, day)?;
+        return Some(ParsedTs {
+            wall,
+            hour: 0,
+            minute: 0,
+            offset_minutes: None,
+        });
     }
     if t.len() < 8 {
         return None;
@@ -89,11 +109,16 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
         return None;
     }
     let day: u32 = t.get(8..10)?.parse().ok()?;
-    valid_date(year, month, day)?;
+    let wall = valid_date(year, month, day)?;
     // optional time
     let rest = t.get(10..)?;
     if rest.is_empty() {
-        return Some(UtcParts { year, month, day });
+        return Some(ParsedTs {
+            wall,
+            hour: 0,
+            minute: 0,
+            offset_minutes: None,
+        });
     }
     if !rest.starts_with('T') && !rest.starts_with('t') && !rest.starts_with(' ') {
         return None;
@@ -115,13 +140,38 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
         let sec_str = sec_part.split('.').next().unwrap_or("0");
         let _sec: i64 = sec_str.parse().ok()?;
     }
-    // local = UTC + offset  →  UTC minutes from midnight = local - offset
-    let total_min = hour * 60 + minute - offset;
-    // shift date by offset-adjusted day delta (already relative to UTC midnight)
-    let mut y = year;
-    let mut m = month as i32;
-    let mut d = day as i32;
-    let mut day_delta = total_min.div_euclid(24 * 60);
+    Some(ParsedTs {
+        wall,
+        hour: hour as u32,
+        minute: minute as u32,
+        offset_minutes: offset,
+    })
+}
+
+/// Parse a timestamp into its UTC calendar date (default E=UTC rule).
+pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
+    parse_timestamp(s).map(|p| bucket_date(&p, 0))
+}
+
+/// Calendar date of `p` in the effective timezone `tz_offset_min` (minutes
+/// east of UTC), per the S2.3 rules table:
+/// - date-only / naive values: wall-clock date as written (never shifted);
+/// - values carrying an offset: instant converted to E's wall-clock.
+/// With `tz_offset_min == 0` this equals the historical UTC result.
+pub fn bucket_date(p: &ParsedTs, tz_offset_min: i64) -> UtcParts {
+    let Some(off) = p.offset_minutes else {
+        return p.wall;
+    };
+    // E wall minutes-from-midnight = wall + (E - value offset); day delta only.
+    let total_min = p.hour as i64 * 60 + p.minute as i64 + (tz_offset_min - off);
+    shift_days(p.wall, total_min.div_euclid(24 * 60))
+}
+
+/// Shift a civil date by whole days (may be negative).
+fn shift_days(base: UtcParts, mut day_delta: i64) -> UtcParts {
+    let mut y = base.year;
+    let mut m = base.month as i32;
+    let mut d = base.day as i32;
     while day_delta != 0 {
         if day_delta > 0 {
             d += 1;
@@ -147,11 +197,40 @@ pub fn parse_timestamp_utc_date(s: &str) -> Option<UtcParts> {
             }
         }
     }
-    Some(UtcParts {
+    UtcParts {
         year: y,
         month: m as u32,
         day: d as u32,
-    })
+    }
+}
+
+/// Bucket key for `p` in effective timezone `tz_offset_min` (R-29).
+pub fn bucket_key_tz(p: &ParsedTs, period: &Period, tz_offset_min: i64) -> String {
+    bucket_key(bucket_date(p, tz_offset_min), period)
+}
+
+/// Parse a `groupBy` `tz` string (S2.2): fixed `±HH:MM` (`HH` 00..=14,
+/// `MM` 00..=59) or IANA whitelist v1 (`Asia/Shanghai` → +08:00, hand-rolled,
+/// no chrono-tz). Returns minutes east of UTC; `None` when rejected.
+pub fn parse_tz(v: &str) -> Option<i64> {
+    if v == "Asia/Shanghai" {
+        return Some(8 * 60);
+    }
+    let b = v.as_bytes();
+    if b.len() != 6 || b[3] != b':' {
+        return None;
+    }
+    let sign: i64 = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hh: i64 = v.get(1..3)?.parse().ok()?;
+    let mm: i64 = v.get(4..6)?.parse().ok()?;
+    if !(0..=14).contains(&hh) || !(0..=59).contains(&mm) {
+        return None;
+    }
+    Some(sign * (hh * 60 + mm))
 }
 
 fn valid_date(year: i32, month: u32, day: u32) -> Option<UtcParts> {
@@ -274,10 +353,12 @@ fn take_digits(sc: &[char], si: &mut usize, n: usize) -> Option<String> {
 }
 
 /// Split trailing `Z` / `±HH:MM` / `±HHMM` off the time string.
-/// Returns (time_without_offset, offset_minutes).
-fn split_offset(rest: &str) -> (&str, i64) {
+/// Returns (time_without_offset, offset_minutes) — `None` when the value
+/// carried no offset at all (date-only / naive), which the tz rules require
+/// to stay unshifted.
+fn split_offset(rest: &str) -> (&str, Option<i64>) {
     if let Some(stripped) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
-        return (stripped, 0);
+        return (stripped, Some(0));
     }
     // find last + or - after position 0 (not year sign)
     if let Some(pos) = rest.rfind(['+', '-']) {
@@ -296,10 +377,10 @@ fn split_offset(rest: &str) -> (&str, i64) {
             };
             let h: i64 = h_str.parse().unwrap_or(0);
             let m: i64 = m_str.parse().unwrap_or(0);
-            return (time_part, sign * (h * 60 + m));
+            return (time_part, Some(sign * (h * 60 + m)));
         }
     }
-    (rest, 0)
+    (rest, None)
 }
 
 fn is_leap(y: i32) -> bool {
@@ -464,5 +545,84 @@ mod tests {
         assert_eq!(t.to_iso(false), "2026-10-02");
         assert!(parse_with_fmt("2026-10-02", "%Y/%m/%d").is_none());
         assert!(parse_with_fmt("2026/10/02x", "%Y/%m/%d").is_none());
+    }
+
+    // ---- R-29: tz grammar (S2.2) -------------------------------------------
+
+    #[test]
+    fn tz_grammar_accepts_fixed_offset_and_whitelist() {
+        assert_eq!(parse_tz("+00:00"), Some(0));
+        assert_eq!(parse_tz("+08:00"), Some(480));
+        assert_eq!(parse_tz("-05:30"), Some(-330));
+        assert_eq!(parse_tz("+14:00"), Some(840));
+        assert_eq!(parse_tz("-14:00"), Some(-840));
+        assert_eq!(parse_tz("Asia/Shanghai"), Some(480));
+    }
+
+    #[test]
+    fn tz_grammar_rejects_everything_else() {
+        for bad in [
+            "Asia/Tokyo",
+            "UTC",
+            "+15:00",
+            "-15:00",
+            "+8:00",
+            "08:00",
+            "+08:60",
+            "+0800",
+            "",
+            "+ab:cd",
+        ] {
+            assert_eq!(parse_tz(bad), None, "bad={bad}");
+        }
+    }
+
+    // ---- R-29: E-calendar bucketing (S2.3) ---------------------------------
+
+    #[test]
+    fn tz_day_buckets_lock_both_sides_of_sample() {
+        // §7.1 three-row +08:00 flow: with tz Asia/Shanghai vs default UTC.
+        let p = parse_timestamp("2026-10-01T00:30:00+08:00").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 480), "2026-10-01");
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 0), "2026-09-30");
+        let p = parse_timestamp("2026-10-01T12:00:00+08:00").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 480), "2026-10-01");
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 0), "2026-10-01");
+        let p = parse_timestamp("2026-10-02T01:00:00+08:00").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 480), "2026-10-02");
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 0), "2026-10-01");
+    }
+
+    #[test]
+    fn tz_month_crosses_boundary() {
+        // Local 10-01 00:30+08:00: October in Shanghai, September in UTC.
+        let p = parse_timestamp("2026-10-01T00:30:00+08:00").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Month, 480), "2026-10");
+        assert_eq!(bucket_key_tz(&p, &Period::Month, 0), "2026-09");
+    }
+
+    #[test]
+    fn tz_week_crosses_boundary() {
+        // 2026-10-04 is a Sunday; +08:00 moves the instant to Monday 10-05.
+        let p = parse_timestamp("2026-10-04T23:30:00Z").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Week, 0), "2026-09-28");
+        assert_eq!(bucket_key_tz(&p, &Period::Week, 480), "2026-10-05");
+    }
+
+    #[test]
+    fn tz_date_only_never_shifts() {
+        let p = parse_timestamp("2026-10-01").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 480), "2026-10-01");
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 0), "2026-10-01");
+        let p = parse_timestamp("20261001").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Month, 480), "2026-10");
+    }
+
+    #[test]
+    fn tz_naive_is_local_wall_clock() {
+        // Naive value with tz: treated as E's local wall-clock, no shift.
+        let p = parse_timestamp("2026-09-30 18:00:00").unwrap();
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 480), "2026-09-30");
+        assert_eq!(bucket_key_tz(&p, &Period::Day, 0), "2026-09-30");
     }
 }

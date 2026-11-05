@@ -780,8 +780,245 @@ fn version_capabilities_include_new_commands() {
         assert!(o.status.success());
         String::from_utf8(o.stdout).unwrap()
     };
-    assert!(out.contains("\"version\":\"0.1.10\""), "{out}");
+    assert!(out.contains("\"version\":\"0.1.11\""), "{out}");
     for tok in ["\"union\"", "\"diff\"", "\"pivot\""] {
         assert!(out.contains(tok), "missing {tok}: {out}");
     }
+}
+
+// ------------------------------------------------------------- R-30 encoding
+
+fn write_bytes(ws: &Path, name: &str, bytes: &[u8]) {
+    fs::write(ws.join("data").join(name), bytes).unwrap();
+}
+
+/// GBK/GB18030 bytes for the §7.2 Chinese fixture (generated, not hardcoded).
+fn gbk_fixture(text: &str) -> Vec<u8> {
+    let (bytes, _, had_errors) = encoding_rs::GBK.encode(text);
+    assert!(!had_errors, "fixture text must be GBK-encodable: {text}");
+    bytes.into_owned()
+}
+
+const GBK_FIXTURE: &str = "地区,金额\n东省,100\n西省,200\n";
+const PLAN_B_UTF8: &str =
+    "analysis/invalid-args: file is not valid UTF-8 (re-save as CSV UTF-8, or pass --encoding gbk)";
+
+#[test]
+fn ingest_gb18030_default_utf8_rejects_with_plan_b_message() {
+    let ws = temp_workspace();
+    let bytes = gbk_fixture(GBK_FIXTURE);
+    // Fixture sanity: invalid UTF-8, valid GB18030 (never lossy — both checked).
+    assert!(std::str::from_utf8(&bytes).is_err(), "fixture must not be UTF-8");
+    assert!(
+        encoding_rs::GBK
+            .decode_without_bom_handling_and_without_replacement(&bytes)
+            .is_some(),
+        "fixture must decode as GB18030"
+    );
+    write_bytes(&ws, "gbk.csv", &bytes);
+
+    let err = run_fail(&ws, &["ingest", "--input", "data/gbk.csv"], 2);
+    assert!(
+        err.contains(PLAN_B_UTF8),
+        "exact Plan B message expected, stderr={err}"
+    );
+    // No dataset must be written on decode failure.
+    let list = run_ok(&ws, &["list"]);
+    assert_eq!(list.matches("\"datasetId\":").count(), 0, "{list}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_gb18030_gbk_gb18030_and_auto_succeed_auto_warns() {
+    let ws = temp_workspace();
+    write_bytes(&ws, "gbk.csv", &gbk_fixture(GBK_FIXTURE));
+
+    // (b) --encoding gb18030 (uppercase: flag value is case-insensitive)
+    let out = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/gbk.csv",
+            "--encoding",
+            "GB18030",
+            "--dataset-id",
+            "ds_gbk000000000001",
+        ],
+    );
+    assert_eq!(json_usize_field(&out, "rowCount"), Some(2), "{out}");
+    assert!(!out.contains("warnings"), "explicit mode must not warn: {out}");
+    let head = run_ok(&ws, &["head", "--dataset-id", "ds_gbk000000000001", "--n", "5"]);
+    assert!(head.contains("地区") && head.contains("金额"), "header: {head}");
+    assert!(head.contains("东省") && head.contains("西省"), "values: {head}");
+    assert!(head.contains("100") && head.contains("200"), "amounts: {head}");
+
+    // (c) --encoding gbk — same decoder path, no warning
+    let out2 = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/gbk.csv",
+            "--encoding",
+            "gbk",
+            "--dataset-id",
+            "ds_gbk000000000002",
+        ],
+    );
+    assert_eq!(json_usize_field(&out2, "rowCount"), Some(2), "{out2}");
+    assert!(!out2.contains("warnings"), "explicit gbk must not warn: {out2}");
+
+    // (d) --encoding auto → GB18030 fallback with encoding-fallback warning
+    let out3 = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/gbk.csv",
+            "--encoding",
+            "auto",
+            "--dataset-id",
+            "ds_gbk000000000003",
+        ],
+    );
+    assert_eq!(json_usize_field(&out3, "rowCount"), Some(2), "{out3}");
+    assert!(
+        out3.contains(
+            "\"warnings\":[{\"code\":\"encoding-fallback\",\"encoding\":\"gb18030\"}]"
+        ),
+        "auto must warn on fallback: {out3}"
+    );
+    let head3 = run_ok(&ws, &["head", "--dataset-id", "ds_gbk000000000003", "--n", "5"]);
+    assert!(head3.contains("东省") && head3.contains("地区"), "{head3}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_utf8_with_and_without_bom_default_and_auto_no_warning() {
+    let ws = temp_workspace();
+    write_bytes(&ws, "u8.csv", GBK_FIXTURE.as_bytes());
+    let mut bom = vec![0xEF, 0xBB, 0xBF];
+    bom.extend_from_slice(GBK_FIXTURE.as_bytes());
+    write_bytes(&ws, "bom.csv", &bom);
+
+    for (name, id) in [
+        ("u8.csv", "ds_utf8000000000001"),
+        ("bom.csv", "ds_utf8000000000002"),
+    ] {
+        // Default utf-8
+        let out = run_ok(
+            &ws,
+            &["ingest", "--input", &format!("data/{name}"), "--dataset-id", id],
+        );
+        assert_eq!(json_usize_field(&out, "rowCount"), Some(2), "{name}: {out}");
+        assert!(!out.contains("warnings"), "utf-8 must not warn: {out}");
+        let head = run_ok(&ws, &["head", "--dataset-id", id, "--n", "5"]);
+        assert!(
+            head.contains("地区") && head.contains("东省"),
+            "{name} header must be BOM-clean: {head}"
+        );
+
+        // auto: valid UTF-8 (BOM or not) → same rows, no fallback warning
+        let id_auto = format!("{id}a");
+        let out2 = run_ok(
+            &ws,
+            &[
+                "ingest",
+                "--input",
+                &format!("data/{name}"),
+                "--encoding",
+                "auto",
+                "--dataset-id",
+                &id_auto,
+            ],
+        );
+        assert_eq!(json_usize_field(&out2, "rowCount"), Some(2), "{name}: {out2}");
+        assert!(!out2.contains("warnings"), "auto on utf-8 must not warn: {out2}");
+    }
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_corrupt_bytes_rejected_in_every_mode_no_dataset() {
+    let ws = temp_workspace();
+    // Lone 0xFF: invalid UTF-8 and malformed for the GB18030 decoder too
+    // (0xFF is neither ASCII, 0x80, nor a 0x81..=0xFE lead byte).
+    // Built as a Vec so the check below is a real runtime assertion.
+    let corrupt: Vec<u8> = vec![b'i', b'd', b',', b'x', b'\n', 0xFF, b'\n'];
+    assert!(std::str::from_utf8(&corrupt).is_err(), "corrupt must fail UTF-8");
+    assert!(
+        encoding_rs::GBK
+            .decode_without_bom_handling_and_without_replacement(&corrupt)
+            .is_none(),
+        "corrupt must fail GB18030 fatal decode"
+    );
+    write_bytes(&ws, "corrupt.csv", &corrupt);
+
+    for enc in [None, Some("utf-8"), Some("gbk"), Some("gb18030"), Some("auto")] {
+        let mut args = vec![
+            "ingest",
+            "--input",
+            "data/corrupt.csv",
+            "--dataset-id",
+            "ds_corrupt00000001",
+        ];
+        if let Some(e) = enc {
+            args.extend(["--encoding", e]);
+        }
+        let err = run_fail(&ws, &args, 2);
+        assert!(
+            err.starts_with("analysis/invalid-args:"),
+            "enc={enc:?} stderr={err}"
+        );
+    }
+
+    // Never a garbage dataset: nothing listed, no meta written.
+    let list = run_ok(&ws, &["list"]);
+    assert_eq!(list.matches("\"datasetId\":").count(), 0, "{list}");
+    assert!(
+        !ws.join(".dsh-analyze/datasets/ds_corrupt00000001.meta.json").exists(),
+        "meta must not exist after decode failure"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_encoding_flag_rejected_for_non_csv_formats() {
+    let ws = temp_workspace();
+    write_file(&ws, "d.json", "[{\"a\":1}]");
+
+    let err = run_fail(
+        &ws,
+        &["ingest", "--input", "data/d.json", "--encoding", "gbk"],
+        2,
+    );
+    assert!(
+        err.contains("analysis/invalid-args: --encoding only applies to csv"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ingest_bad_encoding_value_is_invalid_args() {
+    let ws = temp_workspace();
+    write_file(&ws, "d.csv", "a\n1\n");
+
+    let err = run_fail(
+        &ws,
+        &["ingest", "--input", "data/d.csv", "--encoding", "latin1"],
+        2,
+    );
+    assert!(
+        err.contains("analysis/invalid-args: bad encoding latin1"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
 }

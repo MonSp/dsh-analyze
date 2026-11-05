@@ -1881,3 +1881,143 @@ test('R-24: dataset_corr pairs carry pValue via mock', async () => {
     rmSync(ws, { recursive: true, force: true })
   }
 })
+
+// ---------- v0.1.11 acceptance: R-29 groupBy tz (T3) + R-30 encoding (T5) ----------
+
+test('R-29: validateAggSpec accepts valid tz (fixed offset + whitelist)', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  for (const tz of ['+08:00', 'Asia/Shanghai', '-05:30', '+14:00', '+00:00']) {
+    validateAggSpec(
+      JSON.stringify({ groupBy: [{ dateColumn: 'ts', period: 'day', tz }] }),
+      limits,
+    )
+  }
+  // tz absent stays valid (back-compat)
+  validateAggSpec(JSON.stringify({ groupBy: [{ dateColumn: 'ts', period: 'day' }] }), limits)
+  // spec description mentions optional tz
+  const ws = makeWorkspace()
+  try {
+    const defs = makeDefs(ws)
+    assert.match(
+      defs.transform_agg.parameters.properties.spec.description,
+      /tz\?:\+HH:MM\|Asia\/Shanghai/,
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-29: validateAggSpec rejects bad tz with analysis/invalid-args', () => {
+  const limits = DEFAULT_ANALYSIS_LIMITS
+  for (const tz of ['Asia/Tokyo', '+15:00', '08:00', 480]) {
+    assert.throws(
+      () => validateAggSpec(JSON.stringify({ groupBy: [{ dateColumn: 'ts', period: 'day', tz }] }), limits),
+      (err) => {
+        assert.equal(err.code, 'analysis/invalid-args', `tz=${JSON.stringify(tz)}: ${err.message}`)
+        assert.match(err.message, /bad tz/)
+        return true
+      },
+      `tz=${JSON.stringify(tz)}`,
+    )
+  }
+})
+
+test('R-29: transform_agg day buckets with/without tz via mock CLI (§7.1 both sides)', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(
+      join(ws, 'data', 'flow.csv'),
+      'ts,amt\n' +
+        '2026-10-01T00:30:00+08:00,10\n' +
+        '2026-10-01T12:00:00+08:00,20\n' +
+        '2026-10-02T01:00:00+08:00,30\n',
+      'utf8',
+    )
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/flow.csv', format: 'csv' })
+    const specFor = (tz) =>
+      JSON.stringify({
+        groupBy: [{ dateColumn: 'ts', period: 'day', ...(tz ? { tz } : {}) }],
+        aggs: [
+          { fn: 'sum', column: 'amt', as: 's' },
+          { fn: 'count', as: 'n' },
+        ],
+        orderBy: [{ column: 'ts_day' }],
+      })
+
+    // with tz: local 10-01 00:30 belongs to 10-01 (both Asia/Shanghai and +08:00)
+    for (const tz of ['Asia/Shanghai', '+08:00']) {
+      const withTz = await defs.transform_agg.execute({ datasetId: ing.datasetId, spec: specFor(tz) })
+      assert.deepEqual(
+        withTz.rows,
+        [['2026-10-01', 30, 2], ['2026-10-02', 30, 1]],
+        `tz=${tz}: ${JSON.stringify(withTz.rows)}`,
+      )
+    }
+
+    // without tz (default UTC): regression lock on both buckets
+    const noTz = await defs.transform_agg.execute({ datasetId: ing.datasetId, spec: specFor() })
+    assert.deepEqual(
+      noTz.rows,
+      [['2026-09-30', 10, 1], ['2026-10-01', 50, 2]],
+      JSON.stringify(noTz.rows),
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-30: dataset_ingest encoding schema enum accepts four values; bad value rejected pre-spawn', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'enc.csv'), 'a,b\n1,2\n', 'utf8')
+    const defs = makeDefs(ws)
+
+    // schema declares the four-value enum (additionalProperties:false requires this)
+    const enc = defs.dataset_ingest.parameters.properties.encoding
+    assert.ok(enc, 'encoding property declared')
+    assert.equal(enc.type, 'string')
+    assert.deepEqual(enc.enum, ['utf-8', 'gbk', 'gb18030', 'auto'])
+
+    // all four enum values pass pre-spawn and reach the mock
+    for (const encoding of enc.enum) {
+      const res = await defs.dataset_ingest.execute({ path: 'data/enc.csv', format: 'csv', encoding })
+      assert.equal(res.ok, true, JSON.stringify(res))
+      assert.equal(res.encoding, encoding, `mock saw encoding for ${encoding}`)
+    }
+
+    // invalid value rejected before spawn with analysis/invalid-args
+    await assert.rejects(
+      () => defs.dataset_ingest.execute({ path: 'data/enc.csv', format: 'csv', encoding: 'latin1' }),
+      (err) => {
+        assert.equal(err.code, 'analysis/invalid-args', err.message)
+        assert.match(err.message, /bad encoding/)
+        return true
+      },
+    )
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-30: dataset_ingest passes --encoding gbk through to the mock CLI', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'gbk.csv'), 'region,amount\nA,1\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/gbk.csv', format: 'csv', encoding: 'gbk' })
+    assert.equal(ing.ok, true)
+    // mock echoes the flag only when --encoding was actually passed
+    assert.equal(ing.encoding, 'gbk')
+
+    // omitted encoding → CLI default path, no flag echoed
+    const plain = await defs.dataset_ingest.execute({ path: 'data/gbk.csv', format: 'csv' })
+    assert.equal(plain.ok, true)
+    assert.equal(plain.encoding, undefined)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})

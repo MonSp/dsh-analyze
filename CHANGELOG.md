@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.11
+
+P0 correctness batch (R-29..R-30) from the post-v0.1.10 requirement list:
+timezone-aware day boundaries and Chinese-locale CSV ingest.
+
+### Added
+
+- `agg` / `transform_agg` time-period `groupBy` accepts optional `tz`
+  (R-29): fixed `±HH:MM` (HH 00..=14) or IANA whitelist v1 (`Asia/Shanghai`
+  → +08:00, hand-rolled). `day` / `week` (Monday) / `month` bucket on the
+  target timezone's calendar. Default remains UTC; date-only values never
+  shift; naive date-times with `tz` set are treated as local wall-clock.
+  Invalid `tz` → `analysis/invalid-args` (exit 2); `validateAggSpec` mirrors
+  the grammar before spawn.
+- `ingest --encoding utf-8|gbk|gb18030|auto` (R-30, csv only, default
+  `utf-8`). `auto` = BOM sniff → strict UTF-8 → fatal GB18030 fallback with
+  `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`. Decoding is
+  never lossy.
+
+### Changed
+
+- CSV decode failures are now `analysis/invalid-args` **exit 2** with an
+  actionable message (`file is not valid UTF-8 (re-save as CSV UTF-8, or pass
+  --encoding gbk)`); previously exit 1 `cli-failed: … read failed`. Real
+  filesystem errors stay exit 1.
+- `dataset_list --since` documented as UTC-interpreted (no behavior change).
+- Interface contract updated in `docs/interface.md` (v0.1.11); USAGE lists
+  `--encoding`.
+- Version and `version` capabilities: `0.1.11` (token list unchanged).
+- Package version `dsh-analyze@0.1.11`. New dependency: `encoding_rs` (GB18030
+  decode).
+
 ## 0.1.10
 
 P2 gap list (R-24..R-26) from the post-v0.1.7 requirement batch (targets

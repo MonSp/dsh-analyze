@@ -390,7 +390,7 @@ fn series_unknown_column_exit_2() {
 fn series_version_has_capability() {
     let ws = temp_workspace();
     let out = run_ok(&ws, &["version"]);
-    assert!(out.contains("\"version\":\"0.1.10\""));
+    assert!(out.contains("\"version\":\"0.1.11\""));
     assert!(out.contains("\"series\""));
 }
 

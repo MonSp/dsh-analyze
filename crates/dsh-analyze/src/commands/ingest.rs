@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::cli::{env_u64, fail, flag_value};
 use crate::dataset::{
-    ensure_within_workspace, json_string, new_dataset_id, parse_csv_path, parse_json_path,
-    parse_jsonl_path, save_meta, write_table_parquet_placeholder, Meta,
+    decode_csv_bytes, ensure_within_workspace, json_string, new_dataset_id, parse_csv_bytes,
+    parse_json_path, parse_jsonl_path, save_meta, write_table_parquet_placeholder, Meta,
 };
 
 pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -28,6 +28,16 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
                 "csv".into()
             }
         });
+    let encoding = flag_value(args, "--encoding").map(|s| s.to_ascii_lowercase());
+    if let Some(enc) = &encoding {
+        if !matches!(enc.as_str(), "utf-8" | "gbk" | "gb18030" | "auto") {
+            return fail(2, &format!("analysis/invalid-args: bad encoding {enc}"));
+        }
+        if format != "csv" {
+            return fail(2, "analysis/invalid-args: --encoding only applies to csv");
+        }
+    }
+    let encoding = encoding.unwrap_or_else(|| "utf-8".to_string());
     let label = flag_value(args, "--label").map(|s| s.to_string());
     let dataset_id = flag_value(args, "--dataset-id")
         .map(|s| s.to_string())
@@ -56,11 +66,31 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
         return fail(3, "analysis/limit: input too large");
     }
 
+    let mut encoding_fallback = false;
     let table = match format.as_str() {
-        "csv" => parse_csv_path(&path).map_err(|e| {
-            eprintln!("{e}");
-            1u8
-        })?,
+        "csv" => {
+            // Whole-file read: metadata cap first (above), then re-check the
+            // actual byte count; decode per --encoding before line parsing.
+            let bytes = fs::read(&path).map_err(|e| {
+                eprintln!(
+                    "analysis/cli-failed: cannot read file: {}",
+                    crate::dataset::io_read_reason(&e)
+                );
+                1u8
+            })?;
+            if bytes.len() as u64 > max_bytes {
+                return fail(3, "analysis/limit: input too large");
+            }
+            let (decoded, fallback) = decode_csv_bytes(&bytes, &encoding).map_err(|e| {
+                eprintln!("{e}");
+                2u8
+            })?;
+            encoding_fallback = fallback;
+            parse_csv_bytes(decoded.as_bytes()).map_err(|e| {
+                eprintln!("{e}");
+                1u8
+            })?
+        }
         "json" => parse_json_path(&path).map_err(|e| {
             eprintln!("{e}");
             if e.starts_with("analysis/invalid-args") {
@@ -115,12 +145,18 @@ pub(crate) fn cmd_ingest(workspace: &Path, args: &[String]) -> Result<String, u8
         1u8
     })?;
 
+    let warnings = if encoding_fallback {
+        ",\"warnings\":[{\"code\":\"encoding-fallback\",\"encoding\":\"gb18030\"}]"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"bytesOnDisk\":{}}}",
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"bytesOnDisk\":{}{}}}",
         json_string(&id),
         table.rows.len(),
         table.columns.len(),
         meta.columns_json(),
-        bytes
+        bytes,
+        warnings
     ))
 }

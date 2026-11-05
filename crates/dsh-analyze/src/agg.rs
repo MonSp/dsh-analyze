@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::dataset::{Column, Table, Value};
 use crate::expr::{self, EvalCounters, Expr, ExprType};
-use crate::time::{bucket_key, parse_timestamp_utc_date, Period};
+use crate::time::{bucket_key_tz, parse_timestamp, parse_tz, Period};
 
 #[derive(Debug, Clone)]
 pub struct Filter {
@@ -73,6 +73,9 @@ pub enum GroupKeySpec {
     Period {
         date_column: String,
         period: Period,
+        /// Resolved effective-timezone offset in minutes east of UTC
+        /// (0 = default UTC; R-29 `tz`).
+        tz_offset_min: i64,
     },
 }
 
@@ -337,6 +340,7 @@ pub fn run_agg(
             GroupKeySpec::Period {
                 date_column,
                 period,
+                tz_offset_min,
             } => {
                 let ci = work_cols
                     .iter()
@@ -348,6 +352,7 @@ pub fn run_agg(
                 group_resolvers.push(GroupResolver::Time {
                     col: ci,
                     period: period.clone(),
+                    tz_offset_min: *tz_offset_min,
                 });
             }
         }
@@ -361,7 +366,11 @@ pub fn run_agg(
                 GroupResolver::Col(ci) => {
                     key.push(row.get(*ci).cloned().unwrap_or(Value::Null));
                 }
-                GroupResolver::Time { col, period } => {
+                GroupResolver::Time {
+                    col,
+                    period,
+                    tz_offset_min,
+                } => {
                     let cell = row.get(*col).cloned().unwrap_or(Value::Null);
                     let bucket = match &cell {
                         Value::Null => Value::Null,
@@ -370,8 +379,10 @@ pub fn run_agg(
                             if t.is_empty() {
                                 Value::Null
                             } else {
-                                match parse_timestamp_utc_date(t) {
-                                    Some(p) => Value::Str(bucket_key(p, period)),
+                                match parse_timestamp(t) {
+                                    Some(p) => {
+                                        Value::Str(bucket_key_tz(&p, period, *tz_offset_min))
+                                    }
                                     None => {
                                         parse_fail_count += 1;
                                         push_parse_sample(&mut parse_fail_sample, t);
@@ -383,8 +394,8 @@ pub fn run_agg(
                         other => {
                             let j = other.to_json();
                             let s = j.trim_matches('"');
-                            match parse_timestamp_utc_date(s) {
-                                Some(p) => Value::Str(bucket_key(p, period)),
+                            match parse_timestamp(s) {
+                                Some(p) => Value::Str(bucket_key_tz(&p, period, *tz_offset_min)),
                                 None => {
                                     parse_fail_count += 1;
                                     push_parse_sample(&mut parse_fail_sample, s);
@@ -560,7 +571,11 @@ fn top_k_rows(table: &Table, keep: &[usize], tk: &TopKPerGroup) -> Vec<usize> {
 
 enum GroupResolver {
     Col(usize),
-    Time { col: usize, period: Period },
+    Time {
+        col: usize,
+        period: Period,
+        tz_offset_min: i64,
+    },
 }
 
 fn default_agg_name(a: &Agg) -> String {
@@ -1708,9 +1723,19 @@ fn parse_group_by(arr: &str) -> Result<Vec<GroupKeySpec>, String> {
             let period = Period::parse(&period_s).ok_or_else(|| {
                 format!("analysis/invalid-args: bad period {period_s} (day|week|month)")
             })?;
+            // R-29: optional `tz` (extract-only like dateColumn; unknown keys stay tolerated).
+            let tz_offset_min = match extract_string_field(t, "tz")? {
+                None => 0,
+                Some(v) => parse_tz(&v).ok_or_else(|| {
+                    format!(
+                        "analysis/invalid-args: bad tz \"{v}\" (expected +HH:MM or Asia/Shanghai)"
+                    )
+                })?,
+            };
             out.push(GroupKeySpec::Period {
                 date_column,
                 period,
+                tz_offset_min,
             });
         } else {
             return Err("analysis/invalid-args: groupBy entry must be string or object".into());
@@ -2519,6 +2544,184 @@ mod tests {
         // null bucket + one day bucket
         assert_eq!(out.table.rows.len(), 2);
         assert!(out.table.columns.iter().any(|c| c.name == "created_at_day"));
+    }
+
+    // ---- R-29: groupBy `tz` (S2.2 / S2.3) ----------------------------------
+
+    #[test]
+    fn group_by_tz_resolved_offset() {
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"d","period":"day","tz":"Asia/Shanghai"}]}"#,
+        )
+        .unwrap();
+        let GroupKeySpec::Period { tz_offset_min, .. } = &spec.group_by[0] else {
+            panic!("period entry expected")
+        };
+        assert_eq!(*tz_offset_min, 480);
+        // fixed offset resolves identically
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"d","period":"day","tz":"+08:00"}]}"#,
+        )
+        .unwrap();
+        let GroupKeySpec::Period { tz_offset_min, .. } = &spec.group_by[0] else {
+            panic!("period entry expected")
+        };
+        assert_eq!(*tz_offset_min, 480);
+        // absent tz → default UTC (0)
+        let spec = parse_spec_json(r#"{"groupBy":[{"dateColumn":"d","period":"day"}]}"#).unwrap();
+        let GroupKeySpec::Period { tz_offset_min, .. } = &spec.group_by[0] else {
+            panic!("period entry expected")
+        };
+        assert_eq!(*tz_offset_min, 0);
+        // unknown keys on the groupBy object stay tolerated (extract-only)
+        assert!(parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"d","period":"day","extra":1}]}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn group_by_bad_tz_rejected() {
+        for tz in ["Asia/Tokyo", "+15:00"] {
+            let err = parse_spec_json(&format!(
+                r#"{{"groupBy":[{{"dateColumn":"d","period":"day","tz":"{tz}"}}]}}"#
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "analysis/invalid-args: bad tz \"{tz}\" (expected +HH:MM or Asia/Shanghai)"
+                ),
+                "tz={tz}"
+            );
+        }
+    }
+
+    fn flow_table() -> Table {
+        Table {
+            columns: vec![
+                Column { name: "ts".into(), dtype: "utf8".into() },
+                Column { name: "amt".into(), dtype: "i64".into() },
+            ],
+            rows: vec![
+                vec![
+                    Value::Str("2026-10-01T00:30:00+08:00".into()),
+                    Value::I64(10),
+                ],
+                vec![
+                    Value::Str("2026-10-01T12:00:00+08:00".into()),
+                    Value::I64(20),
+                ],
+                vec![
+                    Value::Str("2026-10-02T01:00:00+08:00".into()),
+                    Value::I64(30),
+                ],
+            ],
+        }
+    }
+
+    #[test]
+    fn time_bucket_day_tz_both_sides() {
+        // §7.1 sample: with tz Asia/Shanghai vs default UTC (both locked).
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"sum","column":"amt","as":"s"},{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&flow_table(), &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![
+                vec![
+                    Value::Str("2026-10-01".into()),
+                    Value::F64(30.0),
+                    Value::I64(2)
+                ],
+                vec![
+                    Value::Str("2026-10-02".into()),
+                    Value::F64(30.0),
+                    Value::I64(1)
+                ],
+            ]
+        );
+        // default UTC: unchanged historical buckets
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"ts","period":"day"}],"aggs":[{"fn":"sum","column":"amt","as":"s"},{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&flow_table(), &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![
+                vec![
+                    Value::Str("2026-09-30".into()),
+                    Value::F64(10.0),
+                    Value::I64(1)
+                ],
+                vec![
+                    Value::Str("2026-10-01".into()),
+                    Value::F64(50.0),
+                    Value::I64(2)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn time_bucket_month_tz_cross_boundary() {
+        // 10-01 00:30+08:00: month 2026-10 in Shanghai, 2026-09 in UTC.
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"ts","period":"month","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_month"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&flow_table(), &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![vec![Value::Str("2026-10".into()), Value::I64(3)]]
+        );
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"ts","period":"month"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_month"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&flow_table(), &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![
+                vec![Value::Str("2026-09".into()), Value::I64(1)],
+                vec![Value::Str("2026-10".into()), Value::I64(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn time_bucket_tz_date_only_and_naive() {
+        // date-only with tz: bucket never drifts.
+        let t = Table {
+            columns: vec![Column { name: "d".into(), dtype: "utf8".into() }],
+            rows: vec![vec![Value::Str("2026-10-01".into())]],
+        };
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"d","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![vec![Value::Str("2026-10-01".into()), Value::I64(1)]]
+        );
+        // naive datetime with tz: local wall-clock, no shift.
+        let t = Table {
+            columns: vec![Column { name: "ts".into(), dtype: "utf8".into() }],
+            rows: vec![vec![Value::Str("2026-09-30 18:00:00".into())]],
+        };
+        let spec = parse_spec_json(
+            r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+        )
+        .unwrap();
+        let out = run_agg(&t, &spec, 1000, 5000).unwrap();
+        assert_eq!(
+            out.table.rows,
+            vec![vec![Value::Str("2026-09-30".into()), Value::I64(1)]]
+        );
     }
 
     #[test]

@@ -626,3 +626,147 @@ fn r15_top_k_out_of_range() {
         );
     }
 }
+
+// R-29: timezone-aware time bucketing (S2.2 / S2.3).
+
+/// §7.1 three-row +08:00 flow sample.
+const FLOW: &str = "ts,amt\n\
+2026-10-01T00:30:00+08:00,10\n\
+2026-10-01T12:00:00+08:00,20\n\
+2026-10-02T01:00:00+08:00,30\n";
+
+fn ingest_flow(ws: &Path) {
+    ingest_csv(ws, "flow.csv", FLOW, ID);
+}
+
+/// T1: day buckets with `tz:"Asia/Shanghai"` and default-UTC regression,
+/// both sides locked against the §7.1 sample.
+#[test]
+fn r29_tz_day_buckets_both_sides() {
+    let ws = temp_workspace();
+    ingest_flow(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"sum","column":"amt","as":"s"},{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-10-01",30,2]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10-02",30,1]"#), "stdout={line}");
+    assert!(!line.contains("2026-09-30"), "stdout={line}");
+    // fixed-offset spelling resolves to the same E
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"+08:00"}],"aggs":[{"fn":"sum","column":"amt","as":"s"},{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-10-01",30,2]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10-02",30,1]"#), "stdout={line}");
+    // default (no tz): historical UTC buckets unchanged
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"day"}],"aggs":[{"fn":"sum","column":"amt","as":"s"},{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-09-30",10,1]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10-01",50,2]"#), "stdout={line}");
+}
+
+/// T2: month boundary — local 10-01 00:30+08:00 is October in Shanghai,
+/// September under default UTC.
+#[test]
+fn r29_tz_month_cross_boundary() {
+    let ws = temp_workspace();
+    ingest_flow(&ws);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"month","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_month"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-10",3]"#), "stdout={line}");
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"month"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_month"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-09",1]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10",2]"#), "stdout={line}");
+}
+
+/// T2: week boundary — Sunday 2026-10-04 23:30Z is Monday 2026-10-05
+/// in Shanghai (different ISO week than under default UTC).
+#[test]
+fn r29_tz_week_cross_boundary() {
+    let ws = temp_workspace();
+    ingest_csv(&ws, "week.csv", "ts\n2026-10-04T23:30:00Z\n", ID);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"week","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-10-05",1]"#), "stdout={line}");
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"week"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-09-28",1]"#), "stdout={line}");
+}
+
+/// T2: date-only values never drift under tz; naive values are the local
+/// wall-clock of E (no conversion).
+#[test]
+fn r29_tz_date_only_and_naive_local() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    // date-only `2026-10-01` (2 rows) buckets identically with tz
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"day","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"day_day"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-10-01",2]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10-02",1]"#), "stdout={line}");
+    assert!(line.contains(r#"["2026-10-03",1]"#), "stdout={line}");
+
+    let ws = temp_workspace();
+    ingest_csv(&ws, "naive.csv", "ts\n2026-09-30 18:00:00\n", ID);
+    let out = run_agg(
+        &ws,
+        r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}]}"#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains(r#"["2026-09-30",1]"#), "stdout={line}");
+}
+
+/// T1/T2: invalid tz values exit 2 with the exact bad-tz message.
+#[test]
+fn r29_bad_tz_exits_2() {
+    let ws = temp_workspace();
+    ingest_rich(&ws);
+    for tz in ["Asia/Tokyo", "+15:00"] {
+        let out = run_agg(
+            &ws,
+            &format!(
+                r#"{{"groupBy":[{{"dateColumn":"day","period":"day","tz":"{tz}"}}],"aggs":[{{"fn":"count","as":"n"}}]}}"#
+            ),
+        );
+        assert_eq!(out.status.code(), Some(2), "tz {tz} must exit 2");
+        let err = stderr_of(&out);
+        assert!(
+            err.contains(&format!(
+                "analysis/invalid-args: bad tz \"{tz}\" (expected +HH:MM or Asia/Shanghai)"
+            )),
+            "tz={tz} stderr={err}"
+        );
+        assert!(!stdout_of(&out).contains("\"ok\":true"), "tz={tz}");
+    }
+}
