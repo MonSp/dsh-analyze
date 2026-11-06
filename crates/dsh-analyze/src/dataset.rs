@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -364,7 +364,16 @@ pub fn io_read_reason(e: &std::io::Error) -> &'static str {
 pub fn parse_csv_path(path: &Path) -> Result<Table, String> {
     let file = fs::File::open(path)
         .map_err(|e| format!("analysis/cli-failed: cannot read file: {}", io_read_reason(&e)))?;
-    let mut reader = BufReader::new(file);
+    parse_csv_reader(BufReader::new(file))
+}
+
+/// Parse CSV bytes already decoded to UTF-8 (R-30 `--encoding` read path).
+/// Shares the exact line/BOM/quote semantics of [`parse_csv_path`].
+pub fn parse_csv_bytes(bytes: &[u8]) -> Result<Table, String> {
+    parse_csv_reader(Cursor::new(bytes))
+}
+
+fn parse_csv_reader<R: BufRead>(mut reader: R) -> Result<Table, String> {
     let mut header_line = String::new();
     let n = reader
         .read_line(&mut header_line)
@@ -401,6 +410,43 @@ pub fn parse_csv_path(path: &Path) -> Result<Table, String> {
         rows.push(row);
     }
     finish_table(headers, rows)
+}
+
+/// Decode whole-file CSV bytes per `--encoding` mode (R-30 / S2.5).
+/// Never lossy: malformed bytes are rejected, never replaced with U+FFFD.
+/// A leading UTF-8 BOM is an encoding marker, not data — stripped before
+/// every mode so it can never surface as garbage.
+/// Returns `(utf-8 text, used_gb18030_fallback)`; the fallback flag is only
+/// ever true for `auto`.
+pub fn decode_csv_bytes(bytes: &[u8], encoding: &str) -> Result<(String, bool), String> {
+    const PLAN_B: &str = "analysis/invalid-args: file is not valid UTF-8 (re-save as CSV UTF-8, or pass --encoding gbk)";
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
+    match encoding {
+        "gbk" | "gb18030" => decode_gb18030(body).map(|s| (s, false)),
+        "auto" => {
+            // Strict UTF-8 first; fatal GB18030 fallback (S2.5) either way —
+            // a BOM never suppresses the fallback (its declaration failed).
+            if let Ok(s) = std::str::from_utf8(body) {
+                return Ok((s.to_string(), false));
+            }
+            decode_gb18030(body)
+                .map(|s| (s, true))
+                .map_err(|_| PLAN_B.to_string())
+        }
+        // Default `utf-8`: strict, as before.
+        _ => std::str::from_utf8(body)
+            .map(|s| (s.to_string(), false))
+            .map_err(|_| PLAN_B.to_string()),
+    }
+}
+
+/// Fatal (no replacement) GB18030 decode. The WHATWG GBK decoder also covers
+/// GB18030 four-byte forms, so `--encoding gbk` and `gb18030` share this path.
+fn decode_gb18030(bytes: &[u8]) -> Result<String, String> {
+    encoding_rs::GBK
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|cow| cow.into_owned())
+        .ok_or_else(|| "analysis/invalid-args: file is not valid GB18030".to_string())
 }
 
 pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {

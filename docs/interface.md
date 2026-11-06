@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.10)
+# dsh-analyze interface specification (v0.1.11)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.10` |
+| Version | `0.1.11` |
 
 ## 2. Invocation
 
@@ -29,8 +29,8 @@ dsh-analyze --workspace <dir> [--pretty] <cmd> [flags...]
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | I/O or internal CLI failure (`analysis/cli-failed`) |
-| 2 | invalid arguments / path (`analysis/invalid-args`, `analysis/invalid-path`) |
+| 1 | I/O or internal CLI failure (`analysis/cli-failed`) — real filesystem errors (not found, permission) |
+| 2 | invalid arguments / path (`analysis/invalid-args`, `analysis/invalid-path`) — includes CSV decode failures (v0.1.11: was exit 1 `read failed`) |
 | 3 | limit exceeded (`analysis/limit`) |
 | 4 | format not enabled (xlsx ingest) |
 | 5 | unknown dataset (`analysis/unknown-dataset`) |
@@ -49,7 +49,9 @@ Success responses may carry an optional `warnings` array (omitted when empty):
 - Codes in this version: `mutate-null` (arithmetic produced Null at runtime,
   e.g. divide by zero), `cast-null` (`to_int`/`to_str`/`to_date` conversion
   failed for some rows), `date-parse-fail` (time-period grouping failures,
-  alongside `parseFailSample`), `clamp` (requested cap was clamped).
+  alongside `parseFailSample`), `clamp` (requested cap was clamped),
+  `encoding-fallback` (v0.1.11: `ingest --encoding auto` fell back from
+  strict UTF-8 to GB18030; extra field `encoding: "gb18030"`).
 - The tool layer renders `warnings` in every tool result.
 
 ## 3. Environment
@@ -74,24 +76,47 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.10","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot"]}
+{"ok":true,"version":"0.1.11","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot"]}
 ```
 
 Capability tokens: the v0.1.6 set plus `union`, `diff`, `pivot` (appended,
 never inserted mid-list). Mutate, time-period grouping, extended `describe`
 quantiles, `having`, `topKPerGroup`, select rename, join `anti`/`semi`,
-`window` ops, parquet ingest/export, export xlsx, corr `pValue`, and crosstab
-`third` ship inside existing commands and do not add separate capability tokens.
+`window` ops, parquet ingest/export, export xlsx, corr `pValue`, crosstab
+`third`, groupBy `tz`, and ingest `--encoding` ship inside existing commands
+and do not add separate capability tokens.
 
 ### `ingest`
 
-Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-insensitive), `--dataset-id <id>`, `--label <text>`
+Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-insensitive), `--encoding utf-8|gbk|gb18030|auto` (v0.1.11, csv only, case-insensitive, default `utf-8`), `--dataset-id <id>`, `--label <text>`
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"bytesOnDisk":N}
 ```
 
 - `--input` must resolve inside `--workspace`.
+- CSV text encoding (v0.1.11, R-30):
+  - `utf-8` (default): strict UTF-8. Decode failure → `analysis/invalid-args:
+    file is not valid UTF-8 (re-save as CSV UTF-8, or pass --encoding gbk)`
+    (**exit 2** — previously exit 1 `cli-failed: … read failed`). Real I/O
+    errors (not found / permission) remain
+    `analysis/cli-failed: cannot read file: {reason}` (exit 1).
+  - `gbk` / `gb18030`: whole file decoded fatal (no replacement characters);
+    both flags share the WHATWG GBK/GB18030 decoder. Decode failure →
+    `analysis/invalid-args: file is not valid GB18030` (exit 2).
+  - `auto`: strict UTF-8 first; on failure GB18030 fallback. Fallback success
+    adds `warnings:[{"code":"encoding-fallback","encoding":"gb18030"}]`.
+    Explicit `--encoding gbk|gb18030` does **not** warn. Both decoders fail →
+    the Plan B UTF-8 message (exit 2).
+  - In every mode a leading UTF-8 BOM is stripped before decoding (encoding
+    marker, not data — it never surfaces as garbage). The GB18030 fallback in
+    `auto` applies even when a BOM was present: the BOM does not suppress it.
+  - Never lossy: corrupt bytes are rejected in every mode; no U+FFFD
+    substitution, no garbage dataset.
+  - `--encoding` with any non-csv `--format` →
+    `analysis/invalid-args: --encoding only applies to csv` (exit 2).
+  - `json` / `jsonl` / `parquet` remain UTF-8-only (spec-required); the flag
+    does not apply to them.
 - `json` accepts a top-level array of objects `[{…},…]` or a wrapper object
   `{"records":[{…},…]}`; non-object elements fail with
   `analysis/invalid-args: bad json record at index {i}`. Columns are the union
@@ -208,7 +233,7 @@ Spec JSON:
   ],
   "topKPerGroup": {"by":["region"],"k":3,"orderBy":{"column":"amount","desc":true}},
   "mutate": [{"as":"rate","expr":"hits / total"}],
-  "groupBy": ["col", {"dateColumn":"created_at","period":"day"}],
+  "groupBy": ["col", {"dateColumn":"created_at","period":"day","tz":"Asia/Shanghai"}],
   "aggs": [{"fn":"count","as":"n"},{"fn":"sum","column":"col","as":"s"}],
   "having": [{"column":"n","op":"gt","value":1}],
   "orderBy": [{"column":"s","desc":true}],
@@ -344,7 +369,18 @@ identifier := [A-Za-z_][A-Za-z0-9_]*
 A `groupBy` array element is either:
 
 - a column name string, or
-- an object `{"dateColumn": "<col>", "period": "day"|"week"|"month"}`.
+- an object `{"dateColumn": "<col>", "period": "day"|"week"|"month", "tz"?: "<tz>"}`.
+
+`tz` (v0.1.11, R-29) is optional and applies only to period objects:
+
+| Form | Example | Notes |
+|---|---|---|
+| fixed offset | `"+08:00"`, `"-05:30"` | `±HH:MM`, HH `00..=14`, MM `00..=59` |
+| IANA whitelist v1 | `"Asia/Shanghai"` | fixed `+08:00`, no DST; hand-rolled, no tz database |
+
+Any other `tz` value — including non-strings such as `null` or `480` — →
+`analysis/invalid-args: bad tz "…" (expected +HH:MM or Asia/Shanghai)`
+(exit 2). Tool-layer `validateAggSpec` rejects the same set before spawn.
 
 Output column name is `"<dateColumn>_<period>"` (e.g. `created_at_day`).
 
@@ -360,16 +396,22 @@ Accepted timestamp text (after trim):
 | slash datetime (v0.1.7) | `2024/01/31 15:04:05` |
 | compact date (v0.1.7) | `20240131` |
 
-Timezone rule: values without an explicit offset are treated as **UTC**. With
-offset, the instant is converted to UTC before bucketing.
+Timezone rule (effective timezone `E`; default `E` = UTC — v0.1.10 behavior
+unchanged when `tz` is omitted):
 
-Buckets:
+| Value form | Default (`E`=UTC) | With `tz` (`E`≠UTC) |
+|---|---|---|
+| date-only (`YYYY-MM-DD`) | bucket as written | **bucket as written — `tz` never shifts date-only** |
+| carries offset (`Z` / `±HH:MM` / `±HHMM`) | instant converted to UTC, then bucketed | instant converted to `E`'s wall-clock, then bucketed |
+| naive date-time (no offset) | wall-clock treated as UTC (unchanged) | **wall-clock treated as already in `E` — bucketed directly, no shift** |
+
+Buckets (computed on `E`'s calendar date):
 
 | period | Bucket key |
 |---|---|
-| `day` | `YYYY-MM-DD` (UTC calendar day) |
-| `week` | `YYYY-MM-DD` of the **Monday** containing that UTC day (ISO week start) |
-| `month` | `YYYY-MM` |
+| `day` | `YYYY-MM-DD` (calendar day in `E`) |
+| `week` | `YYYY-MM-DD` of the **Monday** containing that day in `E` (ISO week start) |
+| `month` | `YYYY-MM` (calendar month in `E`) |
 
 - Unparseable **non-null** values go to the JSON `null` bucket and increment
   `parseFailCount` in the response (field present only when > 0); the response
@@ -627,7 +669,8 @@ Flags: `--label-like <substr>` (optional), `--produced-by <name>` (optional), `-
 - Filters combine with AND: `--label-like` is a case-insensitive substring of
   the label, `--produced-by` an exact `producedBy` match, `--since` keeps
   `createdAt >= since` (datasets without `createdAt` are excluded when
-  `--since` is given).
+  `--since` is given). **`--since` is interpreted as UTC** (v0.1.11 note:
+  `createdAt` is ISO-8601 UTC; groupBy `tz` does not affect `list`).
 
 ### `export`
 
@@ -688,7 +731,7 @@ The DSH plugin registers the same operations as tools:
 | `dataset_diff` | `diff` | `leftDatasetId`/`rightDatasetId` required; optional `on`, `sampleLimit`; writes report dataset |
 | `dataset_pivot` | `pivot` | `index` array, `columns`, `values`, `agg` required; writes new dataset |
 | `dataset_export` | `export` | optional `format` csv\|xlsx\|parquet (default csv) |
-| `dataset_ingest` | `ingest` | `format` may be `parquet`; `xlsx` still rejected pre-spawn |
+| `dataset_ingest` | `ingest` | `format` may be `parquet`; optional `encoding` utf-8\|gbk\|gb18030\|auto (csv only, default utf-8); `xlsx` still rejected pre-spawn |
 
 **head / sample / values caps (R-26, freeze):**
 
@@ -701,11 +744,12 @@ The DSH plugin registers the same operations as tools:
 Non-integer or `< 1` → exit 2 for all three. Tool descriptions must match this table.
 
 `transform_agg` `spec` string gains optional `mutate`, time-period
-`groupBy` objects, `having`, `topKPerGroup`, `window`, select rename, and the
+`groupBy` objects (incl. optional `tz`, v0.1.11), `having`, `topKPerGroup`,
+`window`, select rename, and the
 v0.1.7 agg fns (see §4 `agg`). `filter` is a predicate array or an `all`/`any`/`not`
 group object (a bare predicate object / string filter is rejected). Tool-layer
 `validateAggSpec` must reject illegal mutate expressions, bad `filter`
-shapes, bad `window` ops, and unknown top-level spec keys with
+shapes, bad `window` ops, bad `tz` values, and unknown top-level spec keys with
 `analysis/invalid-args` before spawn. All tool renders surface `warnings[]` and the `requestedN` /
 `requestedLimit` echo fields.
 
@@ -754,4 +798,4 @@ select rename, mutate casts, union/diff/pivot, join/diff key pairs, json
 ingest, list filters, warnings, requested caps shipped in v0.1.7;
 window ops + parquet ingest shipped in v0.1.8; export xlsx/parquet shipped in
 v0.1.9; corr pValue, crosstab third, head/sample/values caps table shipped in
-v0.1.10.)
+v0.1.10; groupBy `tz` and ingest `--encoding` shipped in v0.1.11.)

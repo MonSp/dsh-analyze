@@ -15,3 +15,5 @@ arrow-schema = "55"
 # Parquet ingest/export (R-22/R-23). arrow feature for record-batch reader/writer.
 parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"] }
 rust_xlsxwriter = "0.67"
+# CSV GBK/GB18030 decode for ingest --encoding (R-30); WHATWG gb18030-capable.
+encoding_rs = "0.8"
