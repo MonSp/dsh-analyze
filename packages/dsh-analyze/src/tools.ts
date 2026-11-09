@@ -738,7 +738,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           },
           sheet: {
             type: 'string',
-            description: 'xlsx only: sheet name or 0-based index. Default first sheet (R-31).',
+            description:
+              'xlsx only: sheet name or 0-based index — an exact sheet-name match wins, ' +
+              'digits fall back to the index. Default first sheet (R-31).',
           },
           label: { type: 'string', description: 'Optional short label for humans.' },
         },

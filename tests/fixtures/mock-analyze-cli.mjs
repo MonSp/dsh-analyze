@@ -30,6 +30,11 @@ function mockSourceChecksum(buf) {
   return 'sha256:' + buf.length.toString(16).padStart(8, '0') + '0'.repeat(56)
 }
 
+/** Mirror Rust `validate_dataset_id`: ds_ prefix, >=6 chars, ascii alnum/underscore. */
+function validDatasetId(id) {
+  return typeof id === 'string' && id.startsWith('ds_') && id.length >= 6 && /^[A-Za-z0-9_]+$/.test(id)
+}
+
 function newId() {
   return 'ds_' + randomBytes(6).toString('hex')
 }
@@ -1343,6 +1348,8 @@ async function main() {
 
   if (cmd === 'rm') {
     const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    if (!validDatasetId(id)) fail(2, 'analysis/invalid-args: bad datasetId')
     const { datasets } = analysisDirs(ws)
     const metaPath = join(datasets, `${id}.meta.json`)
     if (!existsSync(metaPath)) fail(5, 'analysis/unknown-dataset')
@@ -1356,6 +1363,7 @@ async function main() {
   if (cmd === 'verify') {
     const id = getFlag(rest, '--dataset-id')
     if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    if (!validDatasetId(id)) fail(2, 'analysis/invalid-args: bad datasetId')
     const { datasets } = analysisDirs(ws)
     const metaPath = join(datasets, `${id}.meta.json`)
     if (!existsSync(metaPath)) fail(5, 'analysis/unknown-dataset')
@@ -1389,17 +1397,26 @@ async function main() {
           ? (sp2 => sp2.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sp2) ? resolve(sp2) : resolve(ws, sp2))(String(meta.sourcePath))
           : null
         if (sp && (sp === root || sp.startsWith(root + sep))) {
-          try {
-            const got = mockSourceChecksum(readFileSync(sp))
-            if (got === expected) {
-              status = 'ok'
-            } else {
-              status = 'mismatch'
-              mismatches.push(`source checksum mismatch: expected ${expected} got ${got}`)
+          // Rust treats non-files (e.g. directories) as `missing`, only real
+          // read failures on a regular file as `unreadable`.
+          let isFile = false
+          try { isFile = statSync(sp).isFile() } catch { isFile = false }
+          if (!isFile) {
+            status = 'missing'
+            mismatches.push('source missing')
+          } else {
+            try {
+              const got = mockSourceChecksum(readFileSync(sp))
+              if (got === expected) {
+                status = 'ok'
+              } else {
+                status = 'mismatch'
+                mismatches.push(`source checksum mismatch: expected ${expected} got ${got}`)
+              }
+            } catch {
+              status = 'unreadable'
+              mismatches.push('source unreadable')
             }
-          } catch {
-            status = existsSync(sp) ? 'unreadable' : 'missing'
-            mismatches.push(status === 'unreadable' ? 'source unreadable' : 'source missing')
           }
         } else {
           mismatches.push('source missing')

@@ -59,6 +59,8 @@ corr --by, category label normalization).
 
 ### Changed
 
+- READMEs (root EN/zh + package) synced to v0.1.12: XLSX ingest, Parquet
+  storage, `dataset_verify`, `corr --by`, 20-row preview.
 - Interface contract updated in `docs/interface.md` (v0.1.12); security
   output-hygiene note matches the preview budget; xlsx ingest and storage
   notes no longer claim exit-4 / CSV-placeholder.

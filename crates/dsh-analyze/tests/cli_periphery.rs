@@ -1473,6 +1473,68 @@ fn verify_rowcount_mismatch_prints_json_and_exits_1() {
     let _ = fs::remove_dir_all(&ws);
 }
 
+/// R-33: verify falls back to `parentDatasetId` for legacy metas that lack
+/// `parentDatasetIds` — existing parent → ok; missing parent → mismatch.
+#[test]
+fn verify_legacy_meta_parent_fallback() {
+    let ws = temp_workspace();
+    let ds_dir = ws.join(".dsh-analyze/datasets");
+    fs::create_dir_all(&ds_dir).unwrap();
+
+    let mk_meta = |id: &str, parent_field: &str| -> String {
+        format!(
+            "{{\"version\":1,\"datasetId\":\"{id}\",\"rowCount\":1,\"columnCount\":1,\"columns\":[{{\"name\":\"x\",\"dtype\":\"i64\"}}],\"sourceKind\":\"csv\",\"sourcePath\":\"data/x.csv\",\"label\":null,\"producedBy\":\"ingest\",\"parentDatasetId\":{parent_field},\"createdAt\":\"2026-01-01T00:00:00Z\"}}"
+        )
+    };
+
+    // parent dataset present
+    fs::write(ds_dir.join("ds_aabbccdd11223344.csv"), "x\n1\n").unwrap();
+    fs::write(
+        ds_dir.join("ds_aabbccdd11223344.meta.json"),
+        mk_meta("ds_aabbccdd11223344", "null"),
+    )
+    .unwrap();
+    // child with legacy meta: only parentDatasetId, no parentDatasetIds
+    fs::write(ds_dir.join("ds_bbccddee11223344.csv"), "x\n2\n").unwrap();
+    fs::write(
+        ds_dir.join("ds_bbccddee11223344.meta.json"),
+        mk_meta("ds_bbccddee11223344", "\"ds_aabbccdd11223344\""),
+    )
+    .unwrap();
+
+    let ok = run_ok(
+        &ws,
+        &["verify", "--dataset-id", "ds_bbccddee11223344"],
+    );
+    assert!(ok.contains("\"ok\":true"), "{ok}");
+    assert!(
+        ok.contains("{\"name\":\"parents\",\"ok\":true,\"count\":1}"),
+        "legacy parent must be checked: {ok}"
+    );
+
+    // remove the parent → the fallback still surfaces the missing parent
+    fs::remove_file(ds_dir.join("ds_aabbccdd11223344.meta.json")).unwrap();
+    let out = bin()
+        .arg("--workspace")
+        .arg(&ws)
+        .args(["verify", "--dataset-id", "ds_bbccddee11223344"])
+        .output()
+        .expect("spawn dsh-analyze");
+    assert_eq!(out.status.code(), Some(1), "missing parent must exit 1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"ok\":false"), "{stdout}");
+    assert!(
+        stdout.contains("{\"name\":\"parents\",\"ok\":false,\"count\":1}"),
+        "fallback must still count the legacy parent: {stdout}"
+    );
+    assert!(
+        stdout.contains("parent dataset missing"),
+        "mismatch text: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
 /// R-31/R-32: xlsx text cells (numeric-looking / NA / true) keep their string
 /// identity across parquet storage — never re-coerced on load.
 #[test]

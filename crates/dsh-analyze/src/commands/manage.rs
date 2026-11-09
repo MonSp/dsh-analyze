@@ -335,7 +335,18 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
         ));
     }
 
-    let parents = extract_string_array(&meta_raw, "parentDatasetIds");
+    // Legacy metas predate `parentDatasetIds` — fall back to the single
+    // `parentDatasetId` exactly as interface.md documents (and load/list do).
+    let parents = {
+        let arr = extract_string_array(&meta_raw, "parentDatasetIds");
+        if !arr.is_empty() {
+            arr
+        } else if let Some(p) = extract_string(&meta_raw, "parentDatasetId") {
+            vec![p]
+        } else {
+            Vec::new()
+        }
+    };
     let parents_ok = parents
         .iter()
         .all(|p| dir.join(format!("{p}.meta.json")).exists());
