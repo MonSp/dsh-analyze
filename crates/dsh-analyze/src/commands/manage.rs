@@ -273,7 +273,10 @@ pub(crate) fn cmd_rm(workspace: &Path, args: &[String]) -> Result<String, u8> {
 /// R-33: verify dataset integrity (meta + data file + parent chain + optional source rehash).
 /// exit 0 all ok; 1 mismatch; 5 unknown dataset.
 pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8> {
-    use crate::dataset::{ensure_within_workspace, load_dataset, sha256_hex};
+    use crate::dataset::{
+        ensure_within_workspace, extract_string, extract_string_array, extract_u64, load_dataset,
+        sha256_hex,
+    };
     let id = match flag_value(args, "--dataset-id") {
         Some(v) => v.to_string(),
         None => return fail(2, "analysis/invalid-args: --dataset-id required"),
@@ -310,7 +313,7 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
         1u8
     })?;
 
-    let declared_rows = meta_field_u64(&meta_raw, "rowCount").unwrap_or(0);
+    let declared_rows = extract_u64(&meta_raw, "rowCount").unwrap_or(0);
     let actual_rows = if data_ok {
         load_dataset(workspace, &id).map(|(_, t)| t.rows.len() as u64).ok()
     } else {
@@ -332,7 +335,7 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
         ));
     }
 
-    let parents = meta_field_string_array(&meta_raw, "parentDatasetIds");
+    let parents = extract_string_array(&meta_raw, "parentDatasetIds");
     let parents_ok = parents
         .iter()
         .all(|p| dir.join(format!("{p}.meta.json")).exists());
@@ -345,8 +348,8 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
     }
 
     if check_source {
-        let expected = meta_field_string(&meta_raw, "sourceChecksum");
-        let source_path = meta_field_string(&meta_raw, "sourcePath").unwrap_or_default();
+        let expected = extract_string(&meta_raw, "sourceChecksum");
+        let source_path = extract_string(&meta_raw, "sourcePath").unwrap_or_default();
         match expected {
             None => {
                 checks.push("{\"name\":\"source\",\"ok\":true,\"skipped\":\"no-checksum\"}".into());
@@ -399,8 +402,10 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
     if ok {
         Ok(line)
     } else {
+        // Exit code 1 (cli-failed) per the usage table — keep the stderr
+        // prefix consistent with the exit code, not invalid-args (2).
         eprintln!(
-            "analysis/invalid-args: dataset verify failed: {}",
+            "analysis/cli-failed: dataset verify failed: {}",
             mismatches.join("; ")
         );
         println!("{line}");
@@ -408,74 +413,3 @@ pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8
     }
 }
 
-fn meta_field_u64(raw: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{key}\":");
-    let idx = raw.find(&needle)?;
-    let rest = raw[idx + needle.len()..].trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-fn meta_field_string(raw: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":");
-    let idx = raw.find(&needle)?;
-    let rest = raw[idx + needle.len()..].trim_start();
-    if rest.starts_with("null") {
-        return None;
-    }
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut chars = rest[1..].chars();
-    while let Some(c) = chars.next() {
-        if c == '"' {
-            break;
-        }
-        if c == '\\' {
-            if let Some(n) = chars.next() {
-                out.push(n);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    Some(out)
-}
-
-fn meta_field_string_array(raw: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\":[");
-    let Some(start) = raw.find(&needle) else {
-        return Vec::new();
-    };
-    let rest = &raw[start + needle.len()..];
-    let Some(end) = rest.find(']') else {
-        return Vec::new();
-    };
-    let inner = &rest[..end];
-    let mut out = Vec::new();
-    let mut i = 0;
-    let b = inner.as_bytes();
-    while i < b.len() {
-        while i < b.len() && (b[i] == b' ' || b[i] == b',') {
-            i += 1;
-        }
-        if i >= b.len() || b[i] != b'"' {
-            break;
-        }
-        i += 1;
-        let mut s = String::new();
-        while i < b.len() && b[i] != b'"' {
-            if b[i] == b'\\' && i + 1 < b.len() {
-                i += 1;
-            }
-            s.push(b[i] as char);
-            i += 1;
-        }
-        if i < b.len() && b[i] == b'"' {
-            i += 1;
-        }
-        out.push(s);
-    }
-    out
-}

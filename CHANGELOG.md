@@ -27,6 +27,23 @@ corr --by, category label normalization).
 
 ### Fixed
 
+- Internal Parquet storage (R-32) encodes string cells unambiguously (quoted
+  JSON vs raw scalars): xlsx/json string values like `"007"` / `"NA"` now
+  survive save/load unchanged instead of being re-coerced by `parse_cell`, so
+  meta dtypes stay consistent with loaded values. Export parquet keeps raw
+  strings (ingest round-trip unchanged).
+- Tool layer: `dataset_verify` returns the CLI's `checks`/`mismatches` JSON
+  on exit 1 (mismatch) instead of discarding stdout and surfacing a
+  misclassified `analysis/invalid-args`; mock CLI capabilities now include
+  `verify`, and mock verify counts rows from stored data instead of echoing
+  the declared count.
+- `corr --by`: `pairCount` reports all candidate pairs (`groupCount ×
+  column-pairs`, matching the ungrouped total semantics) and
+  `corr-groups-truncated` / `corr-pairs-truncated` warnings can now co-occur.
+- `verify` mismatch stderr prefix is `analysis/cli-failed:` (consistent with
+  exit 1).
+- `ingest --sheet`: an exact sheet-name match wins over the numeric index, so
+  all-digit sheet names (e.g. `2024`) remain selectable.
 - `agg` / `transform_agg` always return up to **20** inline preview rows
   (`min(20, rowCount)`), with or without `--out` (R-36-A, R-37). Previously
   `include_rows = out.is_empty() && len <= 20` dropped all rows when

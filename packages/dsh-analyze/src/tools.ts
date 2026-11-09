@@ -706,7 +706,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
   }
 
   const datasetIngstDescription =
-    'Ingest a local workspace file (csv/json/jsonl) into the analysis dataset store. ' +
+    'Ingest a local workspace file (csv/json/jsonl/parquet/xlsx) into the analysis dataset store. ' +
     'Source path must be under this session analysis root (relative preferred). ' +
     'If the file was produced elsewhere (bash, connector, export), first copy/write it ' +
     'into the session analysis root, then ingest with a relative path. ' +
@@ -2042,16 +2042,12 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         }
         if (a.by !== undefined && a.by !== null) {
           if (!Array.isArray(a.by) || a.by.length < 1 || a.by.length > 4) {
-            const err = new Error('analysis/invalid-args: by must be 1..4 column names') as Error & { code?: string }
-            err.code = 'analysis/invalid-args'
-            throw err
+            throw invalidArgs('by must be 1..4 column names')
           }
           if (a.by.some(c => typeof c !== 'string' || !c.trim())) {
-            const err = new Error('analysis/invalid-args: by entries must be non-empty strings') as Error & { code?: string }
-            err.code = 'analysis/invalid-args'
-            throw err
+            throw invalidArgs('by entries must be non-empty strings')
           }
-          cliArgs.push('--by', a.by.join(','))
+          cliArgs.push('--by', a.by.map(c => c.trim()).join(','))
         }
         const result = await run(cliArgs, exec?.signal)
         return result.data

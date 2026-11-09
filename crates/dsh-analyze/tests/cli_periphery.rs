@@ -1417,3 +1417,206 @@ fn r33_join_two_parents() {
 
     let _ = fs::remove_dir_all(&ws);
 }
+
+/// R-33: verify mismatch exits 1 but still prints the result JSON on stdout
+/// (the tool layer relies on this), with a cli-failed stderr prefix.
+#[test]
+fn verify_rowcount_mismatch_prints_json_and_exits_1() {
+    let ws = temp_workspace();
+    write_file(&ws, "v.csv", "a,b\n1,2\n3,4\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/v.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let meta_path = ws
+        .join(".dsh-analyze/datasets")
+        .join("ds_aabbccdd11223344.meta.json");
+    let meta = fs::read_to_string(&meta_path).unwrap();
+    assert!(meta.contains("\"rowCount\":2"), "{meta}");
+    fs::write(
+        &meta_path,
+        meta.replace("\"rowCount\":2", "\"rowCount\":99"),
+    )
+    .unwrap();
+
+    let out = bin()
+        .arg("--workspace")
+        .arg(&ws)
+        .args([
+            "verify",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ])
+        .output()
+        .expect("spawn dsh-analyze");
+    assert_eq!(out.status.code(), Some(1), "mismatch must exit 1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"ok\":false"), "stdout: {stdout}");
+    assert!(stdout.contains("\"row-count\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"declared\":99"), "stdout: {stdout}");
+    assert!(stdout.contains("\"actual\":2"), "stdout: {stdout}");
+    assert!(stdout.contains("\"data-file\""), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("analysis/cli-failed: dataset verify failed"),
+        "stderr prefix must match exit 1: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-31/R-32: xlsx text cells (numeric-looking / NA / true) keep their string
+/// identity across parquet storage — never re-coerced on load.
+#[test]
+fn xlsx_text_cells_survive_storage() {
+    use rust_xlsxwriter::{Workbook, Worksheet};
+    let ws = temp_workspace();
+    let path = ws.join("data").join("text.xlsx");
+    let mut wb = Workbook::new();
+    let mut s = Worksheet::new();
+    s.write_string(0, 0, "code").unwrap();
+    s.write_string(0, 1, "note").unwrap();
+    s.write_string(1, 0, "007").unwrap();
+    s.write_string(1, 1, "NA").unwrap();
+    s.write_string(2, 0, "42x").unwrap();
+    s.write_string(2, 1, "true").unwrap();
+    wb.worksheets_mut().push(s);
+    wb.save(&path).unwrap();
+
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/text.xlsx",
+            "--format",
+            "xlsx",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let head = run_ok(
+        &ws,
+        &["head", "--dataset-id", "ds_aabbccdd11223344", "--n", "5"],
+    );
+    assert!(head.contains("\"007\""), "string 007 must survive: {head}");
+    assert!(head.contains("\"NA\""), "string NA must survive: {head}");
+    assert!(head.contains("\"42x\""), "{head}");
+    assert!(head.contains("\"true\""), "string true must stay a string: {head}");
+    assert!(!head.contains(",7,"), "007 must not coerce to 7: {head}");
+
+    // meta dtype (schema) stays utf8 and matches the loaded values.
+    let schema = run_ok(&ws, &["schema", "--dataset-id", "ds_aabbccdd11223344"]);
+    assert!(schema.contains("\"name\":\"code\",\"dtype\":\"utf8\""), "{schema}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-32: json string values that look like scalars keep string identity
+/// through parquet storage (legacy CSV reload used to coerce them).
+#[test]
+fn json_stringy_values_survive_storage() {
+    let ws = temp_workspace();
+    write_file(
+        &ws,
+        "s.json",
+        r#"[{"code":"007","flag":"true","note":"NA"}]"#,
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/s.json",
+            "--format",
+            "json",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let head = run_ok(
+        &ws,
+        &["head", "--dataset-id", "ds_aabbccdd11223344", "--n", "5"],
+    );
+    assert!(head.contains("\"007\""), "{head}");
+    assert!(head.contains("\"true\""), "{head}");
+    assert!(head.contains("\"NA\""), "{head}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-31: all-digit sheet NAMES win over index interpretation; digits fall
+/// back to a 0-based index only when no sheet matches by name.
+#[test]
+fn ingest_xlsx_all_digit_sheet_name() {
+    use rust_xlsxwriter::{Workbook, Worksheet};
+    let ws = temp_workspace();
+    let path = ws.join("data").join("digits.xlsx");
+    let mut wb = Workbook::new();
+    let mut s1 = Worksheet::new();
+    s1.write_string(0, 0, "f").unwrap();
+    s1.write_string(1, 0, "first-row").unwrap();
+    s1.set_name("first").unwrap();
+    wb.worksheets_mut().push(s1);
+    let mut s2 = Worksheet::new();
+    s2.write_string(0, 0, "y").unwrap();
+    s2.write_string(1, 0, "year-row").unwrap();
+    s2.set_name("2024").unwrap();
+    wb.worksheets_mut().push(s2);
+    wb.save(&path).unwrap();
+
+    // Exact name match: "2024" selects the sheet named 2024 (not index 2024).
+    let by_name = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/digits.xlsx",
+            "--format",
+            "xlsx",
+            "--sheet",
+            "2024",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(by_name.contains("\"ok\":true"), "{by_name}");
+    assert!(by_name.contains("\"y\""), "named sheet header: {by_name}");
+    let head1 = run_ok(
+        &ws,
+        &["head", "--dataset-id", "ds_aabbccdd11223344", "--n", "5"],
+    );
+    assert!(head1.contains("year-row"), "{head1}");
+
+    // Digits without a matching name fall back to the 0-based index.
+    let by_index = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/digits.xlsx",
+            "--format",
+            "xlsx",
+            "--sheet",
+            "0",
+            "--dataset-id",
+            "ds_bbccddee11223344",
+        ],
+    );
+    assert!(by_index.contains("\"ok\":true"), "{by_index}");
+    let head2 = run_ok(
+        &ws,
+        &["head", "--dataset-id", "ds_bbccddee11223344", "--n", "5"],
+    );
+    assert!(head2.contains("first-row"), "{head2}");
+
+    let _ = fs::remove_dir_all(&ws);
+}

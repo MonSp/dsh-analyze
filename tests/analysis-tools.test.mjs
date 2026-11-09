@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -385,8 +385,74 @@ test('probeAnalyzeCliSync accepts mock CLI version', () => {
       assert.ok(probe.capabilities.includes('union'))
       assert.ok(probe.capabilities.includes('diff'))
       assert.ok(probe.capabilities.includes('pivot'))
+      // capability list only ever appends — verify must be the last token
+      assert.ok(probe.capabilities.includes('verify'))
+      assert.equal(probe.capabilities[probe.capabilities.length - 1], 'verify')
       assert.match(probe.version, /^\d+\.\d+\.\d+/)
     }
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_verify returns checks/mismatches on exit-1 mismatch', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 'v.csv'), 'a,b\n1,2\n3,4\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/v.csv' })
+    const id = ing.datasetId
+    assert.ok(id, JSON.stringify(ing))
+    const metaPath = join(ws, '.dsh-analyze', 'datasets', `${id}.meta.json`)
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    meta.rowCount = 99
+    writeFileSync(metaPath, JSON.stringify(meta), 'utf8')
+
+    // CLI exits 1 but prints JSON — the tool must surface it, not throw.
+    const v = await defs.dataset_verify.execute({ datasetId: id })
+    assert.equal(v.ok, false)
+    assert.equal(v.datasetId, id)
+    const rc = v.checks.find((c) => c.name === 'row-count')
+    assert.ok(rc, JSON.stringify(v.checks))
+    assert.equal(rc.ok, false)
+    assert.equal(rc.declared, 99)
+    assert.equal(rc.actual, 2)
+    assert.ok(v.checks.find((c) => c.name === 'data-file')?.ok === true)
+    assert.match(v.mismatches.join(' '), /rowCount declared=99 actual=2/)
+
+    // clean dataset verifies ok with checkSource
+    meta.rowCount = 2
+    writeFileSync(metaPath, JSON.stringify(meta), 'utf8')
+    const clean = await defs.dataset_verify.execute({ datasetId: id, checkSource: true })
+    assert.equal(clean.ok, true, JSON.stringify(clean))
+    assert.equal(clean.checks.find((c) => c.name === 'source')?.ok, true)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('dataset_verify checkSource detects a changed source file', async () => {
+  const ws = makeWorkspace()
+  try {
+    mkdirSync(join(ws, 'data'), { recursive: true })
+    writeFileSync(join(ws, 'data', 's.csv'), 'a,b\n1,2\n3,4\n', 'utf8')
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/s.csv' })
+    const id = ing.datasetId
+
+    const before = await defs.dataset_verify.execute({ datasetId: id, checkSource: true })
+    assert.equal(before.ok, true, JSON.stringify(before))
+
+    // grow the source → checksum mismatch (mock hash is length-based; any
+    // byte change is enough)
+    writeFileSync(join(ws, 'data', 's.csv'), 'a,b\n1,2\n3,4\n5,6\n', 'utf8')
+    const after = await defs.dataset_verify.execute({ datasetId: id, checkSource: true })
+    assert.equal(after.ok, false)
+    assert.match(after.mismatches.join(' '), /source checksum mismatch/)
+    const src = after.checks.find((c) => c.name === 'source')
+    assert.equal(src?.ok, false)
+    assert.equal(src?.status, 'mismatch')
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

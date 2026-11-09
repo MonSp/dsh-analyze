@@ -79,8 +79,8 @@ TS bridge only:
 {"ok":true,"version":"0.1.12","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot","verify"]}
 ```
 
-Capability tokens: the v0.1.6 set plus `union`, `diff`, `pivot` (appended,
-never inserted mid-list). Mutate, time-period grouping, extended `describe`
+Capability tokens: the v0.1.6 set plus `union`, `diff`, `pivot`, `verify`
+(appended, never inserted mid-list). Mutate, time-period grouping, extended `describe`
 quantiles, `having`, `topKPerGroup`, select rename, join `anti`/`semi`,
 `window` ops, parquet ingest/export, export xlsx, corr `pValue`, crosstab
 `third`, groupBy `tz`, and ingest `--encoding` ship inside existing commands
@@ -142,9 +142,13 @@ Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet|xlsx` (case
   → `analysis/cli-failed: not a valid parquet file` (exit 1), no OS text.
   Dataset storage is Parquet (v0.1.12, R-32) under `{id}.parquet` next to
   meta; legacy `{id}.csv` datasets remain readable (lazy fallback, no bulk
-  migration). New writes always use Parquet (`storageFormat` in meta).
+  migration). New writes always use Parquet — the storage format is detected
+  from the data file extension (`{id}.parquet` preferred, `{id}.csv`
+  fallback); meta has no separate format field.
 - `xlsx` ingest (v0.1.12, R-31): reads one sheet via calamine — default first
-  sheet, or `--sheet <name|0-based-index>`. Multi-sheet workbooks emit
+  sheet, or `--sheet <name|0-based-index>` (an exact sheet-name match wins,
+  so all-digit sheet names like `2024` stay selectable; digits fall back to
+  the 0-based index). Multi-sheet workbooks emit
   `warnings:[{code:"sheet-skipped",skipped:N,sheets:[…]}]`. Cell types map to
   dtypes (`Int`→i64, `Float`/`DateTime`→f64, `Bool`→bool, `String`→utf8);
   formula cells use cached values. Corrupt / password-protected files →
@@ -499,8 +503,12 @@ Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--
   (column names), `groupCount`, `groupsEmitted`; each pair carries `by: […]
   group key values` (null → JSON `null`). Caps: **50 groups** (first-seen
   order) and **100 pairs** total; over-cap → `truncated: true` plus
-  `warnings:[{code:"corr-groups-truncated"|"corr-pairs-truncated",emitted,total}]`.
-  Within each group n&lt;minNumeric → `r`/`pValue` null (same as ungrouped).
+  `warnings` entries `{code:"corr-groups-truncated"|"corr-pairs-truncated",
+  emitted,total}` (both codes may co-occur in the same array). With `--by`,
+  `pairCount` reports all candidate pairs (`groupCount × column-pairs`,
+  untruncated — same semantics as the ungrouped mode); the emitted pairs are
+  the `pairs` array. Within each group n&lt;minNumeric → `r`/`pValue` null
+  (same as ungrouped).
   Unknown `--by` column → `analysis/invalid-args: unknown column {name}`.
 - Spearman: mid-ranks (average ranks for ties) then Pearson on ranks.
 
@@ -705,7 +713,8 @@ Flags: `--dataset-id` (required), `--check-source` (optional)
   meta file). With `--check-source`: re-hash `sourcePath` and compare to
   `sourceChecksum` (`sha256:<hex>`); missing file / mismatch reported in
   `mismatches`.
-- Exit: **0** all ok, **1** mismatch (JSON still printed on stdout),
+- Exit: **0** all ok, **1** mismatch (JSON still printed on stdout; stderr
+  reports `analysis/cli-failed: dataset verify failed: …`),
   **5** unknown dataset. Old metas without `parentDatasetIds` /
   `sourceChecksum` are tolerated (`parents` falls back to
   `parentDatasetId`; source check skipped when no checksum).

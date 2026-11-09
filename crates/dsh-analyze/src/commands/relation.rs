@@ -253,7 +253,7 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
     // R-34: optional grouping columns for per-group pairwise corr.
     let by_names: Vec<String> = match flag_value(args, "--by") {
         Some(raw) => {
-            let names = parse_column_list(&raw);
+            let names = parse_column_list(raw);
             if names.is_empty() || names.len() > 4 {
                 return fail(2, "analysis/invalid-args: --by must list 1..4 columns");
             }
@@ -377,7 +377,7 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
     const MAX_BY_GROUPS: usize = 50;
     const MAX_BY_PAIRS: usize = 100;
     let groups_total = group_rows.len();
-    let groups_truncated = by_idxs.is_empty() == false && groups_total > MAX_BY_GROUPS;
+    let groups_truncated = !by_idxs.is_empty() && groups_total > MAX_BY_GROUPS;
     let groups_kept = if groups_truncated {
         MAX_BY_GROUPS
     } else {
@@ -387,19 +387,14 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
     #[allow(clippy::type_complexity)]
     let mut all_out: Vec<(usize, Vec<Value>, PairOut)> = Vec::new();
     for (gi, rows) in group_rows.iter().take(groups_kept).enumerate() {
-        let row_set: std::collections::HashSet<usize> = rows.iter().copied().collect();
         let mut results: Vec<PairOut> = Vec::with_capacity(total_pairs_per_set);
         for i in 0..columns.len() {
             for j in (i + 1)..columns.len() {
                 let mut xs: Vec<f64> = Vec::new();
                 let mut ys: Vec<f64> = Vec::new();
-                // Stable original-index order within the group.
-                let mut ordered: Vec<usize> = rows.clone();
-                ordered.sort_unstable();
-                for &ri in &ordered {
-                    if !row_set.contains(&ri) {
-                        continue;
-                    }
+                // group_rows entries are built in ascending original-index
+                // order (listwise mask sorted, ranges monotonic) - no re-sort.
+                for &ri in rows.iter() {
                     if let (Some(&x), Some(&y)) = (maps[i].get(&ri), maps[j].get(&ri)) {
                         xs.push(x);
                         ys.push(y);
@@ -515,21 +510,28 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         extra.push_str(&format!(",\"groupCount\":{}", groups_total));
         extra.push_str(&format!(",\"groupsEmitted\":{}", groups_kept));
     }
+    let mut warnings: Vec<String> = Vec::new();
     if groups_truncated {
-        extra.push_str(&format!(
-            ",\"warnings\":[{{\"code\":\"corr-groups-truncated\",\"emitted\":{groups_kept},\"total\":{groups_total}}}]"
+        warnings.push(format!(
+            "{{\"code\":\"corr-groups-truncated\",\"emitted\":{groups_kept},\"total\":{groups_total}}}"
         ));
-    } else if pairs_total > pair_budget && by_json.is_some() {
-        extra.push_str(&format!(
-            ",\"warnings\":[{{\"code\":\"corr-pairs-truncated\",\"emitted\":{},\"total\":{pairs_total}}}]",
+    }
+    if by_json.is_some() && pairs_total > pair_budget {
+        warnings.push(format!(
+            "{{\"code\":\"corr-pairs-truncated\",\"emitted\":{},\"total\":{pairs_total}}}",
             all_out.len()
         ));
     }
+    if !warnings.is_empty() {
+        extra.push_str(&format!(",\"warnings\":[{}]", warnings.join(",")));
+    }
 
+    // pairCount = all candidate pairs (mirrors the ungrouped mode, which also
+    // reports the theoretical total when truncated): groups x column pairs.
     let pair_count_field = if by_idxs.is_empty() {
         total_pairs_per_set
     } else {
-        pairs_total.min(pair_budget)
+        groups_total.saturating_mul(total_pairs_per_set)
     };
 
     Ok(format!(
@@ -545,6 +547,7 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         truncated
     ))
 }
+
 // ---------------------------------------------------------------------------
 // crosstab
 // ---------------------------------------------------------------------------

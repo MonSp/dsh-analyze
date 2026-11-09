@@ -124,6 +124,19 @@ export async function runAnalyzeCli(options: RunCliOptions): Promise<AnalyzeCliR
       settled = true
       clearTimeout(timer)
       if (code !== 0) {
+        // Some commands (e.g. `verify` on mismatch) exit non-zero but still
+        // print their result JSON on stdout per the interface contract — surface
+        // that instead of discarding it. stderr-only failures reject as before.
+        const failStdout = stdout.trim()
+        if (failStdout) {
+          try {
+            const data = JSON.parse(failStdout) as Record<string, unknown>
+            if (typeof data.ok === 'boolean') {
+              resolvePromise({ ok: true, data })
+              return
+            }
+          } catch { /* fall through to the stderr-based error */ }
+        }
         rejectPromise(mapCliFailure(code, stderr))
         return
       }

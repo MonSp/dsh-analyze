@@ -25,6 +25,11 @@ function within(ws, p) {
   return abs
 }
 
+function mockSourceChecksum(buf) {
+  // deterministic fake: length-prefixed hex (mock only; real CLI uses sha256)
+  return 'sha256:' + buf.length.toString(16).padStart(8, '0') + '0'.repeat(56)
+}
+
 function newId() {
   return 'ds_' + randomBytes(6).toString('hex')
 }
@@ -159,7 +164,7 @@ async function main() {
     console.log(json({
       ok: true,
       version: '0.1.12-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot', 'verify'],
     }))
     return
   }
@@ -250,9 +255,7 @@ async function main() {
     const encoding = getFlag(rest, '--encoding')
     let sourceChecksum = null
     try {
-      const buf = readFileSync(path)
-      // deterministic fake: length-prefixed hex (mock only; real CLI uses sha256)
-      sourceChecksum = 'sha256:' + buf.length.toString(16).padStart(8, '0') + '0'.repeat(56)
+      sourceChecksum = mockSourceChecksum(readFileSync(path))
     } catch { /* ignore */ }
     const { meta, bytes } = writeDataset(ws, id, table, {
       sourceKind: format === 'json' ? 'json' : 'csv',
@@ -1362,22 +1365,54 @@ async function main() {
     const mismatches = []
     if (!dataOk) mismatches.push('data-file missing')
     const declared = meta.rowCount ?? 0
-    const rowsOk = dataOk
-    checks.push({ name: 'row-count', ok: rowsOk, declared, actual: rowsOk ? declared : null })
-    if (!rowsOk) mismatches.push(`rowCount declared=${declared} actual=null`)
+    // Real row count from the stored csv (the mock's storage format).
+    let actual = null
+    const csvPath = join(datasets, `${id}.csv`)
+    if (existsSync(csvPath)) {
+      try { actual = parseCsv(readFileSync(csvPath, 'utf8')).rows.length } catch { actual = null }
+    }
+    const rowsOk = actual !== null && actual === declared
+    checks.push({ name: 'row-count', ok: rowsOk, declared, actual })
+    if (!rowsOk) mismatches.push(`rowCount declared=${declared} actual=${actual === null ? 'missing' : actual}`)
     const parents = meta.parentDatasetIds || (meta.parentDatasetId ? [meta.parentDatasetId] : [])
     const parentsOk = parents.every((pp) => existsSync(join(datasets, `${pp}.meta.json`)))
     checks.push({ name: 'parents', ok: parentsOk, count: parents.length })
     if (!parentsOk) mismatches.push('parent dataset missing')
     if (rest.includes('--check-source')) {
-      checks.push({ name: 'source', ok: true, skipped: meta.sourceChecksum ? 'mock' : 'no-checksum' })
+      const expected = meta.sourceChecksum ?? null
+      if (!expected) {
+        checks.push({ name: 'source', ok: true, skipped: 'no-checksum' })
+      } else {
+        let status = 'missing'
+        const root = resolve(ws)
+        const sp = meta.sourcePath
+          ? (sp2 => sp2.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sp2) ? resolve(sp2) : resolve(ws, sp2))(String(meta.sourcePath))
+          : null
+        if (sp && (sp === root || sp.startsWith(root + sep))) {
+          try {
+            const got = mockSourceChecksum(readFileSync(sp))
+            if (got === expected) {
+              status = 'ok'
+            } else {
+              status = 'mismatch'
+              mismatches.push(`source checksum mismatch: expected ${expected} got ${got}`)
+            }
+          } catch {
+            status = existsSync(sp) ? 'unreadable' : 'missing'
+            mismatches.push(status === 'unreadable' ? 'source unreadable' : 'source missing')
+          }
+        } else {
+          mismatches.push('source missing')
+        }
+        checks.push({ name: 'source', ok: status === 'ok', status })
+      }
     }
     const ok = mismatches.length === 0
     const line = { ok, datasetId: id, checks, mismatches }
     if (!ok) {
       console.log(json(line))
       process.exitCode = 1
-      console.error(`analysis/invalid-args: dataset verify failed: ${mismatches.join('; ')}`)
+      console.error(`analysis/cli-failed: dataset verify failed: ${mismatches.join('; ')}`)
       return
     }
     console.log(json(line))

@@ -1173,3 +1173,147 @@ fn crosstab_mixed_int_float_single_label() {
         "duplicate int/float labels: {rc}"
     );
 }
+
+/// R-34 caps: >50 groups → corr-groups-truncated (pairs stay under 100).
+#[test]
+fn corr_by_group_cap_warns() {
+    let ws = temp_workspace();
+    let mut csv = String::from("g,a,b\n");
+    for g in 0..51 {
+        csv.push_str(&format!("{g},1,2\n{g},2,4\n"));
+    }
+    write_csv(&ws, "cap_g.csv", &csv);
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/cap_g.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b",
+            "--by",
+            "g",
+        ],
+    );
+    assert!(out.contains("\"groupCount\":51"), "{out}");
+    assert!(out.contains("\"groupsEmitted\":50"), "{out}");
+    assert!(out.contains("corr-groups-truncated"), "{out}");
+    assert!(
+        !out.contains("corr-pairs-truncated"),
+        "50 kept groups x 1 pair must stay under the 100-pair cap: {out}"
+    );
+    // pairCount = all candidate pairs (51 groups x 1 column pair), untruncated.
+    assert!(out.contains("\"pairCount\":51"), "{out}");
+    assert!(out.contains("\"truncated\":true"), "{out}");
+}
+
+/// R-34 caps: 1 group x 16 columns (120 pairs) → corr-pairs-truncated only.
+#[test]
+fn corr_by_pairs_cap_warns() {
+    let ws = temp_workspace();
+    let cols: Vec<String> = (0..16).map(|i| format!("c{i}")).collect();
+    let mut csv = String::from("g,");
+    csv.push_str(&cols.join(","));
+    csv.push('\n');
+    for r in 1..=3 {
+        csv.push_str("only,");
+        csv.push_str(
+            &cols
+                .iter()
+                .map(|_| r.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        csv.push('\n');
+    }
+    write_csv(&ws, "cap_p.csv", &csv);
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/cap_p.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let col_list = cols.join(",");
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            &col_list,
+            "--by",
+            "g",
+        ],
+    );
+    assert!(out.contains("corr-pairs-truncated"), "{out}");
+    assert!(!out.contains("corr-groups-truncated"), "{out}");
+    assert!(out.contains("\"groupCount\":1"), "{out}");
+    // 1 group x 16 choose 2 = 120 candidate pairs; emitted capped at 100.
+    assert!(out.contains("\"pairCount\":120"), "{out}");
+    assert_eq!(
+        out.matches("\"df\":").count(),
+        100,
+        "pairs array must hold 100 entries: {out}"
+    );
+}
+
+/// R-34 caps: both caps can fire together → both warnings in one array.
+#[test]
+fn corr_by_both_caps_warn_together() {
+    let ws = temp_workspace();
+    let mut csv = String::from("g,a,b,c\n");
+    for g in 0..51 {
+        for r in 1..=3 {
+            csv.push_str(&format!("{g},{r},{},{r}\n", r * 2));
+        }
+    }
+    write_csv(&ws, "cap_b.csv", &csv);
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/cap_b.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b,c",
+            "--by",
+            "g",
+        ],
+    );
+    assert!(out.contains("corr-groups-truncated"), "{out}");
+    assert!(out.contains("corr-pairs-truncated"), "{out}");
+    // 51 groups x 3 column pairs = 153 candidate pairs, 100 emitted.
+    assert!(out.contains("\"pairCount\":153"), "{out}");
+    assert_eq!(out.matches("\"df\":").count(), 100, "{out}");
+}

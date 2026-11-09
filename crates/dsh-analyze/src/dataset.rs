@@ -500,12 +500,9 @@ pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {
     finish_table(headers, rows)
 }
 
-/// Read a Parquet file into a Table (R-22). Nested list/struct/map are rejected.
-/// Errors are stable `analysis/*` strings (never raw OS / parquet Display leakage
-/// beyond our own mapping).
-/// Parse an `.xlsx` workbook (R-31). Reads one sheet: `sheet` is a sheet
-/// name, or a 0-based index as decimal digits; `None` = first sheet.
-/// Returns `(table, sheet_names_read_from)`.
+/// Parse an `.xlsx` workbook (R-31). Reads one sheet: `sheet` matches an
+/// exact sheet name first, else a 0-based index as decimal digits;
+/// `None` = first sheet. Returns `(table, sheet_names_read_from)`.
 pub fn parse_xlsx_path(path: &Path, sheet: Option<&str>) -> Result<(Table, Vec<String>), String> {
     use calamine::{open_workbook, Reader, Xlsx};
 
@@ -524,7 +521,11 @@ pub fn parse_xlsx_path(path: &Path, sheet: Option<&str>) -> Result<(Table, Vec<S
             if t.is_empty() {
                 return Err("analysis/invalid-args: --sheet must be a sheet name or 0-based index".into());
             }
-            if t.bytes().all(|b| b.is_ascii_digit()) {
+            // Exact name wins so all-digit sheet names (e.g. "2024") stay
+            // selectable; digits fall back to a 0-based index.
+            if let Some(n) = names.iter().find(|n| n.as_str() == t) {
+                n.clone()
+            } else if t.bytes().all(|b| b.is_ascii_digit()) {
                 let idx: usize = t.parse().map_err(|_| {
                     "analysis/invalid-args: --sheet must be a sheet name or 0-based index"
                         .to_string()
@@ -535,8 +536,6 @@ pub fn parse_xlsx_path(path: &Path, sheet: Option<&str>) -> Result<(Table, Vec<S
                         names.len()
                     )
                 })?
-            } else if let Some(n) = names.iter().find(|n| n.as_str() == t) {
-                n.clone()
             } else {
                 return Err(format!(
                     "analysis/invalid-args: unknown sheet {t} (available: {})",
@@ -569,13 +568,9 @@ pub fn parse_xlsx_path(path: &Path, sheet: Option<&str>) -> Result<(Table, Vec<S
                 .map(|(i, v)| match v {
                     Value::Str(s) => s.clone(),
                     Value::Null => format!("column{}", i + 1),
-                    other => match other {
-                        Value::I64(n) => n.to_string(),
-                        Value::F64(f) => format!("{f}"),
-                        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-                        Value::Str(s) => s.clone(),
-                        Value::Null => format!("column{}", i + 1),
-                    },
+                    Value::I64(n) => n.to_string(),
+                    Value::F64(f) => format!("{f}"),
+                    Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
                 })
                 .collect();
             header_done = true;
@@ -617,6 +612,10 @@ fn xlsx_cell_to_value(d: &calamine::Data) -> Value {
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::Str(s.clone()),
     }
 }
+
+/// Read a Parquet file into a Table (R-22). Nested list/struct/map are rejected.
+/// Errors are stable `analysis/*` strings (never raw OS / parquet Display leakage
+/// beyond our own mapping).
 pub fn parse_parquet_path(path: &Path) -> Result<Table, String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -1113,10 +1112,63 @@ fn record_key_order(el: &str) -> Result<Vec<String>, String> {
 }
 
 
-/// Re-coerce Utf8 cells in an internal storage table using the same rules as
-/// CSV `parse_cell` (R-32 mixed-column round-trip). External parquet ingest
-/// must NOT call this — string columns that look like numbers stay strings.
-fn recover_internal_value_types(table: &mut Table) {
+/// Decode one Utf8 cell written by the internal dataset writer (R-32).
+/// Internal writes encode `Value::Str` as a quoted JSON string and other
+/// scalars via `to_json` (unquoted), so `"007"` round-trips as a string while
+/// `7` round-trips as a number. Quoted → Str; unquoted → `parse_cell`.
+fn decode_internal_utf8_cell(s: &str) -> Value {
+    if s.starts_with('"') {
+        match json_string_decode(s) {
+            Some(u) => Value::Str(u),
+            // Malformed quoting — keep the raw text rather than inventing data.
+            None => Value::Str(s.to_string()),
+        }
+    } else {
+        parse_cell(s)
+    }
+}
+
+/// Reverse of `json_string`: strip the surrounding quotes and unescape
+/// (`\\`, `\"`, `\n`/`\r`/`\t`, `\uXXXX` for control chars the writer emits).
+fn json_string_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+        return None;
+    }
+    // Writer escapes every `"` and `\`, so the inner span is unambiguous.
+    let inner = &s[1..s.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let cp = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(cp)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Decode all Utf8 cells of an internal storage table and re-infer dtypes for
+/// columns whose values changed (R-32 mixed-column round-trip). Only for files
+/// written by `write_table_dataset` — external parquet ingest must NOT call
+/// this (its cells are real parquet values, not this encoding).
+fn decode_internal_utf8_cells(table: &mut Table) {
     for ci in 0..table.columns.len() {
         if table.columns[ci].dtype != "utf8" {
             continue;
@@ -1124,10 +1176,10 @@ fn recover_internal_value_types(table: &mut Table) {
         let mut changed = false;
         for row in table.rows.iter_mut() {
             if let Some(Value::Str(s)) = row.get(ci) {
-                let parsed = parse_cell(s);
-                let same = matches!((&parsed, s), (Value::Str(a), b) if a == b);
+                let decoded = decode_internal_utf8_cell(s);
+                let same = matches!((&decoded, s), (Value::Str(a), b) if a == b);
                 if !same {
-                    row[ci] = parsed;
+                    row[ci] = decoded;
                     changed = true;
                 }
             }
@@ -1371,11 +1423,13 @@ impl Meta {
 }
 
 /// Write dataset bytes as Parquet (R-32 columnar storage). Returns (bytes, path).
+/// Utf8 cells use the internal encoding (Str quoted via `to_json`) so
+/// `decode_internal_utf8_cells` can restore exact values on load.
 pub fn write_table_dataset(workspace: &Path, id: &str, table: &Table) -> Result<(u64, PathBuf), String> {
     let dir = datasets_dir(workspace);
     fs::create_dir_all(&dir).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
     let path = dir.join(format!("{id}.parquet"));
-    write_table_parquet(&path, table)?;
+    write_table_parquet_impl(&path, table, true)?;
     let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     Ok((bytes, path))
 }
@@ -1385,8 +1439,16 @@ pub fn write_table_parquet_placeholder(workspace: &Path, id: &str, table: &Table
     write_table_dataset(workspace, id, table)
 }
 
-/// Serialize a Table to Parquet at `path` (shared by internal storage + export).
+/// Serialize a Table to Parquet at `path` for **export** (string cells raw —
+/// the inverse of the ingest type map; external consumers read plain strings).
 pub fn write_table_parquet(path: &Path, table: &Table) -> Result<u64, String> {
+    write_table_parquet_impl(path, table, false)
+}
+
+/// `quote_strings`: internal dataset storage encodes `Value::Str` cells as
+/// quoted JSON (`to_json`) and other scalars raw, so load can distinguish
+/// `"7"` (string) from `7` (number). Export passes `false` (raw strings).
+fn write_table_parquet_impl(path: &Path, table: &Table, quote_strings: bool) -> Result<u64, String> {
     use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
@@ -1446,6 +1508,7 @@ pub fn write_table_parquet(path: &Path, table: &Table) -> Result<u64, String> {
                 .map(|r| match r.get(i) {
                     None | Some(Value::Null) => None,
                     other => Some(match other.unwrap() {
+                        Value::Str(s) if quote_strings => json_string(s),
                         Value::Str(s) => s.clone(),
                         v => v.to_json(),
                     }),
@@ -1556,9 +1619,9 @@ pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String>
     // R-32: prefer Parquet (new writes); fall back to legacy CSV.
     let table = if parquet_path.exists() {
         let mut t = parse_parquet_path(&parquet_path)?;
-        // Internal mixed columns are stored as Utf8 via to_json; recover
-        // scalar types the same way the legacy CSV parse_cell path did.
-        recover_internal_value_types(&mut t);
+        // Internal storage Utf8 cells carry the internal encoding (quoted
+        // strings vs raw scalars) — decode them back to exact Values.
+        decode_internal_utf8_cells(&mut t);
         t
     } else {
         parse_csv_path(&csv_path)?
@@ -1579,7 +1642,7 @@ pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String>
 }
 
 /// Extract a JSON string array field: `"name":["a","b"]`. Missing → empty vec.
-fn extract_string_array(raw: &str, field: &str) -> Vec<String> {
+pub(crate) fn extract_string_array(raw: &str, field: &str) -> Vec<String> {
     let needle = format!("\"{field}\":[");
     let Some(start) = raw.find(&needle) else {
         return Vec::new();
@@ -1723,7 +1786,7 @@ pub fn list_dataset_summaries(workspace: &Path) -> Result<Vec<DatasetSummary>, S
     Ok(out)
 }
 
-fn extract_u64(raw: &str, key: &str) -> Option<u64> {
+pub(crate) fn extract_u64(raw: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\":");
     let idx = raw.find(&needle)?;
     let rest = raw[idx + needle.len()..].trim_start();
@@ -1731,7 +1794,7 @@ fn extract_u64(raw: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn extract_string(raw: &str, key: &str) -> Option<String> {
+pub(crate) fn extract_string(raw: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":");
     let idx = raw.find(&needle)?;
     let rest = &raw[idx + needle.len()..];
