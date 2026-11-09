@@ -61,6 +61,8 @@ pub(crate) fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
             label: Some(out_label),
             produced_by: "agg".into(),
             parent_dataset_id: Some(id.clone()),
+            parent_dataset_ids: vec![id.clone()],
+            source_checksum: None,
         };
         save_meta(workspace, &meta).map_err(|e| {
             eprintln!("{e}");
@@ -69,26 +71,25 @@ pub(crate) fn cmd_agg(workspace: &Path, args: &[String]) -> Result<String, u8> {
         out_dataset_id = new_id;
     }
 
+    // R-36-A + R-37: always inline-preview up to `budget_rows` rows.
+    // Full result still requires `--out` / `export` when rowCount > budget.
+    // With `--out`, data is also persisted; inline rows are a preview only.
     let budget_rows = 20;
-    let include_rows = out_dataset_id.is_empty() && result.rows.len() <= budget_rows;
-    let truncated =
-        !include_rows && (out_dataset_id.is_empty() || result.rows.len() > budget_rows);
+    let include_count = result.rows.len().min(budget_rows);
+    let truncated = result.rows.len() > budget_rows;
     let cols: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
-    let rows_json = if include_rows {
-        result
-            .rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "[{}]",
-                    row.iter().map(|v| v.to_json()).collect::<Vec<_>>().join(",")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    } else {
-        String::new()
-    };
+    let rows_json = result
+        .rows
+        .iter()
+        .take(include_count)
+        .map(|row| {
+            format!(
+                "[{}]",
+                row.iter().map(|v| v.to_json()).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
 
     let mut extra = String::new();
     if outcome.parse_fail_count > 0 {

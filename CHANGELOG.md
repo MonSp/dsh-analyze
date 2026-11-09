@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.1.12
+
+Full batch from the post-v0.1.11 requirement lists: agg inline rows budget
+(R-36/R-37) plus R-31..R-35 (xlsx ingest, columnar storage, provenance,
+corr --by, category label normalization).
+
+### Added
+
+- `ingest --format xlsx` (R-31, calamine): first sheet or `--sheet
+  <name|index>`; multi-sheet → `sheet-skipped` warning; corrupt/password →
+  exit 2 actionable; `.xlsm` stays exit 4 (`save as .xlsx`).
+- Dataset storage is Parquet (R-32): new writes go to `{id}.parquet`;
+  legacy `{id}.csv` remains readable (lazy fallback). `rm` removes both.
+- Provenance (R-33): ingest records `sourceChecksum` (`sha256:…`);
+  every derived set records `parentDatasetIds` (join/union/diff =
+  `[left, right]`; `parentDatasetId` stays first parent). New
+  `verify` / `dataset_verify` command + capability token
+  (`--check-source` re-hashes the source file). `dataset_list` surfaces
+  both fields.
+- `corr --by g1[,g2…]` (R-34): per-group pairwise pairs with `by` keys;
+  caps 50 groups / 100 pairs + `corr-groups-truncated` /
+  `corr-pairs-truncated` warnings.
+- Crosstab/pivot numeric category keys normalize whole-number floats (R-35):
+  mixed `1` / `1.0` merge to a single `1` label; `1.5` stays exact.
+
+### Fixed
+
+- `agg` / `transform_agg` always return up to **20** inline preview rows
+  (`min(20, rowCount)`), with or without `--out` (R-36-A, R-37). Previously
+  `include_rows = out.is_empty() && len <= 20` dropped all rows when
+  `rowCount > 20` without `--out` (`rows:[]` + `outDatasetId:null` — data
+  unreachable) and always returned `rows:[]` when `--out` was set (even for
+  small results). `truncated` is now simply `rowCount > 20`. Full results
+  still require `--out` / `export`; with `--out` the dataset is persisted as
+  before (`producedBy: "agg"`).
+- Tool-layer `transform_agg` render no longer claims “full result stored”
+  for a `truncated` response without `outDatasetId`; it prompts
+  `re-run with outLabel` instead, and surfaces the inline preview count when
+  a store is present.
+
+### Changed
+
+- Interface contract updated in `docs/interface.md` (v0.1.12); security
+  output-hygiene note matches the preview budget; xlsx ingest and storage
+  notes no longer claim exit-4 / CSV-placeholder.
+- Version and `version` capabilities: `0.1.12` (token list appends `verify`).
+- Package version `dsh-analyze@0.1.12`. New deps: `calamine` (xlsx read),
+  `sha2` (sourceChecksum).
+
 ## 0.1.11
 
 P0 correctness batch (R-29..R-30) from the post-v0.1.10 requirement list:

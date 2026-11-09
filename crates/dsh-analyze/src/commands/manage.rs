@@ -242,123 +242,7 @@ fn write_export_xlsx(path: &Path, table: &crate::dataset::Table) -> Result<u64, 
 }
 
 fn write_export_parquet(path: &Path, table: &crate::dataset::Table) -> Result<u64, String> {
-    use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-    use std::sync::Arc;
-
-    let mut fields = Vec::with_capacity(table.columns.len());
-    let mut arrays: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(table.columns.len());
-    for (i, col) in table.columns.iter().enumerate() {
-        let rows = &table.rows;
-        // K3: no value evidence (empty table or all-null column) -> honor the
-        // declared column dtype. Never let "saw nothing" collapse to Boolean.
-        let has_non_null = rows
-            .iter()
-            .any(|r| matches!(r.get(i), Some(v) if !matches!(v, Value::Null)));
-        if !has_non_null {
-            let dt = match col.dtype.as_str() {
-                "bool" => DataType::Boolean,
-                "i64" => DataType::Int64,
-                "f64" => DataType::Float64,
-                _ => DataType::Utf8,
-            };
-            fields.push(Field::new(&col.name, dt.clone(), true));
-            let n = rows.len();
-            match dt {
-                DataType::Boolean => {
-                    arrays.push(Arc::new(BooleanArray::from(vec![None::<bool>; n])))
-                }
-                DataType::Int64 => arrays.push(Arc::new(Int64Array::from(vec![None::<i64>; n]))),
-                DataType::Float64 => {
-                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>; n])))
-                }
-                _ => arrays.push(Arc::new(StringArray::from(vec![None::<String>; n]))),
-            }
-            continue;
-        }
-        let all_i64 = rows.iter().all(|r| {
-            matches!(
-                r.get(i),
-                None | Some(Value::Null) | Some(Value::I64(_))
-            )
-        });
-        let all_f64 = rows.iter().all(|r| {
-            matches!(
-                r.get(i),
-                None | Some(Value::Null) | Some(Value::I64(_)) | Some(Value::F64(_))
-            )
-        });
-        let all_bool = rows
-            .iter()
-            .all(|r| matches!(r.get(i), None | Some(Value::Null) | Some(Value::Bool(_))));
-        let has_f = rows
-            .iter()
-            .any(|r| matches!(r.get(i), Some(Value::F64(_))));
-        let has_str = rows
-            .iter()
-            .any(|r| matches!(r.get(i), Some(Value::Str(_))));
-
-        if has_str || (!all_i64 && !all_f64 && !all_bool) {
-            fields.push(Field::new(&col.name, DataType::Utf8, true));
-            let vals: Vec<Option<String>> = rows
-                .iter()
-                .map(|r| match r.get(i) {
-                    None | Some(Value::Null) => None,
-                    other => Some(match other.unwrap() {
-                        Value::Str(s) => s.clone(),
-                        v => v.to_json(),
-                    }),
-                })
-                .collect();
-            arrays.push(Arc::new(StringArray::from(vals)));
-        } else if all_bool && !has_f {
-            fields.push(Field::new(&col.name, DataType::Boolean, true));
-            let vals: Vec<Option<bool>> = rows
-                .iter()
-                .map(|r| match r.get(i) {
-                    Some(Value::Bool(b)) => Some(*b),
-                    _ => None,
-                })
-                .collect();
-            arrays.push(Arc::new(BooleanArray::from(vals)));
-        } else if has_f || !all_i64 {
-            fields.push(Field::new(&col.name, DataType::Float64, true));
-            let vals: Vec<Option<f64>> = rows
-                .iter()
-                .map(|r| match r.get(i) {
-                    Some(Value::I64(v)) => Some(*v as f64),
-                    Some(Value::F64(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            arrays.push(Arc::new(Float64Array::from(vals)));
-        } else {
-            fields.push(Field::new(&col.name, DataType::Int64, true));
-            let vals: Vec<Option<i64>> = rows
-                .iter()
-                .map(|r| match r.get(i) {
-                    Some(Value::I64(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            arrays.push(Arc::new(Int64Array::from(vals)));
-        }
-    }
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    let file = fs::File::create(path)
-        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)
-        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    writer
-        .write(&batch)
-        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    writer
-        .close()
-        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    Ok(fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+    crate::dataset::write_table_parquet(path, table)
 }
 
 pub(crate) fn cmd_rm(workspace: &Path, args: &[String]) -> Result<String, u8> {
@@ -371,15 +255,227 @@ pub(crate) fn cmd_rm(workspace: &Path, args: &[String]) -> Result<String, u8> {
     }
     let dir = datasets_dir(workspace);
     let meta = dir.join(format!("{id}.meta.json"));
-    let data = dir.join(format!("{id}.csv"));
+    let data_csv = dir.join(format!("{id}.csv"));
+    let data_parquet = dir.join(format!("{id}.parquet"));
     if !meta.exists() {
         return fail(5, "analysis/unknown-dataset");
     }
     let _ = fs::remove_file(&meta);
-    let _ = fs::remove_file(&data);
+    let _ = fs::remove_file(&data_csv);
+    let _ = fs::remove_file(&data_parquet);
     let _ = crate::dataset::analysis_dir(workspace);
     Ok(format!(
         "{{\"ok\":true,\"datasetId\":{},\"removed\":true}}",
         json_string(&id)
     ))
+}
+
+/// R-33: verify dataset integrity (meta + data file + parent chain + optional source rehash).
+/// exit 0 all ok; 1 mismatch; 5 unknown dataset.
+pub(crate) fn cmd_verify(workspace: &Path, args: &[String]) -> Result<String, u8> {
+    use crate::dataset::{ensure_within_workspace, load_dataset, sha256_hex};
+    let id = match flag_value(args, "--dataset-id") {
+        Some(v) => v.to_string(),
+        None => return fail(2, "analysis/invalid-args: --dataset-id required"),
+    };
+    if let Err(e) = crate::dataset::validate_dataset_id(&id) {
+        return fail(2, &e);
+    }
+    let check_source = args.iter().any(|a| a == "--check-source");
+    let dir = datasets_dir(workspace);
+    let meta_path = dir.join(format!("{id}.meta.json"));
+    let pq = dir.join(format!("{id}.parquet"));
+    let csv = dir.join(format!("{id}.csv"));
+    if !meta_path.exists() {
+        return fail(5, "analysis/unknown-dataset");
+    }
+
+    let mut checks: Vec<String> = Vec::new();
+    let mut mismatches: Vec<String> = Vec::new();
+
+    let data_ok = pq.exists() || csv.exists();
+    checks.push(format!(
+        "{{\"name\":\"data-file\",\"ok\":{}}}",
+        if data_ok { "true" } else { "false" }
+    ));
+    if !data_ok {
+        mismatches.push("data-file missing".into());
+    }
+
+    let meta_raw = fs::read_to_string(&meta_path).map_err(|e| {
+        eprintln!(
+            "analysis/cli-failed: cannot read file: {}",
+            crate::dataset::io_read_reason(&e)
+        );
+        1u8
+    })?;
+
+    let declared_rows = meta_field_u64(&meta_raw, "rowCount").unwrap_or(0);
+    let actual_rows = if data_ok {
+        load_dataset(workspace, &id).map(|(_, t)| t.rows.len() as u64).ok()
+    } else {
+        None
+    };
+    let rows_ok = actual_rows == Some(declared_rows);
+    checks.push(format!(
+        "{{\"name\":\"row-count\",\"ok\":{rows_ok},\"declared\":{declared_rows},\"actual\":{}}}",
+        actual_rows
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".into())
+    ));
+    if !rows_ok {
+        mismatches.push(format!(
+            "rowCount declared={declared_rows} actual={}",
+            actual_rows
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "missing".into())
+        ));
+    }
+
+    let parents = meta_field_string_array(&meta_raw, "parentDatasetIds");
+    let parents_ok = parents
+        .iter()
+        .all(|p| dir.join(format!("{p}.meta.json")).exists());
+    checks.push(format!(
+        "{{\"name\":\"parents\",\"ok\":{parents_ok},\"count\":{}}}",
+        parents.len()
+    ));
+    if !parents_ok {
+        mismatches.push("parent dataset missing".into());
+    }
+
+    if check_source {
+        let expected = meta_field_string(&meta_raw, "sourceChecksum");
+        let source_path = meta_field_string(&meta_raw, "sourcePath").unwrap_or_default();
+        match expected {
+            None => {
+                checks.push("{\"name\":\"source\",\"ok\":true,\"skipped\":\"no-checksum\"}".into());
+            }
+            Some(expected) => {
+                let status = match ensure_within_workspace(workspace, std::path::Path::new(&source_path))
+                {
+                    Ok(p) if p.is_file() => match fs::read(&p) {
+                        Ok(bytes) => {
+                            let got = sha256_hex(&bytes);
+                            if got == expected {
+                                "ok".to_string()
+                            } else {
+                                mismatches.push(format!(
+                                    "source checksum mismatch: expected {expected} got {got}"
+                                ));
+                                "mismatch".to_string()
+                            }
+                        }
+                        Err(_) => {
+                            mismatches.push("source unreadable".into());
+                            "unreadable".to_string()
+                        }
+                    },
+                    _ => {
+                        mismatches.push("source missing".into());
+                        "missing".to_string()
+                    }
+                };
+                checks.push(format!(
+                    "{{\"name\":\"source\",\"ok\":{},\"status\":\"{status}\"}}",
+                    status == "ok"
+                ));
+            }
+        }
+    }
+
+    let ok = mismatches.is_empty();
+    let line = format!(
+        "{{\"ok\":{},\"datasetId\":{},\"checks\":[{}],\"mismatches\":[{}]}}",
+        if ok { "true" } else { "false" },
+        json_string(&id),
+        checks.join(","),
+        mismatches
+            .iter()
+            .map(|m| json_string(m))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if ok {
+        Ok(line)
+    } else {
+        eprintln!(
+            "analysis/invalid-args: dataset verify failed: {}",
+            mismatches.join("; ")
+        );
+        println!("{line}");
+        Err(1u8)
+    }
+}
+
+fn meta_field_u64(raw: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let idx = raw.find(&needle)?;
+    let rest = raw[idx + needle.len()..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn meta_field_string(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let idx = raw.find(&needle)?;
+    let rest = raw[idx + needle.len()..].trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = rest[1..].chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            break;
+        }
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn meta_field_string_array(raw: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\":[");
+    let Some(start) = raw.find(&needle) else {
+        return Vec::new();
+    };
+    let rest = &raw[start + needle.len()..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    let inner = &rest[..end];
+    let mut out = Vec::new();
+    let mut i = 0;
+    let b = inner.as_bytes();
+    while i < b.len() {
+        while i < b.len() && (b[i] == b' ' || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'"' {
+            break;
+        }
+        i += 1;
+        let mut s = String::new();
+        while i < b.len() && b[i] != b'"' {
+            if b[i] == b'\\' && i + 1 < b.len() {
+                i += 1;
+            }
+            s.push(b[i] as char);
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'"' {
+            i += 1;
+        }
+        out.push(s);
+    }
+    out
 }

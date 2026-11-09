@@ -728,13 +728,17 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           },
           format: {
             type: 'string',
-            enum: ['csv', 'json', 'jsonl', 'parquet'],
+            enum: ['csv', 'json', 'jsonl', 'parquet', 'xlsx'],
             description: 'Source format. Omit to infer from extension.',
           },
           encoding: {
             type: 'string',
             enum: ['utf-8', 'gbk', 'gb18030', 'auto'],
             description: 'CSV text encoding (csv only). Default utf-8.',
+          },
+          sheet: {
+            type: 'string',
+            description: 'xlsx only: sheet name or 0-based index. Default first sheet (R-31).',
           },
           label: { type: 'string', description: 'Optional short label for humans.' },
         },
@@ -781,7 +785,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         },
       },
       async execute(args: unknown, exec?: { signal?: AbortSignal }) {
-        const a = args as { path: string; format?: string; label?: string; encoding?: string }
+        const a = args as { path: string; format?: string; label?: string; encoding?: string; sheet?: string }
         if (typeof a.path !== 'string' || a.path.length === 0 || a.path.length > MAX_PATH_LEN) {
           throw invalidArgs('path length invalid')
         }
@@ -803,16 +807,18 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         }
         const abs = resolveInWorkspace(ws, a.path)
         assertNotSensitiveSource(abs, config.profileRoot)
-        // parquet is enabled (R-22); xlsx remains rejected pre-spawn.
-        // Format is case-insensitive (parity with the CLI).
+        // Format is case-insensitive (parity with the CLI). xlsx allowed (R-31).
         const format = typeof a.format === 'string' && a.format ? a.format.toLowerCase() : undefined
-        if (format === 'xlsx') {
-          throw limitError('xlsx not supported (convert to csv/jsonl)')
-        }
         const cliArgs = ['ingest', '--input', a.path, '--dataset-id', newDatasetId()]
         if (format) cliArgs.push('--format', format)
         if (a.label) cliArgs.push('--label', a.label)
         if (encoding) cliArgs.push('--encoding', encoding)
+        if (a.sheet !== undefined && a.sheet !== null && a.sheet !== '') {
+          if (format && format !== 'xlsx' && format !== 'xlsm') {
+            throw invalidArgs('--sheet only applies to xlsx')
+          }
+          cliArgs.push('--sheet', String(a.sheet))
+        }
         const result = await run(cliArgs, exec?.signal)
         return result.data
       },
@@ -1130,6 +1136,65 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       },
     },
 
+    dataset_verify: {
+      name: 'dataset_verify',
+      description:
+        'Verify dataset integrity (R-33): data file present, rowCount matches, parent chain resolves. ' +
+        'With checkSource, re-hashes the ingest source file and compares to sourceChecksum. ' +
+        'Returns checks[] + mismatches[]; exit 0 when clean, 1 on mismatch.',
+      parameters: {
+        type: 'object',
+        properties: {
+          datasetId: { type: 'string' },
+          checkSource: {
+            type: 'boolean',
+            description: 'Re-hash the original source file against sourceChecksum (ingest datasets only).',
+          },
+        },
+        required: ['datasetId'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            datasetId: { type: 'string' },
+            checks: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            mismatches: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['ok', 'datasetId'],
+          additionalProperties: true,
+        },
+        render(_args: unknown, value: unknown) {
+          const v = value as {
+            ok: boolean
+            datasetId: string
+            checks?: Array<{ name: string; ok: boolean }>
+            mismatches?: string[]
+          }
+          const lines = (v.checks ?? []).map(
+            (c) => `- ${c.name}: ${c.ok ? 'ok' : 'FAIL'}`,
+          )
+          const bad = v.mismatches ?? []
+          return textRender(withWarnings(
+            `verify ${v.datasetId}: ${v.ok ? 'ok' : 'FAILED'}` +
+              (bad.length ? `\n${bad.join('\n')}` : '') +
+              (lines.length ? `\n${lines.join('\n')}` : ''),
+            value,
+          ))
+        },
+      },
+      async execute(args: unknown, exec?: { signal?: AbortSignal }) {
+        const a = args as { datasetId: string; checkSource?: boolean }
+        validateDatasetId(a.datasetId)
+        const cliArgs = ['verify', '--dataset-id', a.datasetId]
+        if (a.checkSource) cliArgs.push('--check-source')
+        const result = await run(cliArgs, exec?.signal)
+        return result.data
+      },
+    },
+
     stats_describe: {
       name: 'stats_describe',
       description:
@@ -1193,6 +1258,8 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
         'spec may include window ops, mutate derived columns, time-period groupBy objects, having, and topKPerGroup. ' +
         'Pipeline order: filter → window → topKPerGroup → mutate → group/agg → having → select → orderBy → limit. ' +
         'Returns at most `limit` rows (default 1000). ' +
+        'Inline response always previews up to 20 rows (truncated when rowCount > 20); ' +
+        'full result needs outLabel / export. ' +
         'Set outLabel to persist a new datasetId for further steps.',
       parameters: {
         type: 'object',
@@ -1249,12 +1316,25 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             outDatasetId?: string | null
             rowCount: number
             columns: string[]
+            rows?: unknown[]
             truncated?: boolean
           }
-          if (v.truncated || v.outDatasetId) {
+          const preview = Array.isArray(v.rows) ? v.rows.length : 0
+          const cols = (v.columns ?? []).join(',')
+          // R-36: truncated + no store → preview only; full needs outLabel.
+          // R-37: truncated + store → preview + full on disk.
+          // Otherwise (≤ budget): full rows are present inline (± stored).
+          if (v.truncated && !v.outDatasetId) {
             return textRender(withWarnings(
-              `agg → ${v.outDatasetId ?? v.datasetId}: ${v.rowCount} rows ` +
-                `(full result stored; use dataset_head or further agg). columns=${(v.columns ?? []).join(',')}`,
+              `agg → ${v.datasetId}: ${v.rowCount} rows ` +
+                `(inline preview ${preview}/${v.rowCount}; re-run with outLabel for full result). columns=${cols}`,
+              value,
+            ))
+          }
+          if (v.truncated && v.outDatasetId) {
+            return textRender(withWarnings(
+              `agg → ${v.outDatasetId}: ${v.rowCount} rows ` +
+                `(full result stored; inline preview ${preview}/${v.rowCount}; use dataset_head for the rest). columns=${cols}`,
               value,
             ))
           }
@@ -1820,6 +1900,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
       description:
         'Pairwise correlations among numeric-capable columns (Pearson or Spearman). ' +
         'Returns top pairs sorted by |r| with sample size n and two-sided pValue (Student-t approx) — never a full matrix dump beyond the pair cap. ' +
+        'Optional `by` groups compute the same pairs within each group (R-34). ' +
         'Use to find co-moving numeric signals before deeper agg; treat n<30 or large p as weak evidence.',
       parameters: {
         type: 'object',
@@ -1844,6 +1925,13 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             type: 'number',
             description: 'Pairs with n below this report r=null (default 2).',
           },
+          by: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional 1..4 grouping columns (R-34): compute pairwise corr within each group. ' +
+              'Each pair carries a `by` array; groupCount/groupsEmitted and corr-groups-truncated warning when capped.',
+          },
         },
         required: ['datasetId', 'columns'],
         additionalProperties: false,
@@ -1858,6 +1946,9 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             columns: { type: 'array', items: { type: 'string' } },
             pairs: { type: 'array', items: { type: 'object', additionalProperties: true } },
             truncated: { type: 'boolean' },
+            by: { type: 'array', items: { type: 'string' } },
+            groupCount: { type: 'number' },
+            groupsEmitted: { type: 'number' },
           },
           required: ['datasetId', 'method', 'pairs'],
           additionalProperties: true,
@@ -1871,13 +1962,17 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             truncated?: boolean
           }
           const lines = (v.pairs ?? []).map((p) => {
-            const pval = (p as { pValue?: number | null }).pValue
+            const pval = (p as { pValue?: number | null; by?: unknown[] }).pValue
+            const by = (p as { by?: unknown[] }).by
             const pStr = pval == null ? 'p=null' : `p=${pval}`
-            return `- ${p.columns.join('×')}: r=${p.r == null ? 'null' : p.r} n=${p.n} ${pStr}` +
+            const byStr = Array.isArray(by) && by.length ? ` by=[${by.join(',')}]` : ''
+            return `- ${p.columns.join('×')}${byStr}: r=${p.r == null ? 'null' : p.r} n=${p.n} ${pStr}` +
               (p.degenerate ? ' (degenerate)' : '')
           })
+          const byArr = (v as { by?: string[] }).by
+          const byTop = Array.isArray(byArr) && byArr.length ? ` by=${byArr.join(',')}` : ''
           return textRender(withWarnings(
-            `corr ${v.datasetId} method=${v.method ?? 'pearson'} pairwise=${v.pairwise ?? 'complete'}` +
+            `corr ${v.datasetId} method=${v.method ?? 'pearson'} pairwise=${v.pairwise ?? 'complete'}${byTop}` +
               (v.truncated ? ' [pairs truncated]' : '') +
               '\n' +
               (lines.join('\n') || '  (no pairs)'),
@@ -1892,6 +1987,7 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
           method?: string
           pairwise?: string
           minNumeric?: number
+          by?: string[]
         }
         validateDatasetId(a.datasetId)
         if (!Array.isArray(a.columns) || a.columns.length < 2 || a.columns.length > limits.maxCorrColumns) {
@@ -1943,6 +2039,19 @@ export function createAnalysisToolDefinitions(config: AnalysisRuntimeConfig) {
             throw err
           }
           cliArgs.push('--min-numeric', String(n))
+        }
+        if (a.by !== undefined && a.by !== null) {
+          if (!Array.isArray(a.by) || a.by.length < 1 || a.by.length > 4) {
+            const err = new Error('analysis/invalid-args: by must be 1..4 column names') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          if (a.by.some(c => typeof c !== 'string' || !c.trim())) {
+            const err = new Error('analysis/invalid-args: by entries must be non-empty strings') as Error & { code?: string }
+            err.code = 'analysis/invalid-args'
+            throw err
+          }
+          cliArgs.push('--by', a.by.join(','))
         }
         const result = await run(cliArgs, exec?.signal)
         return result.data

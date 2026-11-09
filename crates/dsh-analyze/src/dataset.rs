@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,22 @@ impl std::hash::Hash for Value {
 }
 
 impl Value {
+    /// Canonical category key (R-35): whole-number floats share the integer
+    /// category so mixed `1` / `1.0` never yield duplicate labels.
+    pub fn category_key(&self) -> Value {
+        match self {
+            Value::F64(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f >= i64::MIN as f64
+                    && *f <= i64::MAX as f64 =>
+            {
+                Value::I64(*f as i64)
+            }
+            other => other.clone(),
+        }
+    }
+
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::I64(v) => Some(*v as f64),
@@ -487,6 +503,120 @@ pub fn parse_jsonl_path(path: &Path) -> Result<Table, String> {
 /// Read a Parquet file into a Table (R-22). Nested list/struct/map are rejected.
 /// Errors are stable `analysis/*` strings (never raw OS / parquet Display leakage
 /// beyond our own mapping).
+/// Parse an `.xlsx` workbook (R-31). Reads one sheet: `sheet` is a sheet
+/// name, or a 0-based index as decimal digits; `None` = first sheet.
+/// Returns `(table, sheet_names_read_from)`.
+pub fn parse_xlsx_path(path: &Path, sheet: Option<&str>) -> Result<(Table, Vec<String>), String> {
+    use calamine::{open_workbook, Reader, Xlsx};
+
+    let mut workbook: Xlsx<_> = open_workbook(path).map_err(|_| {
+        "analysis/invalid-args: cannot read xlsx (file is corrupt or password-protected)"
+            .to_string()
+    })?;
+    let names = workbook.sheet_names();
+    if names.is_empty() {
+        return Err("analysis/invalid-args: cannot read xlsx (no sheets)".into());
+    }
+    let target = match sheet {
+        None => names[0].clone(),
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Err("analysis/invalid-args: --sheet must be a sheet name or 0-based index".into());
+            }
+            if t.bytes().all(|b| b.is_ascii_digit()) {
+                let idx: usize = t.parse().map_err(|_| {
+                    "analysis/invalid-args: --sheet must be a sheet name or 0-based index"
+                        .to_string()
+                })?;
+                names.get(idx).cloned().ok_or_else(|| {
+                    format!(
+                        "analysis/invalid-args: sheet index {idx} out of range (0..{})",
+                        names.len()
+                    )
+                })?
+            } else if let Some(n) = names.iter().find(|n| n.as_str() == t) {
+                n.clone()
+            } else {
+                return Err(format!(
+                    "analysis/invalid-args: unknown sheet {t} (available: {})",
+                    names.join(", ")
+                ));
+            }
+        }
+    };
+
+    let range = workbook
+        .worksheet_range(&target)
+        .map_err(|_| "analysis/invalid-args: cannot read xlsx (file is corrupt or password-protected)")?;
+
+    // First non-empty row = header; remaining rows = data.
+    let mut headers: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut header_done = false;
+    for row in range.rows() {
+        let cells: Vec<Value> = row.iter().map(xlsx_cell_to_value).collect();
+        let is_empty = cells
+            .iter()
+            .all(|v| matches!(v, Value::Null));
+        if is_empty {
+            continue;
+        }
+        if !header_done {
+            headers = cells
+                .iter()
+                .enumerate()
+                .map(|(i, v)| match v {
+                    Value::Str(s) => s.clone(),
+                    Value::Null => format!("column{}", i + 1),
+                    other => match other {
+                        Value::I64(n) => n.to_string(),
+                        Value::F64(f) => format!("{f}"),
+                        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+                        Value::Str(s) => s.clone(),
+                        Value::Null => format!("column{}", i + 1),
+                    },
+                })
+                .collect();
+            header_done = true;
+        } else {
+            // Pad / trim to header width.
+            let mut r = cells;
+            r.resize(headers.len(), Value::Null);
+            rows.push(r);
+        }
+    }
+    if !header_done {
+        return Err("analysis/invalid-args: cannot read xlsx (sheet is empty)".into());
+    }
+    // Deduplicate header names (first-seen wins, later get _2 …).
+    {
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for h in headers.iter_mut() {
+            let base = h.clone();
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            if *n > 1 {
+                *h = format!("{base}_{}", *n);
+            }
+        }
+    }
+    let table = finish_table(headers, rows)?;
+    Ok((table, names))
+}
+
+fn xlsx_cell_to_value(d: &calamine::Data) -> Value {
+    use calamine::Data;
+    match d {
+        Data::Empty | Data::Error(_) => Value::Null,
+        Data::Int(i) => Value::I64(*i),
+        Data::Float(f) => Value::F64(*f),
+        Data::String(s) => Value::Str(s.clone()),
+        Data::Bool(b) => Value::Bool(*b),
+        Data::DateTime(dt) => Value::F64(dt.as_f64()),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => Value::Str(s.clone()),
+    }
+}
 pub fn parse_parquet_path(path: &Path) -> Result<Table, String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -982,6 +1112,33 @@ fn record_key_order(el: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+
+/// Re-coerce Utf8 cells in an internal storage table using the same rules as
+/// CSV `parse_cell` (R-32 mixed-column round-trip). External parquet ingest
+/// must NOT call this — string columns that look like numbers stay strings.
+fn recover_internal_value_types(table: &mut Table) {
+    for ci in 0..table.columns.len() {
+        if table.columns[ci].dtype != "utf8" {
+            continue;
+        }
+        let mut changed = false;
+        for row in table.rows.iter_mut() {
+            if let Some(Value::Str(s)) = row.get(ci) {
+                let parsed = parse_cell(s);
+                let same = matches!((&parsed, s), (Value::Str(a), b) if a == b);
+                if !same {
+                    row[ci] = parsed;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let vals: Vec<Value> = table.rows.iter().map(|r| r[ci].clone()).collect();
+            table.columns[ci].dtype = infer_dtype(&vals);
+        }
+    }
+}
+
 fn finish_table(headers: Vec<String>, rows: Vec<Vec<Value>>) -> Result<Table, String> {
     if headers.is_empty() {
         return Err("analysis/cli-failed: no columns".into());
@@ -1159,6 +1316,11 @@ pub struct Meta {
     pub label: Option<String>,
     pub produced_by: String,
     pub parent_dataset_id: Option<String>,
+    /// R-33: full parent chain (join/union/diff = [left, right]; legacy metas
+    /// fall back to `[parentDatasetId]` on load).
+    pub parent_dataset_ids: Vec<String>,
+    /// R-33: `sha256:<hex>` of the ingest source file bytes; derived sets null.
+    pub source_checksum: Option<String>,
 }
 
 impl Meta {
@@ -1170,7 +1332,7 @@ impl Meta {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"version\":1,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"sourceKind\":{},\"sourcePath\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"createdAt\":{}}}",
+            "{{\"version\":1,\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"columns\":[{}],\"sourceKind\":{},\"sourcePath\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"parentDatasetIds\":[{}],\"sourceChecksum\":{},\"createdAt\":{}}}",
             json_string(&self.dataset_id),
             self.row_count,
             self.columns.len(),
@@ -1183,6 +1345,15 @@ impl Meta {
                 .unwrap_or_else(|| "null".into()),
             json_string(&self.produced_by),
             self.parent_dataset_id
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            self.parent_dataset_ids
+                .iter()
+                .map(|p| json_string(p))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.source_checksum
                 .as_deref()
                 .map(json_string)
                 .unwrap_or_else(|| "null".into()),
@@ -1199,35 +1370,146 @@ impl Meta {
     }
 }
 
-pub fn write_table_parquet_placeholder(workspace: &Path, id: &str, table: &Table) -> Result<(u64, PathBuf), String> {
-    // T0 stores a simple CSV next to meta; format name "csv" until Parquet lands.
+/// Write dataset bytes as Parquet (R-32 columnar storage). Returns (bytes, path).
+pub fn write_table_dataset(workspace: &Path, id: &str, table: &Table) -> Result<(u64, PathBuf), String> {
     let dir = datasets_dir(workspace);
     fs::create_dir_all(&dir).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    let path = dir.join(format!("{id}.csv"));
-    let mut f = fs::File::create(&path).map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    let header = table
-        .columns
-        .iter()
-        .map(|c| csv_escape(&c.name))
-        .collect::<Vec<_>>()
-        .join(",");
-    writeln!(f, "{header}").map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    for row in &table.rows {
-        let line = row
-            .iter()
-            .map(|v| match v {
-                Value::Null => String::new(),
-                Value::Str(s) => csv_escape(s),
-                other => other.to_json(),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        writeln!(f, "{line}").map_err(|_| "analysis/cli-failed: write failed".to_string())?;
-    }
+    let path = dir.join(format!("{id}.parquet"));
+    write_table_parquet(&path, table)?;
     let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     Ok((bytes, path))
 }
 
+/// Back-compat alias — all call sites historically used this name.
+pub fn write_table_parquet_placeholder(workspace: &Path, id: &str, table: &Table) -> Result<(u64, PathBuf), String> {
+    write_table_dataset(workspace, id, table)
+}
+
+/// Serialize a Table to Parquet at `path` (shared by internal storage + export).
+pub fn write_table_parquet(path: &Path, table: &Table) -> Result<u64, String> {
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let mut fields = Vec::with_capacity(table.columns.len());
+    let mut arrays: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(table.columns.len());
+    for (i, col) in table.columns.iter().enumerate() {
+        let rows = &table.rows;
+        let has_non_null = rows
+            .iter()
+            .any(|r| matches!(r.get(i), Some(v) if !matches!(v, Value::Null)));
+        if !has_non_null {
+            let dt = match col.dtype.as_str() {
+                "bool" => DataType::Boolean,
+                "i64" => DataType::Int64,
+                "f64" => DataType::Float64,
+                _ => DataType::Utf8,
+            };
+            fields.push(Field::new(&col.name, dt.clone(), true));
+            let n = rows.len();
+            match dt {
+                DataType::Boolean => {
+                    arrays.push(Arc::new(BooleanArray::from(vec![None::<bool>; n])))
+                }
+                DataType::Int64 => arrays.push(Arc::new(Int64Array::from(vec![None::<i64>; n]))),
+                DataType::Float64 => {
+                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>; n])))
+                }
+                _ => arrays.push(Arc::new(StringArray::from(vec![None::<String>; n]))),
+            }
+            continue;
+        }
+        let all_i64 = rows.iter().all(|r| {
+            matches!(r.get(i), None | Some(Value::Null) | Some(Value::I64(_)))
+        });
+        let all_f64 = rows.iter().all(|r| {
+            matches!(
+                r.get(i),
+                None | Some(Value::Null) | Some(Value::I64(_)) | Some(Value::F64(_))
+            )
+        });
+        let all_bool = rows
+            .iter()
+            .all(|r| matches!(r.get(i), None | Some(Value::Null) | Some(Value::Bool(_))));
+        let has_f = rows
+            .iter()
+            .any(|r| matches!(r.get(i), Some(Value::F64(_))));
+        let has_str = rows
+            .iter()
+            .any(|r| matches!(r.get(i), Some(Value::Str(_))));
+
+        if has_str || (!all_i64 && !all_f64 && !all_bool) {
+            fields.push(Field::new(&col.name, DataType::Utf8, true));
+            let vals: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| match r.get(i) {
+                    None | Some(Value::Null) => None,
+                    other => Some(match other.unwrap() {
+                        Value::Str(s) => s.clone(),
+                        v => v.to_json(),
+                    }),
+                })
+                .collect();
+            arrays.push(Arc::new(StringArray::from(vals)));
+        } else if all_bool && !has_f {
+            fields.push(Field::new(&col.name, DataType::Boolean, true));
+            let vals: Vec<Option<bool>> = rows
+                .iter()
+                .map(|r| match r.get(i) {
+                    Some(Value::Bool(b)) => Some(*b),
+                    _ => None,
+                })
+                .collect();
+            arrays.push(Arc::new(BooleanArray::from(vals)));
+        } else if has_f || !all_i64 {
+            fields.push(Field::new(&col.name, DataType::Float64, true));
+            let vals: Vec<Option<f64>> = rows
+                .iter()
+                .map(|r| match r.get(i) {
+                    Some(Value::I64(v)) => Some(*v as f64),
+                    Some(Value::F64(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            arrays.push(Arc::new(Float64Array::from(vals)));
+        } else {
+            fields.push(Field::new(&col.name, DataType::Int64, true));
+            let vals: Vec<Option<i64>> = rows
+                .iter()
+                .map(|r| match r.get(i) {
+                    Some(Value::I64(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            arrays.push(Arc::new(Int64Array::from(vals)));
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+    let file = fs::File::create(path)
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+    writer
+        .write(&batch)
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+    writer
+        .close()
+        .map_err(|_| "analysis/cli-failed: write failed".to_string())?;
+    Ok(fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+}
+
+/// SHA-256 of raw bytes as `sha256:<hex>` (R-33).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("sha256:{:x}", h.finalize())
+}
+
+#[allow(dead_code)]
 fn csv_escape(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -1247,8 +1529,9 @@ pub fn save_meta(workspace: &Path, meta: &Meta) -> Result<(), String> {
 pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String> {
     validate_dataset_id(id)?;
     let meta_path = datasets_dir(workspace).join(format!("{id}.meta.json"));
+    let parquet_path = datasets_dir(workspace).join(format!("{id}.parquet"));
     let csv_path = datasets_dir(workspace).join(format!("{id}.csv"));
-    if !meta_path.exists() || !csv_path.exists() {
+    if !meta_path.exists() || (!parquet_path.exists() && !csv_path.exists()) {
         return Err("analysis/unknown-dataset".into());
     }
     let meta_raw = fs::read_to_string(&meta_path)
@@ -1259,7 +1542,27 @@ pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String>
     let label = extract_string(&meta_raw, "label");
     let produced_by = extract_string(&meta_raw, "producedBy").unwrap_or_else(|| "ingest".into());
     let parent = extract_string(&meta_raw, "parentDatasetId");
-    let table = parse_csv_path(&csv_path)?;
+    let source_checksum = extract_string(&meta_raw, "sourceChecksum");
+    let parent_dataset_ids = {
+        let arr = extract_string_array(&meta_raw, "parentDatasetIds");
+        if !arr.is_empty() {
+            arr
+        } else if let Some(p) = parent.clone() {
+            vec![p]
+        } else {
+            Vec::new()
+        }
+    };
+    // R-32: prefer Parquet (new writes); fall back to legacy CSV.
+    let table = if parquet_path.exists() {
+        let mut t = parse_parquet_path(&parquet_path)?;
+        // Internal mixed columns are stored as Utf8 via to_json; recover
+        // scalar types the same way the legacy CSV parse_cell path did.
+        recover_internal_value_types(&mut t);
+        t
+    } else {
+        parse_csv_path(&csv_path)?
+    };
     let meta = Meta {
         dataset_id: id.to_string(),
         row_count: row_count.max(table.rows.len()),
@@ -1269,8 +1572,51 @@ pub fn load_dataset(workspace: &Path, id: &str) -> Result<(Meta, Table), String>
         label,
         produced_by,
         parent_dataset_id: parent,
+        parent_dataset_ids,
+        source_checksum,
     };
     Ok((meta, table))
+}
+
+/// Extract a JSON string array field: `"name":["a","b"]`. Missing → empty vec.
+fn extract_string_array(raw: &str, field: &str) -> Vec<String> {
+    let needle = format!("\"{field}\":[");
+    let Some(start) = raw.find(&needle) else {
+        return Vec::new();
+    };
+    let rest = &raw[start + needle.len()..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    let inner = &rest[..end];
+    let mut out = Vec::new();
+    let mut i = 0;
+    let b = inner.as_bytes();
+    while i < b.len() {
+        while i < b.len() && (b[i] == b' ' || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] != b'"' {
+            break;
+        }
+        i += 1;
+        let mut s = String::new();
+        while i < b.len() && b[i] != b'"' {
+            if b[i] == b'\\' && i + 1 < b.len() {
+                i += 1;
+            }
+            s.push(b[i] as char);
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'"' {
+            i += 1;
+        }
+        out.push(s);
+    }
+    out
 }
 
 pub fn validate_dataset_id(id: &str) -> Result<(), String> {
@@ -1288,6 +1634,8 @@ pub struct DatasetSummary {
     pub label: Option<String>,
     pub produced_by: String,
     pub parent_dataset_id: Option<String>,
+    pub parent_dataset_ids: Vec<String>,
+    pub source_checksum: Option<String>,
     pub source_kind: String,
     pub created_at: Option<String>,
 }
@@ -1295,7 +1643,7 @@ pub struct DatasetSummary {
 impl DatasetSummary {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"sourceKind\":{},\"createdAt\":{}}}",
+            "{{\"datasetId\":{},\"rowCount\":{},\"columnCount\":{},\"label\":{},\"producedBy\":{},\"parentDatasetId\":{},\"parentDatasetIds\":[{}],\"sourceChecksum\":{},\"sourceKind\":{},\"createdAt\":{}}}",
             json_string(&self.dataset_id),
             self.row_count,
             self.column_count,
@@ -1305,6 +1653,15 @@ impl DatasetSummary {
                 .unwrap_or_else(|| "null".into()),
             json_string(&self.produced_by),
             self.parent_dataset_id
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            self.parent_dataset_ids
+                .iter()
+                .map(|p| json_string(p))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.source_checksum
                 .as_deref()
                 .map(json_string)
                 .unwrap_or_else(|| "null".into()),
@@ -1348,6 +1705,17 @@ pub fn list_dataset_summaries(workspace: &Path) -> Result<Vec<DatasetSummary>, S
             label: extract_string(&raw, "label"),
             produced_by: extract_string(&raw, "producedBy").unwrap_or_else(|| "ingest".into()),
             parent_dataset_id: extract_string(&raw, "parentDatasetId"),
+            parent_dataset_ids: {
+                let arr = extract_string_array(&raw, "parentDatasetIds");
+                if !arr.is_empty() {
+                    arr
+                } else if let Some(p) = extract_string(&raw, "parentDatasetId") {
+                    vec![p]
+                } else {
+                    Vec::new()
+                }
+            },
+            source_checksum: extract_string(&raw, "sourceChecksum"),
             source_kind: extract_string(&raw, "sourceKind").unwrap_or_else(|| "csv".into()),
             created_at: extract_string(&raw, "createdAt"),
         });

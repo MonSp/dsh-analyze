@@ -1,4 +1,4 @@
-# dsh-analyze interface specification (v0.1.11)
+# dsh-analyze interface specification (v0.1.12)
 
 This document is the **public contract** for the CLI binary and the DSH tool
 plugin. Hosts and tests should depend only on this spec.
@@ -12,7 +12,7 @@ plugin. Hosts and tests should depend only on this spec.
 | DatasetId | `ds_` + 8–32 lowercase hex |
 | Data root | `<workspace>/.dsh-analyze/{datasets,outputs,tmp}` |
 | License | MIT |
-| Version | `0.1.11` |
+| Version | `0.1.12` |
 
 ## 2. Invocation
 
@@ -32,7 +32,7 @@ dsh-analyze --workspace <dir> [--pretty] <cmd> [flags...]
 | 1 | I/O or internal CLI failure (`analysis/cli-failed`) — real filesystem errors (not found, permission) |
 | 2 | invalid arguments / path (`analysis/invalid-args`, `analysis/invalid-path`) — includes CSV decode failures (v0.1.11: was exit 1 `read failed`) |
 | 3 | limit exceeded (`analysis/limit`) |
-| 4 | format not enabled (xlsx ingest) |
+| 4 | truly unsupported format (`.xlsm` ingest) |
 | 5 | unknown dataset (`analysis/unknown-dataset`) |
 
 ### Response warnings
@@ -76,7 +76,7 @@ TS bridge only:
 ### `version`
 
 ```json
-{"ok":true,"version":"0.1.11","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot"]}
+{"ok":true,"version":"0.1.12","capabilities":["ingest","head","schema","describe","agg","list","export","rm","values","sample","join","profile","dedup","outliers","corr","crosstab","series","union","diff","pivot","verify"]}
 ```
 
 Capability tokens: the v0.1.6 set plus `union`, `diff`, `pivot` (appended,
@@ -88,7 +88,7 @@ and do not add separate capability tokens.
 
 ### `ingest`
 
-Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-insensitive), `--encoding utf-8|gbk|gb18030|auto` (v0.1.11, csv only, case-insensitive, default `utf-8`), `--dataset-id <id>`, `--label <text>`
+Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet|xlsx` (case-insensitive), `--encoding utf-8|gbk|gb18030|auto` (v0.1.11, csv only, case-insensitive, default `utf-8`), `--sheet <name|index>` (v0.1.12, xlsx only), `--dataset-id <id>`, `--label <text>`
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"columnCount":N,"columns":[{"name":"…","dtype":"…"}],"bytesOnDisk":N}
@@ -140,10 +140,18 @@ Flags: `--input <path>` (required), `--format csv|json|jsonl|parquet` (case-inse
   `analysis/invalid-args: parquet type not supported for column …` (exit 2) —
   never silently read as null. Corrupt / non-parquet masquerade
   → `analysis/cli-failed: not a valid parquet file` (exit 1), no OS text.
-  Dataset storage remains the CSV placeholder next to meta (parquet is a
-  source format only).
-- `xlsx` ingest remains exit 4:
-  `analysis/limit: xlsx not supported (convert to csv/jsonl)`.
+  Dataset storage is Parquet (v0.1.12, R-32) under `{id}.parquet` next to
+  meta; legacy `{id}.csv` datasets remain readable (lazy fallback, no bulk
+  migration). New writes always use Parquet (`storageFormat` in meta).
+- `xlsx` ingest (v0.1.12, R-31): reads one sheet via calamine — default first
+  sheet, or `--sheet <name|0-based-index>`. Multi-sheet workbooks emit
+  `warnings:[{code:"sheet-skipped",skipped:N,sheets:[…]}]`. Cell types map to
+  dtypes (`Int`→i64, `Float`/`DateTime`→f64, `Bool`→bool, `String`→utf8);
+  formula cells use cached values. Corrupt / password-protected files →
+  `analysis/invalid-args: cannot read xlsx (file is corrupt or password-protected)`
+  (exit 2, no OS text). `.xlsm` remains exit 4:
+  `analysis/limit: .xlsm not supported (save as .xlsx)`.
+  `--sheet` on non-xlsx → `analysis/invalid-args: --sheet only applies to xlsx`.
 
 ### `head`
 
@@ -428,9 +436,14 @@ Buckets (computed on `E`'s calendar date):
 failures; `parseFailSample` follows the same rule (at most 10 entries).
 
 `outDatasetId` is `string | null` — `null` when `--out` is not given (inline
-result only), else the new dataset id. When `--out` is set, a new dataset is
-persisted and `outDatasetId` is set; inline `rows` may be empty with
-`truncated: true` (budget 20 rows).
+result only), else the new dataset id.
+
+**Inline rows budget (v0.1.12, R-36/R-37)**: the response always includes
+up to **20** inline preview rows (`min(20, rowCount)`), regardless of `--out`.
+`truncated` is `true` iff `rowCount > 20`. When `--out` is set the full result
+is also persisted and `outDatasetId` is set (use `dataset_head` / `export` for
+the rest). Without `--out`, a `truncated: true` response carries only the
+20-row preview — full rows require re-running with `--out <label>`.
 
 ### `join`
 
@@ -463,7 +476,7 @@ Flags: `--left <id>` (required), `--right <id>` (required), `--on pair[,pair…]
 
 Pairwise correlation among numeric-capable columns. Summary only — never a full dense matrix dump beyond the pair cap.
 
-Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--method pearson|spearman` (default `pearson`), `--pairwise complete|omit` (default `complete`), `--min-numeric <n>` (integer ≥ 2, default 2)
+Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--method pearson|spearman` (default `pearson`), `--pairwise complete|omit` (default `complete`), `--min-numeric <n>` (integer ≥ 2, default 2), `--by g1[,g2…]` (v0.1.12, R-34, optional, 1..=4 group columns)
 
 ```json
 {"ok":true,"datasetId":"ds_…","rowCount":N,"method":"pearson","pairwise":"complete","minNumeric":2,"columns":["a","b","c"],"pairCount":3,"pairs":[{"columns":["a","b"],"n":123,"df":121,"r":0.87,"pValue":0.0,"degenerate":false}],"truncated":false}
@@ -482,6 +495,13 @@ Flags: `--dataset-id` (required), `--columns a,b[,c…]` (required, 2..=16), `--
   `pValue: null`, `degenerate: true`.
 - `--pairwise complete`: pairwise deletion (each pair uses its own complete rows).
 - `--pairwise omit`: listwise deletion (only rows where **all** listed columns are non-null numeric).
+- `--by` (v0.1.12, R-34): optional 1..=4 grouping columns. Response gains `by`
+  (column names), `groupCount`, `groupsEmitted`; each pair carries `by: […]
+  group key values` (null → JSON `null`). Caps: **50 groups** (first-seen
+  order) and **100 pairs** total; over-cap → `truncated: true` plus
+  `warnings:[{code:"corr-groups-truncated"|"corr-pairs-truncated",emitted,total}]`.
+  Within each group n&lt;minNumeric → `r`/`pValue` null (same as ungrouped).
+  Unknown `--by` column → `analysis/invalid-args: unknown column {name}`.
 - Spearman: mid-ranks (average ranks for ties) then Pearson on ranks.
 
 ### `crosstab` (v0.1.4; `third` added v0.1.10)
@@ -503,7 +523,7 @@ Flags: `--dataset-id` (required), `--rows <col>` (required), `--cols <col>` (req
 {"ok":true,"datasetId":"ds_…","rowCount":N,"rowColumn":"a","colColumn":"b","thirdColumn":"m","thirdCategories":["2026-01"],"tables":[{"third":"2026-01","rowCategories":[…],"colCategories":[…],"matrix":[[…]],"rowTotals":[…],"colTotals":[…],"grandTotal":N,"cellCount":N,"truncated":false,"nullRowCount":0,"topCells":[…]}],"thirdTruncated":false,"nullThirdCount":0}
 ```
 
-- Categories: distinct `Value` JSON forms (same encoding as `values`); selected by marginal count desc, then first-seen. Length ≤ `--top`. With the default `--drop-null true`, only non-null categories appear. With `--drop-null false`, null participates as JSON string category `__null__` (a data string `"__null__"` is a separate category with the same label). Mixed numeric kinds that share a JSON form (e.g. integer `1` vs float `1.0`) may yield repeated labels in the category list.
+- Categories: distinct `Value` JSON forms (same encoding as `values`); selected by marginal count desc, then first-seen. Length ≤ `--top`. With the default `--drop-null true`, only non-null categories appear. With `--drop-null false`, null participates as JSON string category `__null__` (a data string `"__null__"` is a separate category with the same label). Numeric category keys are normalized (v0.1.12, R-35): whole-number floats share the integer category, so mixed `1` / `1.0` never yield duplicate labels; non-integral floats (e.g. `1.5`) keep full precision.
 - `matrix` is `len(rowCategories) × len(colCategories)`; margins only cover the kept grid.
 - `truncated`: distinct categories exceeded `--top` or cells fell outside the selected grid.
 - `topCells`: cells with `count >= --min-count`, count desc, cap 50.
@@ -672,6 +692,32 @@ Flags: `--label-like <substr>` (optional), `--produced-by <name>` (optional), `-
   `--since` is given). **`--since` is interpreted as UTC** (v0.1.11 note:
   `createdAt` is ISO-8601 UTC; groupBy `tz` does not affect `list`).
 
+### `verify` (v0.1.12, R-33)
+
+Flags: `--dataset-id` (required), `--check-source` (optional)
+
+```json
+{"ok":true,"datasetId":"ds_…","checks":[{"name":"data-file","ok":true},{"name":"row-count","ok":true,"declared":N,"actual":N},{"name":"parents","ok":true,"count":1}],"mismatches":[]}
+```
+
+- Checks: `data-file` (parquet or legacy csv present), `row-count` (meta
+  rowCount == parsed rows), `parents` (every `parentDatasetIds` entry has a
+  meta file). With `--check-source`: re-hash `sourcePath` and compare to
+  `sourceChecksum` (`sha256:<hex>`); missing file / mismatch reported in
+  `mismatches`.
+- Exit: **0** all ok, **1** mismatch (JSON still printed on stdout),
+  **5** unknown dataset. Old metas without `parentDatasetIds` /
+  `sourceChecksum` are tolerated (`parents` falls back to
+  `parentDatasetId`; source check skipped when no checksum).
+
+### `list` provenance fields (v0.1.12, R-33)
+
+Each list item also carries `parentDatasetIds` (array; legacy metas fall
+back to `[parentDatasetId]`) and `sourceChecksum` (`sha256:…` or null).
+`parentDatasetId` remains the first parent for back-compat. join/union/diff
+write `[left, right]`; single-parent commands write `[source]`; ingest
+writes `[]`.
+
 ### `export`
 
 Flags: `--dataset-id` (required), `--output <path>` (required), `--format csv|xlsx|parquet` (optional, case-insensitive; default inferred from extension, else `csv`)
@@ -780,7 +826,7 @@ profile root is known. The deny list is a defensive path guard only; see
 - Online database connectors
 - Arbitrary code execution
 - Write-side SQL or mutating external systems
-- **xlsx ingest** (still exit 4; convert to csv/jsonl). Parquet ingest/export
+- **xlsb / xlsm ingest** (xlsm → exit 4 save as xlsx). Parquet ingest/export
   shipped in v0.1.8/v0.1.9.
 - UDF / JS / Python expressions
 - Full correlation-matrix export / confidence intervals / regression (pair

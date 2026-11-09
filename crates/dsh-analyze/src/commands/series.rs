@@ -586,6 +586,8 @@ pub(crate) fn cmd_series(workspace: &Path, args: &[String]) -> Result<String, u8
         label,
         produced_by: "series".into(),
         parent_dataset_id: Some(id.clone()),
+        parent_dataset_ids: vec![id.clone()],
+        source_checksum: None,
     };
     save_meta(workspace, &out_meta).map_err(|e| {
         eprintln!("{e}");

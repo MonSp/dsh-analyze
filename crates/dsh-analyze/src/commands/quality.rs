@@ -705,6 +705,8 @@ pub(crate) fn cmd_outliers(workspace: &Path, args: &[String]) -> Result<String, 
             label: out_label.clone(),
             produced_by: "outliers".into(),
             parent_dataset_id: Some(id.clone()),
+            parent_dataset_ids: vec![id.clone()],
+            source_checksum: None,
         };
         save_meta(workspace, &meta_out).map_err(|e| {
             eprintln!("{e}");

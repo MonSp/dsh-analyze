@@ -54,7 +54,7 @@ test('analysisToolsForScopedAllow: deny-all ignores analysisTools', () => {
   )
 })
 
-test('ANALYSIS_TOOL_NAMES is the v0.1.7 surface (v0.1.5 + union/diff/pivot)', () => {
+test('ANALYSIS_TOOL_NAMES is the v0.1.12 surface (v0.1.7 + verify)', () => {
   assert.deepEqual([...ANALYSIS_TOOL_NAMES], [
     'dataset_ingest',
     'dataset_head',
@@ -76,6 +76,7 @@ test('ANALYSIS_TOOL_NAMES is the v0.1.7 surface (v0.1.5 + union/diff/pivot)', ()
     'dataset_union',
     'dataset_diff',
     'dataset_pivot',
+    'dataset_verify',
   ])
 })
 
@@ -128,4 +129,8 @@ test('analysisToolsForScopedAllow can enable relation tools only', () => {
     analysisTools: ['dataset_corr', 'dataset_crosstab'],
   })
   assert.deepEqual(names, ['dataset_corr', 'dataset_crosstab'])
+})
+
+test('v0.1.12 verify tool is recognized by isAnalysisToolName', () => {
+  assert.equal(isAnalysisToolName('dataset_verify'), true)
 })

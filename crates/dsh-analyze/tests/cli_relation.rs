@@ -439,7 +439,7 @@ fn version_capabilities_include_corr_crosstab() {
         assert!(out.status.success(), "version failed");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(out.contains("\"0.1.11\""), "got: {out}");
+    assert!(out.contains("\"0.1.12\""), "got: {out}");
     for tok in [
         "\"ingest\"",
         "\"head\"",
@@ -970,4 +970,206 @@ fn crosstab_third_returns_tables_and_unknown_names_column() {
     assert!(err2.contains("--third must differ"), "stderr={err2}");
 
     let _ = fs::remove_dir_all(&ws);
+}
+
+// ---- v0.1.12 R-34 / R-35 ---------------------------------------------------
+
+/// R-34: --by groups each report independent r/pValue; unknown by-column exits 2.
+#[test]
+fn corr_by_groups_and_unknown_column() {
+    let ws = temp_workspace();
+    // three regions, perfect within-group correlation on a,b
+    write_csv(
+        &ws,
+        "by.csv",
+        "region,a,b\n\
+         E,1,2\n\
+         E,2,4\n\
+         E,3,6\n\
+         W,1,10\n\
+         W,2,20\n\
+         W,3,30\n\
+         N,1,0\n\
+         N,2,0\n\
+         N,3,1\n",
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/by.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b",
+            "--by",
+            "region",
+        ],
+    );
+    assert!(out.contains("\"by\":[\"region\"]"), "{out}");
+    assert!(out.contains("\"groupCount\":3"), "{out}");
+    assert!(out.contains("\"groupsEmitted\":3"), "{out}");
+    // three pairs, each with by key
+    assert!(out.contains("\"by\":[\"E\"]"), "E group: {out}");
+    assert!(out.contains("\"by\":[\"W\"]"), "W group: {out}");
+    assert!(out.contains("\"by\":[\"N\"]"), "N group: {out}");
+    // E: a=1,2,3 b=2,4,6 → r=1
+    assert!(
+        out.contains("\"r\":1") && out.contains("\"by\":[\"E\"]"),
+        "E r=1: {out}"
+    );
+
+    // unknown --by column → exit 2 with column name
+    let bad = run_fail(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b",
+            "--by",
+            "nope",
+        ],
+        2,
+    );
+    assert!(bad.contains("unknown column nope"), "{bad}");
+
+    // --by with >4 columns → exit 2
+    let too_many = run_fail(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b",
+            "--by",
+            "a,b,region,a,v",
+        ],
+        2,
+    );
+    assert!(too_many.contains("--by must list 1..4"), "{too_many}");
+}
+
+/// R-34: within a group with n < 3, r and pValue are null (not an error).
+#[test]
+fn corr_by_small_group_null_r() {
+    let ws = temp_workspace();
+    write_csv(
+        &ws,
+        "small.csv",
+        "g,a,b\n\
+         x,1,2\n\
+         x,2,3\n\
+         y,1,2\n\
+         y,2,4\n\
+         y,3,6\n",
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/small.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    let out = run_ok(
+        &ws,
+        &[
+            "corr",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--columns",
+            "a,b",
+            "--by",
+            "g",
+        ],
+    );
+    // group x has n=2 < 3 for pValue; r may still compute (n>=2) but pValue null
+    // With minNumeric default 2, n=2 computes r; pValue needs n>=3 → null
+    assert!(out.contains("\"by\":[\"x\"]"), "{out}");
+    assert!(out.contains("\"by\":[\"y\"]"), "{out}");
+    // y group n=3, r=1, pValue=0
+    assert!(out.contains("\"pValue\":0"), "y pValue: {out}");
+}
+
+/// R-35: mixed i64 1 and f64 1.0 share one category label `1`.
+#[test]
+fn crosstab_mixed_int_float_single_label() {
+    let ws = temp_workspace();
+    // parquet-free path: use JSON ingest so types stay distinct
+    write_csv(
+        &ws,
+        "mix.csv",
+        "cat,v\n\
+         1,10\n\
+         1.0,20\n\
+         1.5,30\n\
+         2,40\n",
+    );
+    // CSV parse will coerce 1 and 1.0 both to numbers — force mixed kinds via json
+    write_csv(
+        &ws,
+        "mix.json",
+        r#"[{"cat":1,"v":10},{"cat":1.0,"v":20},{"cat":1.5,"v":30},{"cat":2,"v":40}]"#,
+    );
+    let ing = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/mix.json",
+            "--format",
+            "json",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(ing.contains("\"ok\":true"), "{ing}");
+    let out = run_ok(
+        &ws,
+        &[
+            "crosstab",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--rows",
+            "cat",
+            "--cols",
+            "v",
+        ],
+    );
+    // Exactly one category labeled 1 (not both 1 and 1.0)
+    // rowCategories is a JSON array of category_json labels (numbers unquoted).
+    let rc_start = out.find("\"rowCategories\":[").expect("rowCategories");
+    let rc_end = out[rc_start..].find(']').map(|i| rc_start + i).expect("close");
+    let rc = &out[rc_start..rc_end].to_string();
+    // Mixed I64(1)/F64(1.0) must collapse to a single `1` token.
+    let ones = rc
+        .split(|c: char| c == ',' || c == '[' || c == ']')
+        .filter(|t| t.trim() == "1")
+        .count();
+    assert_eq!(ones, 1, "expected single 1 category, got {ones}: {rc}");
+    assert!(!rc.contains("1.0"), "must not render 1.0 separately: {rc}");
+    assert!(rc.contains("1.5"), "1.5 must remain: {rc}");
+    // And never both 1 and 1.0 as distinct adjacent labels
+    assert!(
+        !rc.contains("1,1.0") && !rc.contains("1.0,1"),
+        "duplicate int/float labels: {rc}"
+    );
 }

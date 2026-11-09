@@ -1629,9 +1629,10 @@ test('R-11: dataset_ingest accepts json (array and records forms) via mock CLI',
       () => defs.dataset_ingest.execute({ path: 'data/a.json', format: 'parquet' }),
       /not a valid parquet file/, 
     )
+    // xlsx allowed past the tool layer (R-31); non-PK bytes → corrupt message.
     await assert.rejects(
       () => defs.dataset_ingest.execute({ path: 'data/a.json', format: 'xlsx' }),
-      /xlsx not supported/,
+      /cannot read xlsx/,
     )
   } finally {
     rmSync(ws, { recursive: true, force: true })
@@ -1648,11 +1649,11 @@ test('dataset_ingest/export format is case-insensitive (tool layer)', async () =
     const ing = await defs.dataset_ingest.execute({ path: 'data/f.csv', format: 'CSV' })
     assert.ok(ing.datasetId, JSON.stringify(ing))
 
-    // Uppercase XLSX must hit the documented limit error, not fall through
-    // to the CLI as `bad format`.
+    // Uppercase XLSX must reach the xlsx reader (not fall through as
+    // `bad format`); CSV bytes are not a zip → corrupt message (R-31).
     await assert.rejects(
       () => defs.dataset_ingest.execute({ path: 'data/f.csv', format: 'XLSX' }),
-      /xlsx not supported/,
+      /cannot read xlsx/,
     )
 
     const exp = await defs.dataset_export.execute({ datasetId: ing.datasetId, format: 'PARQUET' })
@@ -2049,6 +2050,137 @@ test('R-30: dataset_ingest passes --encoding gbk through to the mock CLI', async
     const plain = await defs.dataset_ingest.execute({ path: 'data/gbk.csv', format: 'csv' })
     assert.equal(plain.ok, true)
     assert.equal(plain.encoding, undefined)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+
+// ---------- v0.1.12 acceptance: R-36/R-37 agg inline rows budget ----------
+
+const DAY_SPEC = JSON.stringify({
+  groupBy: [{ dateColumn: 'ts', period: 'day', tz: 'Asia/Shanghai' }],
+  aggs: [{ fn: 'count', as: 'n' }],
+  orderBy: [{ column: 'ts_day' }],
+})
+
+async function write21DayCsv(ws) {
+  mkdirSync(join(ws, 'data'), { recursive: true })
+  const lines = ['ts,v']
+  for (let i = 1; i <= 21; i++) {
+    lines.push(`2026-01-${String(i).padStart(2, '0')}T00:30:00+08:00,${i}`)
+  }
+  writeFileSync(join(ws, 'data', 'd21.csv'), lines.join('\n') + '\n', 'utf8')
+}
+
+test('R-36: over-budget agg without outLabel previews 20 rows (never empty rows)', async () => {
+  const ws = makeWorkspace()
+  try {
+    await write21DayCsv(ws)
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/d21.csv', format: 'csv' })
+
+    const res = await defs.transform_agg.execute({ datasetId: ing.datasetId, spec: DAY_SPEC })
+    assert.equal(res.ok, true)
+    assert.equal(res.rowCount, 21)
+    assert.equal(res.truncated, true)
+    assert.equal(res.outDatasetId, null)
+    assert.equal(res.rows.length, 20, JSON.stringify(res.rows.length))
+    assert.deepEqual(res.rows[0], ['2026-01-01', 1])
+    assert.ok(
+      !res.rows.some((r) => r[0] === '2026-01-21'),
+      '21st day is beyond the 20-row budget',
+    )
+
+    const rendered = defs.transform_agg.output.render({}, res).map((p) => p.text).join('')
+    assert.match(rendered, /re-run with outLabel/, rendered)
+    assert.doesNotMatch(rendered, /full result stored/, rendered)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-36: under-budget agg without outLabel returns full rows', async () => {
+  const ws = makeWorkspace()
+  try {
+    await write21DayCsv(ws)
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/d21.csv', format: 'csv' })
+
+    const res = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: [{ dateColumn: 'ts', period: 'day', tz: 'Asia/Shanghai' }],
+        aggs: [{ fn: 'count', as: 'n' }],
+        orderBy: [{ column: 'ts_day' }],
+        limit: 10,
+      }),
+    })
+    assert.equal(res.rowCount, 10)
+    assert.equal(res.truncated, false)
+    assert.equal(res.outDatasetId, null)
+    assert.equal(res.rows.length, 10)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-37: small result with outLabel returns full inline rows + outDatasetId', async () => {
+  const ws = makeWorkspace()
+  try {
+    await write21DayCsv(ws)
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/d21.csv', format: 'csv' })
+
+    const res = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: JSON.stringify({
+        groupBy: [{ dateColumn: 'ts', period: 'day', tz: 'Asia/Shanghai' }],
+        aggs: [{ fn: 'count', as: 'n' }],
+        orderBy: [{ column: 'ts_day' }],
+        limit: 3,
+      }),
+      outLabel: 'small3',
+    })
+    assert.equal(res.rowCount, 3)
+    assert.equal(res.truncated, false)
+    assert.ok(res.outDatasetId, 'outDatasetId required')
+    assert.match(res.outDatasetId, /^ds_/)
+    assert.equal(res.rows.length, 3, JSON.stringify(res.rows))
+
+    const head = await defs.dataset_head.execute({ datasetId: res.outDatasetId, n: 5 })
+    assert.equal(head.rowCount, 3)
+
+    const rendered = defs.transform_agg.output.render({}, res).map((p) => p.text).join('')
+    assert.match(rendered, /"rows"/, rendered)
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+})
+
+test('R-37: over-budget with outLabel previews 20 rows and stores full result', async () => {
+  const ws = makeWorkspace()
+  try {
+    await write21DayCsv(ws)
+    const defs = makeDefs(ws)
+    const ing = await defs.dataset_ingest.execute({ path: 'data/d21.csv', format: 'csv' })
+
+    const res = await defs.transform_agg.execute({
+      datasetId: ing.datasetId,
+      spec: DAY_SPEC,
+      outLabel: 'd21',
+    })
+    assert.equal(res.rowCount, 21)
+    assert.equal(res.truncated, true)
+    assert.ok(res.outDatasetId)
+    assert.equal(res.rows.length, 20)
+
+    const head = await defs.dataset_head.execute({ datasetId: res.outDatasetId, n: 50 })
+    assert.equal(head.rowCount, 21)
+
+    const rendered = defs.transform_agg.output.render({}, res).map((p) => p.text).join('')
+    assert.match(rendered, /full result stored/, rendered)
+    assert.match(rendered, /inline preview 20\/21/, rendered)
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

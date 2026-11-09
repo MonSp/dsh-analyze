@@ -81,7 +81,7 @@ pub(crate) fn cmd_pivot(workspace: &Path, args: &[String]) -> Result<String, u8>
     let mut pivot_names: Vec<String> = Vec::new();
     for row in &table.rows {
         let v = row.get(pcol).cloned().unwrap_or(Value::Null);
-        let k = v.to_json();
+        let k = v.category_key().to_json();
         if !pivot_keys.contains(&k) {
             if pivot_keys.len() >= MAX_PIVOT_COLUMNS {
                 return fail(3, "analysis/limit: pivot columns exceed 50");
@@ -97,7 +97,7 @@ pub(crate) fn cmd_pivot(workspace: &Path, args: &[String]) -> Result<String, u8>
     for (ri, row) in table.rows.iter().enumerate() {
         let rk: Vec<String> = index_idx
             .iter()
-            .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null).to_json())
+            .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null).category_key().to_json())
             .collect();
         groups.entry(rk.clone()).or_insert_with(|| {
             row_keys.push(rk.clone());
@@ -134,7 +134,7 @@ pub(crate) fn cmd_pivot(workspace: &Path, args: &[String]) -> Result<String, u8>
             let mut count: usize = 0;
             for &ri in members {
                 let pv = table.rows[ri].get(pcol).cloned().unwrap_or(Value::Null);
-                if pv.to_json() != *pk {
+                if pv.category_key().to_json() != *pk {
                     continue;
                 }
                 count += 1;
@@ -200,6 +200,8 @@ pub(crate) fn cmd_pivot(workspace: &Path, args: &[String]) -> Result<String, u8>
         label,
         produced_by: "pivot".into(),
         parent_dataset_id: Some(id.clone()),
+        parent_dataset_ids: vec![id.clone()],
+        source_checksum: None,
     };
     save_meta(workspace, &meta).map_err(|e| {
         eprintln!("{e}");
@@ -228,11 +230,11 @@ fn pivot_required() -> Result<String, u8> {
 
 /// Column label for a pivot value: JS `String(v)` style (Str unquoted).
 fn pivot_value_name(v: &Value) -> String {
-    match v {
+    match v.category_key() {
         Value::Null => "null".into(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Bool(b) => if b { "true" } else { "false" }.into(),
         Value::I64(i) => i.to_string(),
         Value::F64(f) => format!("{f}"),
-        Value::Str(s) => s.clone(),
+        Value::Str(s) => s,
     }
 }

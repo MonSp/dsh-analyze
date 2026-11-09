@@ -270,14 +270,28 @@ fn ingest_xlsx_still_limits_parquet_rejects_corrupt() {
     write_file(&ws, "w.xlsx", "dummy");
     write_file(&ws, "w.parquet", "dummy");
 
+    // R-31: dummy xlsx is corrupt → exit 2 actionable, not exit 4.
     let err = run_fail(
         &ws,
         &["ingest", "--input", "data/w.xlsx", "--format", "xlsx"],
+        2,
+    );
+    assert!(
+        err.contains("analysis/invalid-args: cannot read xlsx"),
+        "stderr={err}"
+    );
+    assert!(!err.to_lowercase().contains("os error"), "stderr={err}");
+
+    // .xlsm stays a truly-unsupported format → exit 4.
+    write_file(&ws, "w.xlsm", "dummy");
+    let err_xlsm = run_fail(
+        &ws,
+        &["ingest", "--input", "data/w.xlsm", "--format", "xlsm"],
         4,
     );
     assert!(
-        err.contains("analysis/limit: xlsx not supported (convert to csv/jsonl)"),
-        "stderr={err}"
+        err_xlsm.contains("analysis/limit: .xlsm not supported"),
+        "stderr={err_xlsm}"
     );
 
     // Non-parquet masquerade → stable analysis/*, no OS text, exit 1
@@ -508,13 +522,14 @@ fn format_flags_are_case_insensitive() {
     );
     assert!(out.contains("\"ok\":true"), "{out}");
 
+    // R-31: case-insensitive XLSX reaches the xlsx reader; dummy file → exit 2.
     let err = run_fail(
         &ws,
         &["ingest", "--input", "data/w.xlsx", "--format", "XLSX"],
-        4,
+        2,
     );
     assert!(
-        err.contains("analysis/limit: xlsx not supported (convert to csv/jsonl)"),
+        err.contains("analysis/invalid-args: cannot read xlsx"),
         "stderr={err}"
     );
 
@@ -656,9 +671,9 @@ fn help_states_ops_forms_and_formats() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("--ops accepts a JSON array OR a workspace path"), "{text}");
     assert!(text.contains("--spec likewise"), "{text}");
-    assert!(text.contains("--format csv|json|jsonl|parquet"), "{text}");
-    assert!(text.contains("xlsx ingest still reports analysis/limit"), "{text}");
-    for cmd in ["ingest", "union", "diff", "pivot", "list", "export"] {
+    assert!(text.contains("--format csv|json|jsonl|parquet|xlsx"), "{text}");
+    assert!(text.contains(".xlsm reports analysis/limit"), "{text}");
+    for cmd in ["ingest", "union", "diff", "pivot", "list", "export", "verify"] {
         assert!(text.contains(cmd), "missing {cmd} in usage: {text}");
     }
 
@@ -772,8 +787,8 @@ fn version_capabilities_include_new_commands() {
         assert!(o.status.success());
         String::from_utf8(o.stdout).unwrap()
     };
-    assert!(out.contains("\"version\":\"0.1.11\""), "{out}");
-    for tok in ["\"union\"", "\"diff\"", "\"pivot\""] {
+    assert!(out.contains("\"version\":\"0.1.12\""), "{out}");
+    for tok in ["\"union\"", "\"diff\"", "\"pivot\"", "\"verify\""] {
         assert!(out.contains(tok), "missing {tok}: {out}");
     }
 }
@@ -1084,6 +1099,321 @@ fn ingest_bad_encoding_value_is_invalid_args() {
         err.contains("analysis/invalid-args: bad encoding latin1"),
         "stderr={err}"
     );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-31: export xlsx → ingest xlsx round-trip preserves rows/columns.
+#[test]
+fn ingest_xlsx_roundtrip_from_export() {
+    let ws = temp_workspace();
+    write_file(
+        &ws,
+        "src.csv",
+        "name,amount,flag\n\
+         alpha,10,true\n\
+         beta,20.5,false\n\
+         gamma,30,true\n",
+    );
+    let ing = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/src.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(ing.contains("\"ok\":true"), "{ing}");
+
+    let exp = run_ok(
+        &ws,
+        &[
+            "export",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--output",
+            "outputs/rt.xlsx",
+            "--format",
+            "xlsx",
+        ],
+    );
+    assert!(exp.contains("\"ok\":true"), "{exp}");
+
+    let ing2 = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            ".dsh-analyze/outputs/rt.xlsx",
+            "--format",
+            "xlsx",
+            "--dataset-id",
+            "ds_bbccddee11223344",
+        ],
+    );
+    assert!(ing2.contains("\"ok\":true"), "{ing2}");
+    assert!(ing2.contains("\"rowCount\":3"), "{ing2}");
+    assert!(ing2.contains("\"columnCount\":3"), "{ing2}");
+    assert!(ing2.contains("name"), "{ing2}");
+    assert!(ing2.contains("amount"), "{ing2}");
+
+    let head = run_ok(
+        &ws,
+        &["head", "--dataset-id", "ds_bbccddee11223344", "--n", "5"],
+    );
+    assert!(head.contains("alpha"), "{head}");
+    assert!(head.contains("beta"), "{head}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-31: multi-sheet workbook defaults to first sheet + sheet-skipped warning;
+/// --sheet selects by name.
+#[test]
+fn ingest_xlsx_multisheet_and_sheet_flag() {
+    use rust_xlsxwriter::{Workbook, Worksheet};
+    let ws = temp_workspace();
+    // Build a 2-sheet workbook on disk under data/
+    let path = ws.join("data").join("multi.xlsx");
+    let mut wb = Workbook::new();
+    let mut s1 = Worksheet::new();
+    s1.write_string(0, 0, "a").unwrap();
+    s1.write_number(1, 0, 1.0).unwrap();
+    s1.set_name("第一张").unwrap();
+    wb.worksheets_mut().push(s1);
+    let mut s2 = Worksheet::new();
+    s2.write_string(0, 0, "b").unwrap();
+    s2.write_number(1, 0, 2.0).unwrap();
+    s2.set_name("second").unwrap();
+    wb.worksheets_mut().push(s2);
+    wb.save(&path).unwrap();
+
+    let out = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/multi.xlsx",
+            "--format",
+            "xlsx",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    assert!(out.contains("sheet-skipped"), "warning: {out}");
+    assert!(out.contains("\"a\""), "first sheet headers: {out}");
+
+    let out2 = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/multi.xlsx",
+            "--format",
+            "xlsx",
+            "--sheet",
+            "second",
+            "--dataset-id",
+            "ds_bbccddee11223344",
+        ],
+    );
+    assert!(out2.contains("\"ok\":true"), "{out2}");
+    assert!(out2.contains("\"b\""), "second sheet: {out2}");
+    // still sheet-skipped for the other sheet
+    assert!(out2.contains("sheet-skipped"), "{out2}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+
+// ---- v0.1.12 R-32 / R-33 ---------------------------------------------------
+
+/// R-32: new writes land as .parquet; load still works; legacy csv readable.
+#[test]
+fn r32_parquet_storage_and_legacy_csv_fallback() {
+    let ws = temp_workspace();
+    write_file(&ws, "a.csv", "x,y\n1,2\n3,4\n");
+    let ing = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/a.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(ing.contains("\"ok\":true"), "{ing}");
+    assert!(
+        ws.join(".dsh-analyze/datasets/ds_aabbccdd11223344.parquet")
+            .exists(),
+        "expected parquet data file"
+    );
+
+    let out = run_ok(
+        &ws,
+        &[
+            "agg",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--spec",
+            r#"{"aggs":[{"fn":"count","as":"n"}]}"#,
+            "--out",
+            "cnt",
+        ],
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let list = run_ok(&ws, &["list"]);
+    assert!(list.contains("ds_"), "{list}");
+
+    // Legacy CSV-only dataset still loads (hand-written meta + csv, no parquet).
+    let legacy_id = "ds_bbccddee11223344";
+    let ds_dir = ws.join(".dsh-analyze/datasets");
+    fs::create_dir_all(&ds_dir).unwrap();
+    fs::write(ds_dir.join(format!("{legacy_id}.csv")), "x\n9\n").unwrap();
+    fs::write(
+        ds_dir.join(format!("{legacy_id}.meta.json")),
+        format!(
+            "{{\"version\":1,\"datasetId\":\"{legacy_id}\",\"rowCount\":1,\"columnCount\":1,\"columns\":[{{\"name\":\"x\",\"dtype\":\"i64\"}}],\"sourceKind\":\"csv\",\"sourcePath\":\"data/legacy.csv\",\"label\":null,\"producedBy\":\"ingest\",\"parentDatasetId\":null,\"createdAt\":\"2026-01-01T00:00:00Z\"}}\n"
+        ),
+    )
+    .unwrap();
+    let head = run_ok(&ws, &["head", "--dataset-id", legacy_id, "--n", "5"]);
+    assert!(head.contains("9"), "legacy csv head: {head}");
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-33: ingest sourceChecksum + parentDatasetIds chain + verify.
+#[test]
+fn r33_checksum_parents_and_verify() {
+    let ws = temp_workspace();
+    write_file(&ws, "src.csv", "a,b\n1,2\n3,4\n");
+    let ing = run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/src.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    assert!(ing.contains("\"ok\":true"), "{ing}");
+
+    let list = run_ok(&ws, &["list"]);
+    assert!(list.contains("sourceChecksum"), "{list}");
+    assert!(list.contains("sha256:"), "{list}");
+    assert!(list.contains("parentDatasetIds"), "{list}");
+
+    let agg = run_ok(
+        &ws,
+        &[
+            "agg",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--spec",
+            r#"{"aggs":[{"fn":"count","as":"n"}]}"#,
+            "--out",
+            "cnt",
+        ],
+    );
+    assert!(agg.contains("\"ok\":true"), "{agg}");
+    let list2 = run_ok(&ws, &["list", "--produced-by", "agg"]);
+    assert!(list2.contains("parentDatasetIds"), "{list2}");
+    assert!(list2.contains("ds_aabbccdd11223344"), "parent: {list2}");
+
+    let v = run_ok(
+        &ws,
+        &[
+            "verify",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--check-source",
+        ],
+    );
+    assert!(v.contains("\"ok\":true"), "{v}");
+    assert!(v.contains("data-file"), "{v}");
+
+    // tamper source → verify fails exit 1
+    write_file(&ws, "src.csv", "a,b\n1,2\n3,4\n5,6\n");
+    let out = bin()
+        .arg("--workspace")
+        .arg(&ws)
+        .args([
+            "verify",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+            "--check-source",
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(1), "modified source must exit 1");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("verify failed") || err.contains("mismatch"),
+        "{err}"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+/// R-33: join records both parents in parentDatasetIds.
+#[test]
+fn r33_join_two_parents() {
+    let ws = temp_workspace();
+    write_file(&ws, "l.csv", "k,v\n1,10\n");
+    write_file(&ws, "r.csv", "k,w\n1,20\n");
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/l.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_aabbccdd11223344",
+        ],
+    );
+    run_ok(
+        &ws,
+        &[
+            "ingest",
+            "--input",
+            "data/r.csv",
+            "--format",
+            "csv",
+            "--dataset-id",
+            "ds_bbccddee11223344",
+        ],
+    );
+    let j = run_ok(
+        &ws,
+        &[
+            "join",
+            "--left",
+            "ds_aabbccdd11223344",
+            "--right",
+            "ds_bbccddee11223344",
+            "--on",
+            "k",
+        ],
+    );
+    assert!(j.contains("\"ok\":true"), "{j}");
+    let list = run_ok(&ws, &["list", "--produced-by", "join"]);
+    assert!(list.contains("parentDatasetIds"), "{list}");
+    assert!(list.contains("ds_aabbccdd11223344"), "{list}");
+    assert!(list.contains("ds_bbccddee11223344"), "right parent: {list}");
 
     let _ = fs::remove_dir_all(&ws);
 }

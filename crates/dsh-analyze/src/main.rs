@@ -11,8 +11,8 @@ use std::process::ExitCode;
 
 use cli::fail;
 
-const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\",\"corr\",\"crosstab\",\"series\",\"union\",\"diff\",\"pivot\"";
-const VERSION: &str = "0.1.11";
+const CAPABILITIES: &str = "\"ingest\",\"head\",\"schema\",\"describe\",\"agg\",\"list\",\"export\",\"rm\",\"values\",\"sample\",\"join\",\"profile\",\"dedup\",\"outliers\",\"corr\",\"crosstab\",\"series\",\"union\",\"diff\",\"pivot\",\"verify\"";
+const VERSION: &str = "0.1.12";
 
 const USAGE: &str = "\
 dsh-analyze — workspace-confined dataset analysis (stdout: one JSON line per run)
@@ -20,7 +20,7 @@ dsh-analyze — workspace-confined dataset analysis (stdout: one JSON line per r
 Usage: dsh-analyze [--workspace <dir>] [--pretty] <command> [flags]
 
 Commands:
-  ingest    --input <path> [--format csv|json|jsonl] [--encoding utf-8|gbk|gb18030|auto] [--dataset-id <id>] [--label <text>]
+  ingest    --input <path> [--format csv|json|jsonl|xlsx] [--encoding utf-8|gbk|gb18030|auto] [--sheet name|idx] [--dataset-id <id>] [--label <text>]
   head      --dataset-id <id> [--n <N>]                       (default 5, max 100)
   schema    --dataset-id <id>
   describe  --dataset-id <id> [--columns a,b]
@@ -31,7 +31,7 @@ Commands:
   profile   --dataset-id <id>
   dedup     --dataset-id <id> [--key-columns a,b] [--sample-limit <N>]
   outliers  --dataset-id <id> --columns a,b [--method iqr|zscore] [--out <label>]
-  corr      --dataset-id <id> --columns a,b,…                (pairs report n and df)
+  corr      --dataset-id <id> --columns a,b,… [--by g1,g2]   (pairs report n, df, pValue; --by = per-group)
   crosstab  --dataset-id <id> --rows <c> --cols <c> [--values <c>] [--agg sum|mean|min|max|count]
   series    --dataset-id <id> --order-by <c> --ops <json|path> [--out <label>]
   union     --left <id> --right <id> [--columns-policy strict|intersect] [--out <label>]
@@ -40,13 +40,14 @@ Commands:
   list      [--label-like <substr>] [--produced-by <name>] [--since <YYYY-MM-DD[THH:MM:SS]>]
   export    --dataset-id <id> --output <path> [--format csv|xlsx|parquet]
   rm        --dataset-id <id>
+  verify    --dataset-id <id> [--check-source]
   version
 
 Key flags:
   --ops accepts a JSON array OR a workspace path; --spec likewise (a JSON object OR a workspace path).
-  --format csv|json|jsonl|parquet (ingest); export --format csv|xlsx|parquet (default csv).
+  --format csv|json|jsonl|parquet|xlsx (ingest); export --format csv|xlsx|parquet (default csv).
   --encoding utf-8|gbk|gb18030|auto (ingest csv only; default utf-8).
-  xlsx ingest still reports analysis/limit (convert to csv/jsonl).
+  xlsx ingest reads first sheet (or --sheet); .xlsm reports analysis/limit (save as .xlsx).
   Errors go to stderr as analysis/* messages; exit codes: 0 ok, 1 cli-failed, 2 invalid args/path,
   3 limit, 4 unsupported format limit, 5 unknown dataset.
 ";
@@ -124,6 +125,7 @@ fn run(args: &[String]) -> Result<String, u8> {
         "list" => commands::cmd_list(&workspace, rest),
         "export" => commands::cmd_export(&workspace, rest),
         "rm" => commands::cmd_rm(&workspace, rest),
+        "verify" => commands::cmd_verify(&workspace, rest),
         other => fail(2, &format!("analysis/invalid-args: unknown command {other}")),
     }
 }

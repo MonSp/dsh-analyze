@@ -71,7 +71,9 @@ if a network stack crate appears.
 
 - Ingest returns schema + counts, never the full table.
 - Head is capped at 20 rows.
-- Agg inline rows are budgeted at 20; larger results must use `--out`.
+- Agg inline rows are budgeted at 20 (preview always present when
+  `rowCount > 0`; `truncated` when `rowCount > 20`); full results need
+  `--out` / `export`.
 - Export writes to disk and returns a relative path + byte count.
 
 ## 7. Multi-tenant expectation
