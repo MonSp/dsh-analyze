@@ -311,6 +311,8 @@ pub(crate) fn cmd_diff(workspace: &Path, args: &[String]) -> Result<String, u8> 
         label: None,
         produced_by: "diff".into(),
         parent_dataset_id: Some(left_id.clone()),
+        parent_dataset_ids: vec![left_id.clone(), right_id.clone()],
+        source_checksum: None,
     };
     save_meta(workspace, &meta).map_err(|e| {
         eprintln!("{e}");

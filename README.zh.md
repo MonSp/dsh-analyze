@@ -3,7 +3,7 @@
 [English](README.md) | [中文](README.zh.md)
 
 **面向 [DSH](https://github.com/deepseek-ai/deepseek-harness) 的本地数据分析工具。**  
-CSV/JSON/JSONL/Parquet 入库一次，大表留在磁盘，模型通过小 JSON 工具调用完成分析——而不是把整表塞进上下文。
+CSV/JSON/JSONL/Parquet/XLSX 入库一次，大表留在磁盘，模型通过小 JSON 工具调用完成分析——而不是把整表塞进上下文。
 
 ```text
 没有 dsh-analyze              有 dsh-analyze
@@ -47,7 +47,7 @@ dsh-analyze 正是 DSH 会话缺的中间层：
 
 | 是 | 不是 |
 |---|---|
-| 本地**文件** dataset 句柄（CSV / JSON / JSONL / Parquet） | SQL 数据库连接器 |
+| 本地**文件** dataset 句柄（CSV / JSON / JSONL / Parquet / XLSX） | SQL 数据库连接器 |
 | 离线 Rust CLI + DSH 工具插件 | Python/R 科学计算栈 |
 | 会话工作区沙箱 + 硬限额 | 多租户云服务 |
 
@@ -89,12 +89,13 @@ cargo build --release -p dsh-analyze
 
 | 工具 | 用途 |
 |---|---|
-| `dataset_ingest` | 工作区 CSV/JSON/JSONL/Parquet 入库 → `datasetId` + schema 摘要 |
+| `dataset_ingest` | 工作区 CSV/JSON/JSONL/Parquet/XLSX 入库 → `datasetId` + schema 摘要 |
 | `dataset_head` | 最多 20 行样例 |
 | `dataset_schema` | 列名、dtype、行数 |
 | `dataset_list` | 本工作区全部 dataset |
 | `dataset_export` | 全表导出为 outputs/ 下 CSV/XLSX/Parquet |
 | `dataset_rm` | 永久删除 dataset |
+| `dataset_verify` | 校验已存 dataset：数据文件、rowCount、父链、源文件校验和 |
 | `stats_describe` | 空值、min/max/mean/std/分位数 |
 | `transform_agg` | 过滤 / 窗口 / 派生列 / 投影 / 分组聚合（含时间桶） |
 | `dataset_values` | 单列取值分布（`nunique`、`top`） |
@@ -103,7 +104,7 @@ cargo build --release -p dsh-analyze
 | `dataset_profile` | 质量画像：空值率、nunique、类型稳定性、疑似主键 |
 | `dataset_dedup` | 精确或键控重复检测（计数 + 样例组） |
 | `dataset_outliers` | IQR / z-score / MAD 异常值；可选写出异常 dataset |
-| `dataset_corr` | 数值列两两相关（Pearson/Spearman，按 \|r\| 取 top pairs，带 pValue） |
+| `dataset_corr` | 数值列两两相关（Pearson/Spearman，按 \|r\| 取 top pairs，带 pValue；可选 `by` 分组） |
 | `dataset_crosstab` | 列联表（可选第三维）：top 类别、矩阵、边际、top cells |
 | `dataset_series` | 时序变换（lag/lead/diff/pct_change/rolling）→ 新 dataset |
 | `dataset_union` | 两个 dataset 追加合并（strict / intersect 列策略）→ 新 dataset |
@@ -160,6 +161,21 @@ CLI 子命令与工具同名（`values` / `sample` / `join` / `profile` 等）�
   `auto`——Excel 导出的 GBK 文件直接入库；`auto` 回落 GB18030 时挂
   `encoding-fallback` 警告。解码永不有损。
 
+### XLSX 入库、Parquet 存储与 verify（v0.1.12）
+
+- **`dataset_ingest --format xlsx`**：默认读第一张 sheet，`sheet` 参数精确
+  名字优先于纯数字索引（`2024` 这类表名可直接选中）；多 sheet 工作簿读一张
+  + `sheet-skipped` 警告；`.xlsm` → exit 4（另存为 `.xlsx`）。
+- **存储改为 Parquet**：新写入 `{id}.parquet`；旧 `{id}.csv` 仍可读；
+  `dataset_rm` 两者一起删。
+- **数据溯源**：ingest 记录 `sourceChecksum`（sha256），派生数据集记录
+  `parentDatasetIds`；`dataset_verify` 检查数据文件、rowCount、父链，
+  加 `checkSource` 时重算源文件校验和。
+- **`dataset_corr` `by`**：按组两两相关，每对带 `by` 组键（上限 50 组 /
+  100 对，超限挂截断警告）。
+- **`transform_agg` 预览**：无论有无 `outLabel`，始终返回最多 **20** 行
+  内联结果（`min(20, rowCount)`）。
+
 ### `transform_agg` 扩展（v0.1.2）
 
 - **`mutate`**：白名单表达式派生列——标识符、数字、`+ - * /`、括号，以及
@@ -195,7 +211,7 @@ CLI 子命令与工具同名（`values` / `sample` / `join` / `profile` 等）�
 
 | | dsh-analyze | SQL 连接器 | Notebook 栈（Python/R） |
 |---|---|---|---|
-| 输入 | 本地 CSV/JSON/JSONL/Parquet | 在线库 | 任意 |
+| 输入 | 本地 CSV/JSON/JSONL/Parquet/XLSX | 在线库 | 任意 |
 | 网络 | 从不 | 必需 | 常见 |
 | 模型 token 成本 | 每步小 JSON | 查询结果 | 内核输出 |
 | 运行时 | 单一静态二进制 | 驱动 + 服务 | 完整解释器 |

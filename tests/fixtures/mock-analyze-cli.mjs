@@ -25,6 +25,16 @@ function within(ws, p) {
   return abs
 }
 
+function mockSourceChecksum(buf) {
+  // deterministic fake: length-prefixed hex (mock only; real CLI uses sha256)
+  return 'sha256:' + buf.length.toString(16).padStart(8, '0') + '0'.repeat(56)
+}
+
+/** Mirror Rust `validate_dataset_id`: ds_ prefix, >=6 chars, ascii alnum/underscore. */
+function validDatasetId(id) {
+  return typeof id === 'string' && id.startsWith('ds_') && id.length >= 6 && /^[A-Za-z0-9_]+$/.test(id)
+}
+
 function newId() {
   return 'ds_' + randomBytes(6).toString('hex')
 }
@@ -112,6 +122,9 @@ function writeDataset(ws, id, table, metaExtra) {
     label: metaExtra.label ?? null,
     producedBy: metaExtra.producedBy,
     parentDatasetId: metaExtra.parentDatasetId ?? null,
+    parentDatasetIds: metaExtra.parentDatasetIds
+      || (metaExtra.parentDatasetId ? [metaExtra.parentDatasetId] : []),
+    sourceChecksum: metaExtra.sourceChecksum ?? null,
     createdAt: metaExtra.createdAt ?? new Date().toISOString(),
   }
   writeFileSync(join(datasets, `${id}.meta.json`), JSON.stringify(meta) + '\n', 'utf8')
@@ -155,8 +168,8 @@ async function main() {
   if (cmd === 'version' || cmd === '--version') {
     console.log(json({
       ok: true,
-      version: '0.1.11-mock',
-      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot'],
+      version: '0.1.12-mock',
+      capabilities: ['ingest', 'head', 'schema', 'describe', 'agg', 'list', 'export', 'rm', 'values', 'sample', 'join', 'profile', 'dedup', 'outliers', 'corr', 'crosstab', 'series', 'union', 'diff', 'pivot', 'verify'],
     }))
     return
   }
@@ -180,9 +193,36 @@ async function main() {
           : lowerPath.endsWith('.json')
             ? 'json'
             : 'csv'
-    // xlsx ingest remains disabled; parquet accepted at tool layer but mock
-    // only understands text formats — non-parquet bytes → stable analysis/*.
-    if (format === 'xlsx') fail(4, 'analysis/limit: xlsx not supported (convert to csv/jsonl)')
+    // Mock does not implement a full xlsx reader (R-31 covered by Rust tests).
+    // Accept the flag so the tool layer can pass --format xlsx / --sheet through;
+    // non-PK bytes → stable corrupt message matching the real CLI.
+    if (format === 'xlsx') {
+      const inputPath = getFlag(rest, '--input') || ''
+      const abs = inputPath.startsWith('data/') || inputPath.startsWith('data\\')
+        ? join(ws, inputPath)
+        : join(ws, inputPath)
+      let head = Buffer.alloc(0)
+      try { head = readFileSync(abs).subarray(0, 2) } catch { /* missing */ }
+      if (head.length < 2 || head[0] !== 0x50 || head[1] !== 0x4b) {
+        fail(2, 'analysis/invalid-args: cannot read xlsx (file is corrupt or password-protected)')
+      }
+      const dsId = getFlag(rest, '--dataset-id') || newId()
+      writeDataset(ws, dsId, { headers: [], rows: [] }, {
+        sourceKind: 'xlsx',
+        sourcePath: inputPath,
+        producedBy: 'ingest',
+        parentDatasetId: null,
+      })
+      console.log(json({
+        ok: true,
+        datasetId: dsId,
+        rowCount: 0,
+        columnCount: 0,
+        columns: [],
+        bytesOnDisk: head.length,
+      }))
+      return
+    }
     if (format === 'parquet') fail(1, 'analysis/cli-failed: not a valid parquet file')
     if (format === 'jsonl') fail(4, 'analysis/limit: mock CLI supports csv/json only in T0 tests')
     const id = getFlag(rest, '--dataset-id') || newId()
@@ -218,11 +258,16 @@ async function main() {
     const label = getFlag(rest, '--label')
     // R-30: record --encoding for arg-passing tests (no real decoding in the mock).
     const encoding = getFlag(rest, '--encoding')
+    let sourceChecksum = null
+    try {
+      sourceChecksum = mockSourceChecksum(readFileSync(path))
+    } catch { /* ignore */ }
     const { meta, bytes } = writeDataset(ws, id, table, {
       sourceKind: format === 'json' ? 'json' : 'csv',
       sourcePath: input,
       label,
       producedBy: 'ingest',
+      sourceChecksum,
     })
     console.log(json({
       ok: true,
@@ -963,15 +1008,17 @@ async function main() {
         parentDatasetId: id,
       })
     }
-    const includeRows = !outDatasetId && outRows.length <= 20
-    truncated = !includeRows
+    // R-36-A + R-37: always inline-preview up to 20 rows (with or without --out).
+    const budget = 20
+    const includeCount = Math.min(outRows.length, budget)
+    truncated = outRows.length > budget
     console.log(json({
       ok: true,
       datasetId: id,
       outDatasetId,
       rowCount: outRows.length,
       columns: outHeaders,
-      rows: includeRows ? outRows : [],
+      rows: outRows.slice(0, includeCount),
       truncated,
       ...(parseFailCount > 0 ? { parseFailCount, parseFailSample } : {}),
       ...(warnings.length ? { warnings } : {}),
@@ -1239,6 +1286,9 @@ async function main() {
           label: meta.label ?? null,
           producedBy: meta.producedBy,
           parentDatasetId: meta.parentDatasetId ?? null,
+          parentDatasetIds: meta.parentDatasetIds
+            || (meta.parentDatasetId ? [meta.parentDatasetId] : []),
+          sourceChecksum: meta.sourceChecksum ?? null,
           sourceKind: meta.sourceKind,
           createdAt: meta.createdAt ?? null,
         }
@@ -1298,12 +1348,91 @@ async function main() {
 
   if (cmd === 'rm') {
     const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    if (!validDatasetId(id)) fail(2, 'analysis/invalid-args: bad datasetId')
     const { datasets } = analysisDirs(ws)
     const metaPath = join(datasets, `${id}.meta.json`)
     if (!existsSync(metaPath)) fail(5, 'analysis/unknown-dataset')
     unlinkSync(metaPath)
     try { unlinkSync(join(datasets, `${id}.csv`)) } catch {}
+    try { unlinkSync(join(datasets, `${id}.parquet`)) } catch {}
     console.log(json({ ok: true, datasetId: id, removed: true }))
+    return
+  }
+
+  if (cmd === 'verify') {
+    const id = getFlag(rest, '--dataset-id')
+    if (!id) fail(2, 'analysis/invalid-args: --dataset-id required')
+    if (!validDatasetId(id)) fail(2, 'analysis/invalid-args: bad datasetId')
+    const { datasets } = analysisDirs(ws)
+    const metaPath = join(datasets, `${id}.meta.json`)
+    if (!existsSync(metaPath)) fail(5, 'analysis/unknown-dataset')
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    const dataOk = existsSync(join(datasets, `${id}.parquet`)) || existsSync(join(datasets, `${id}.csv`))
+    const checks = [{ name: 'data-file', ok: dataOk }]
+    const mismatches = []
+    if (!dataOk) mismatches.push('data-file missing')
+    const declared = meta.rowCount ?? 0
+    // Real row count from the stored csv (the mock's storage format).
+    let actual = null
+    const csvPath = join(datasets, `${id}.csv`)
+    if (existsSync(csvPath)) {
+      try { actual = parseCsv(readFileSync(csvPath, 'utf8')).rows.length } catch { actual = null }
+    }
+    const rowsOk = actual !== null && actual === declared
+    checks.push({ name: 'row-count', ok: rowsOk, declared, actual })
+    if (!rowsOk) mismatches.push(`rowCount declared=${declared} actual=${actual === null ? 'missing' : actual}`)
+    const parents = meta.parentDatasetIds || (meta.parentDatasetId ? [meta.parentDatasetId] : [])
+    const parentsOk = parents.every((pp) => existsSync(join(datasets, `${pp}.meta.json`)))
+    checks.push({ name: 'parents', ok: parentsOk, count: parents.length })
+    if (!parentsOk) mismatches.push('parent dataset missing')
+    if (rest.includes('--check-source')) {
+      const expected = meta.sourceChecksum ?? null
+      if (!expected) {
+        checks.push({ name: 'source', ok: true, skipped: 'no-checksum' })
+      } else {
+        let status = 'missing'
+        const root = resolve(ws)
+        const sp = meta.sourcePath
+          ? (sp2 => sp2.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sp2) ? resolve(sp2) : resolve(ws, sp2))(String(meta.sourcePath))
+          : null
+        if (sp && (sp === root || sp.startsWith(root + sep))) {
+          // Rust treats non-files (e.g. directories) as `missing`, only real
+          // read failures on a regular file as `unreadable`.
+          let isFile = false
+          try { isFile = statSync(sp).isFile() } catch { isFile = false }
+          if (!isFile) {
+            status = 'missing'
+            mismatches.push('source missing')
+          } else {
+            try {
+              const got = mockSourceChecksum(readFileSync(sp))
+              if (got === expected) {
+                status = 'ok'
+              } else {
+                status = 'mismatch'
+                mismatches.push(`source checksum mismatch: expected ${expected} got ${got}`)
+              }
+            } catch {
+              status = 'unreadable'
+              mismatches.push('source unreadable')
+            }
+          }
+        } else {
+          mismatches.push('source missing')
+        }
+        checks.push({ name: 'source', ok: status === 'ok', status })
+      }
+    }
+    const ok = mismatches.length === 0
+    const line = { ok, datasetId: id, checks, mismatches }
+    if (!ok) {
+      console.log(json(line))
+      process.exitCode = 1
+      console.error(`analysis/cli-failed: dataset verify failed: ${mismatches.join('; ')}`)
+      return
+    }
+    console.log(json(line))
     return
   }
 
@@ -1654,8 +1783,16 @@ async function main() {
       minNumeric = Number(minRaw)
       if (!Number.isInteger(minNumeric) || minNumeric < 2) fail(2, 'analysis/invalid-args: --min-numeric must be integer >= 2')
     }
+    const byRaw = getFlag(rest, '--by')
+    const byNames = byRaw ? byRaw.split(',').map(s => s.trim()).filter(Boolean) : []
+    if (byRaw && (byNames.length < 1 || byNames.length > 4)) fail(2, 'analysis/invalid-args: --by must list 1..4 columns')
     const { meta, table } = loadDataset(ws, id)
     const colIdx = columns.map(name => {
+      const i = table.headers.indexOf(name)
+      if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
+      return i
+    })
+    const byIdx = byNames.map(name => {
       const i = table.headers.indexOf(name)
       if (i < 0) fail(2, `analysis/invalid-args: unknown column ${name}`)
       return i
@@ -1777,61 +1914,108 @@ async function main() {
       }
       return 0.5 * (1 + 0) // unused branch for large x in this helper
     }
+    // Build groups: without --by one group of all (listwise-filtered) rows.
+    const catKey = (v) => {
+      if (typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)) return String(v)
+      if (typeof v === 'number' && Number.isFinite(v) && v.fract === undefined && Number.isInteger(v)) return String(v)
+      if (typeof v === 'number' && Number.isFinite(v) && Math.abs(v - Math.round(v)) < 1e-12 && Number.isInteger(Math.round(v))) {
+        // whole-number float shares integer category (R-35)
+        if (Math.abs(Math.round(v)) <= Number.MAX_SAFE_INTEGER) return String(Math.round(v))
+      }
+      if (v === null || v === undefined) return 'null'
+      if (typeof v === 'number') return String(v)
+      if (typeof v === 'boolean') return String(v)
+      return String(v)
+    }
+    let groups = []
+    if (byIdx.length === 0) {
+      let rows
+      if (listwise) rows = [...listwise].sort((a, b) => a - b)
+      else rows = table.rows.map((_, i) => i)
+      groups = [{ by: [], rows }]
+    } else {
+      const keyToGi = new Map()
+      for (let ri = 0; ri < table.rows.length; ri++) {
+        if (listwise && !listwise.has(ri)) continue
+        const key = byIdx.map(ci => catKey(table.rows[ri][ci]))
+        const k = JSON.stringify(key)
+        if (!keyToGi.has(k)) {
+          keyToGi.set(k, groups.length)
+          groups.push({ by: byIdx.map(ci => table.rows[ri][ci] ?? null), rows: [] })
+        }
+        groups[keyToGi.get(k)].rows.push(ri)
+      }
+    }
+    const MAX_BY_GROUPS = 50
+    const MAX_BY_PAIRS = 100
+    const groupsTotal = groups.length
+    const groupsTruncated = byIdx.length > 0 && groupsTotal > MAX_BY_GROUPS
+    const groupsKept = groupsTruncated ? MAX_BY_GROUPS : groupsTotal
+
     const pairs = []
     const totalPairs = columns.length * (columns.length - 1) / 2
-    for (let i = 0; i < columns.length; i++) {
-      for (let j = i + 1; j < columns.length; j++) {
-        let xs = [], ys = []
-        if (listwise) {
-          const rows = [...listwise].sort((a, b) => a - b)
-          for (const ri of rows) {
+    for (let g = 0; g < groupsKept; g++) {
+      const grow = groups[g].rows
+      for (let i = 0; i < columns.length; i++) {
+        for (let j = i + 1; j < columns.length; j++) {
+          let xs = [], ys = []
+          for (const ri of grow) {
             if (maps[i].has(ri) && maps[j].has(ri)) {
               xs.push(maps[i].get(ri))
               ys.push(maps[j].get(ri))
             }
           }
-        } else {
-          const smaller = maps[i].size <= maps[j].size ? maps[i] : maps[j]
-          for (const ri of [...smaller.keys()].sort((a, b) => a - b)) {
-            if (maps[i].has(ri) && maps[j].has(ri)) {
-              xs.push(maps[i].get(ri))
-              ys.push(maps[j].get(ri))
+          const n = xs.length
+          let r, degenerate
+          if (n < minNumeric) {
+            r = null
+            degenerate = false
+          } else if (method === 'spearman') {
+            const out = pearson(midRanks(xs), midRanks(ys))
+            r = out.r
+            degenerate = out.degenerate
+          } else {
+            const out = pearson(xs, ys)
+            r = out.r
+            degenerate = out.degenerate
+          }
+          // R-24: two-sided Student-t pValue (same contract as real CLI)
+          let pValue = null
+          if (r !== null && n >= 3) {
+            if (Math.abs(r) >= 1) pValue = 0
+            else {
+              const df = n - 2
+              const denom = 1 - r * r
+              if (denom > 0) {
+                const t = Math.abs(r) * Math.sqrt(df / denom)
+                const p = 2 * (1 - studentTCdf(t, df))
+                pValue = Math.min(1, Math.max(0, p))
+              }
             }
           }
+          const entry = { columns: [columns[i], columns[j]], n, r, pValue, degenerate, _i: i, _j: j, _g: g }
+          if (byIdx.length > 0) entry.by = groups[g].by
+          pairs.push(entry)
         }
-        const n = xs.length
-        let r, degenerate
-        if (n < minNumeric) {
-          r = null
-          degenerate = false
-        } else if (method === 'spearman') {
-          const out = pearson(midRanks(xs), midRanks(ys))
-          r = out.r
-          degenerate = out.degenerate
-        } else {
-          const out = pearson(xs, ys)
-          r = out.r
-          degenerate = out.degenerate
-        }
-        // R-24: two-sided Student-t pValue (same contract as real CLI)
-        let pValue = null
-        if (r !== null && n >= 3) {
-          if (Math.abs(r) >= 1) pValue = 0
-          else {
-            const df = n - 2
-            const denom = 1 - r * r
-            if (denom > 0) {
-              const t = Math.abs(r) * Math.sqrt(df / denom)
-              // two-sided p = I_{df/(df+t²)}(df/2, 1/2) via 2*(1-F_t)
-              const p = 2 * (1 - studentTCdf(t, df))
-              pValue = Math.min(1, Math.max(0, p))
-            }
-          }
-        }
-        pairs.push({ columns: [columns[i], columns[j]], n, r, pValue, degenerate, _i: i, _j: j })
+      }
+      // sort within group by |r|
+      const slice = pairs.filter(p => p._g === g)
+      slice.sort((a, b) => {
+        const ar = a.r === null ? -1 : Math.abs(a.r)
+        const br = b.r === null ? -1 : Math.abs(b.r)
+        if (ar !== br) return br - ar
+        if (a.n !== b.n) return b.n - a.n
+        if (a._i !== b._i) return a._i - b._i
+        return a._j - b._j
+      })
+      // rewrite this group's entries in sorted order
+      let k = 0
+      for (let idx = 0; idx < pairs.length; idx++) {
+        if (pairs[idx]._g === g) pairs[idx] = slice[k++]
       }
     }
     pairs.sort((a, b) => {
+      if (a._g !== b._g) return a._g - b._g
       const ar = a.r === null ? -1 : Math.abs(a.r)
       const br = b.r === null ? -1 : Math.abs(b.r)
       if (ar !== br) return br - ar
@@ -1842,10 +2026,13 @@ async function main() {
     for (const p of pairs) {
       delete p._i
       delete p._j
+      delete p._g
     }
-    const truncated = pairs.length > 50
-    pairs.length = Math.min(pairs.length, 50)
-    console.log(json({
+    const pairBudget = byIdx.length === 0 ? 50 : 100
+    const pairsTotal = pairs.length
+    const truncated = groupsTruncated || pairsTotal > pairBudget
+    if (pairs.length > pairBudget) pairs.length = pairBudget
+    const out = {
       ok: true,
       datasetId: id,
       rowCount: meta.rowCount,
@@ -1853,10 +2040,21 @@ async function main() {
       pairwise,
       minNumeric,
       columns,
-      pairCount: totalPairs,
+      pairCount: byIdx.length === 0 ? totalPairs : Math.min(pairsTotal, pairBudget),
       pairs,
       truncated,
-    }))
+    }
+    if (byIdx.length > 0) {
+      out.by = byNames
+      out.groupCount = groupsTotal
+      out.groupsEmitted = groupsKept
+      if (groupsTruncated) {
+        out.warnings = [{ code: 'corr-groups-truncated', emitted: groupsKept, total: groupsTotal }]
+      } else if (pairsTotal > pairBudget) {
+        out.warnings = [{ code: 'corr-pairs-truncated', emitted: pairs.length, total: pairsTotal }]
+      }
+    }
+    console.log(json(out))
     return
   }
 
@@ -1908,6 +2106,10 @@ async function main() {
     const NULL_KEY = String.fromCharCode(0)
     const keyOf = (v) => {
       if (v === null || v === undefined) return NULL_KEY
+      // R-35: whole-number floats share the integer category
+      if (typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) === false && Math.abs(v - Math.round(v)) < 1e-12) {
+        return JSON.stringify(Math.round(v))
+      }
       return JSON.stringify(v)
     }
     const decode = (k) => {

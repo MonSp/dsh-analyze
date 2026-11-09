@@ -17,6 +17,7 @@ fn category_json(v: &Value) -> String {
     }
 }
 
+
 /// Pearson correlation on paired samples; (r, degenerate).
 fn pearson(xs: &[f64], ys: &[f64]) -> (Option<f64>, bool) {
     debug_assert_eq!(xs.len(), ys.len());
@@ -249,6 +250,17 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         },
         None => 2,
     };
+    // R-34: optional grouping columns for per-group pairwise corr.
+    let by_names: Vec<String> = match flag_value(args, "--by") {
+        Some(raw) => {
+            let names = parse_column_list(raw);
+            if names.is_empty() || names.len() > 4 {
+                return fail(2, "analysis/invalid-args: --by must list 1..4 columns");
+            }
+            names
+        }
+        None => Vec::new(),
+    };
 
     let (meta, table) = load_or_fail(workspace, &id)?;
     let row_count = meta.row_count.max(table.rows.len());
@@ -264,6 +276,19 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
                 2u8
             })?;
         col_idxs.push(idx);
+    }
+
+    let mut by_idxs = Vec::with_capacity(by_names.len());
+    for name in &by_names {
+        let idx = table
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| {
+                eprintln!("analysis/invalid-args: unknown column {name}");
+                2u8
+            })?;
+        by_idxs.push(idx);
     }
 
     // Extract numeric series (row_index → f64) per column; validate numeric-capable.
@@ -306,96 +331,167 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         None
     };
 
-    let total_pairs = columns.len() * (columns.len() - 1) / 2;
-    // row → numeric value per column (pairs ≤ 50 after cap; maps once).
     let maps: Vec<HashMap<usize, f64>> = series
         .iter()
         .map(|s| s.iter().copied().collect())
         .collect();
-    let mut results: Vec<PairOut> = Vec::with_capacity(total_pairs);
-    for i in 0..columns.len() {
-        for j in (i + 1)..columns.len() {
-            let mut xs: Vec<f64> = Vec::new();
-            let mut ys: Vec<f64> = Vec::new();
+
+    let total_pairs_per_set = columns.len() * (columns.len() - 1) / 2;
+
+    // Group row indices by --by key (first-seen order). Without --by, one group = all rows.
+    let mut group_keys: Vec<Vec<Value>> = Vec::new();
+    let mut group_rows: Vec<Vec<usize>> = Vec::new();
+    if by_idxs.is_empty() {
+        let all: Vec<usize> = if let Some(mask) = &listwise_rows {
+            let mut rows: Vec<usize> = mask.iter().copied().collect();
+            rows.sort_unstable();
+            rows
+        } else {
+            (0..table.rows.len()).collect()
+        };
+        group_keys.push(Vec::new());
+        group_rows.push(all);
+    } else {
+        let mut key_to_gi: HashMap<Vec<Value>, usize> = HashMap::new();
+        for ri in 0..table.rows.len() {
             if let Some(mask) = &listwise_rows {
-                // stable row order by original index
-                let mut rows: Vec<usize> = mask.iter().copied().collect();
-                rows.sort_unstable();
-                for &ri in &rows {
-                    if let (Some(&x), Some(&y)) = (maps[i].get(&ri), maps[j].get(&ri)) {
-                        xs.push(x);
-                        ys.push(y);
-                    }
-                }
-            } else {
-                // pairwise: iterate the smaller column's row indices
-                let smaller = if maps[i].len() <= maps[j].len() {
-                    &maps[i]
-                } else {
-                    &maps[j]
-                };
-                let mut keys: Vec<usize> = smaller.keys().copied().collect();
-                keys.sort_unstable();
-                for &ri in &keys {
-                    if let (Some(&x), Some(&y)) = (maps[i].get(&ri), maps[j].get(&ri)) {
-                        xs.push(x);
-                        ys.push(y);
-                    }
+                if !mask.contains(&ri) {
+                    continue;
                 }
             }
-            let n = xs.len();
-            let (r, degenerate) = if n < min_numeric {
-                (None, false)
-            } else if method == "spearman" {
-                let rx = mid_ranks(&xs);
-                let ry = mid_ranks(&ys);
-                pearson(&rx, &ry)
-            } else {
-                pearson(&xs, &ys)
-            };
-            let p_value = p_value_from_r(r, n);
-            results.push(PairOut {
-                col_i: i,
-                col_j: j,
-                n,
-                r,
-                p_value,
-                degenerate,
+            let row = &table.rows[ri];
+            let key: Vec<Value> = by_idxs
+                .iter()
+                .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null).category_key())
+                .collect();
+            let gi = *key_to_gi.entry(key.clone()).or_insert_with(|| {
+                group_keys.push(key.clone());
+                group_rows.push(Vec::new());
+                group_keys.len() - 1
             });
+            group_rows[gi].push(ri);
         }
     }
 
-    // Sort: |r| desc (nulls last), then n desc, then original (col_i, col_j).
-    results.sort_by(|a, b| {
-        let ra = a.r.map(|v| v.abs());
-        let rb = b.r.map(|v| v.abs());
-        match (ra, rb) {
-            (Some(x), Some(y)) => y
-                .partial_cmp(&x)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.n.cmp(&a.n))
-                .then_with(|| a.col_i.cmp(&b.col_i))
-                .then_with(|| a.col_j.cmp(&b.col_j)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => b
-                .n
-                .cmp(&a.n)
-                .then_with(|| a.col_i.cmp(&b.col_i))
-                .then_with(|| a.col_j.cmp(&b.col_j)),
+    // Caps (R-34): group count and total emitted pairs.
+    const MAX_BY_GROUPS: usize = 50;
+    const MAX_BY_PAIRS: usize = 100;
+    let groups_total = group_rows.len();
+    let groups_truncated = !by_idxs.is_empty() && groups_total > MAX_BY_GROUPS;
+    let groups_kept = if groups_truncated {
+        MAX_BY_GROUPS
+    } else {
+        groups_total
+    };
+
+    #[allow(clippy::type_complexity)]
+    let mut all_out: Vec<(usize, Vec<Value>, PairOut)> = Vec::new();
+    for (gi, rows) in group_rows.iter().take(groups_kept).enumerate() {
+        let mut results: Vec<PairOut> = Vec::with_capacity(total_pairs_per_set);
+        for i in 0..columns.len() {
+            for j in (i + 1)..columns.len() {
+                let mut xs: Vec<f64> = Vec::new();
+                let mut ys: Vec<f64> = Vec::new();
+                // group_rows entries are built in ascending original-index
+                // order (listwise mask sorted, ranges monotonic) - no re-sort.
+                for &ri in rows.iter() {
+                    if let (Some(&x), Some(&y)) = (maps[i].get(&ri), maps[j].get(&ri)) {
+                        xs.push(x);
+                        ys.push(y);
+                    }
+                }
+                let n = xs.len();
+                let (r, degenerate) = if n < min_numeric {
+                    (None, false)
+                } else if method == "spearman" {
+                    let rx = mid_ranks(&xs);
+                    let ry = mid_ranks(&ys);
+                    pearson(&rx, &ry)
+                } else {
+                    pearson(&xs, &ys)
+                };
+                let p_value = p_value_from_r(r, n);
+                results.push(PairOut {
+                    col_i: i,
+                    col_j: j,
+                    n,
+                    r,
+                    p_value,
+                    degenerate,
+                });
+            }
         }
-    });
+        // Sort within group: |r| desc (nulls last), then n desc, then col order.
+        results.sort_by(|a, b| {
+            let ra = a.r.map(|v| v.abs());
+            let rb = b.r.map(|v| v.abs());
+            match (ra, rb) {
+                (Some(x), Some(y)) => y
+                    .partial_cmp(&x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.n.cmp(&a.n))
+                    .then_with(|| a.col_i.cmp(&b.col_i))
+                    .then_with(|| a.col_j.cmp(&b.col_j)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b
+                    .n
+                    .cmp(&a.n)
+                    .then_with(|| a.col_i.cmp(&b.col_i))
+                    .then_with(|| a.col_j.cmp(&b.col_j)),
+            }
+        });
+        let gkey = group_keys.get(gi).cloned().unwrap_or_default();
+        for p in results {
+            all_out.push((gi, gkey.clone(), p));
+        }
+    }
 
-    let truncated = results.len() > 50;
-    results.truncate(50);
+    // Without --by: keep the historical single-set cap of 50 pairs.
+    // With --by: cap total pairs at MAX_BY_PAIRS (group order stable).
+    let pair_budget = if by_idxs.is_empty() { 50 } else { MAX_BY_PAIRS };
+    let pairs_total = all_out.len();
+    let truncated = groups_truncated || pairs_total > pair_budget;
+    all_out.truncate(pair_budget);
 
-    let pairs_json = results
+    let cols_json = columns
         .iter()
-        .map(|p| {
+        .map(|c| json_string(c))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let by_json = if by_names.is_empty() {
+        None
+    } else {
+        Some(
+            by_names
+                .iter()
+                .map(|c| json_string(c))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+
+    let pairs_json = all_out
+        .iter()
+        .map(|(_gi, gkey, p)| {
             let r_s = p.r.map(json_f64).unwrap_or_else(|| "null".into());
             let p_s = p.p_value.map(json_f64).unwrap_or_else(|| "null".into());
+            let by_field = if by_names.is_empty() {
+                String::new()
+            } else {
+                let vals = gkey
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null => "null".into(),
+                        other => other.to_json(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(",\"by\":[{vals}]")
+            };
             format!(
-                "{{\"columns\":[{},{}],\"n\":{},\"df\":{},\"r\":{},\"pValue\":{},\"degenerate\":{}}}",
+                "{{\"columns\":[{},{}],\"n\":{},\"df\":{},\"r\":{},\"pValue\":{},\"degenerate\":{}{by_field}}}",
                 json_string(&columns[p.col_i]),
                 json_string(&columns[p.col_j]),
                 p.n,
@@ -408,21 +504,45 @@ pub(crate) fn cmd_corr(workspace: &Path, args: &[String]) -> Result<String, u8> 
         .collect::<Vec<_>>()
         .join(",");
 
-    let cols_json = columns
-        .iter()
-        .map(|c| json_string(c))
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut extra = String::new();
+    if let Some(by_j) = &by_json {
+        extra.push_str(&format!(",\"by\":[{by_j}]"));
+        extra.push_str(&format!(",\"groupCount\":{}", groups_total));
+        extra.push_str(&format!(",\"groupsEmitted\":{}", groups_kept));
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    if groups_truncated {
+        warnings.push(format!(
+            "{{\"code\":\"corr-groups-truncated\",\"emitted\":{groups_kept},\"total\":{groups_total}}}"
+        ));
+    }
+    if by_json.is_some() && pairs_total > pair_budget {
+        warnings.push(format!(
+            "{{\"code\":\"corr-pairs-truncated\",\"emitted\":{},\"total\":{pairs_total}}}",
+            all_out.len()
+        ));
+    }
+    if !warnings.is_empty() {
+        extra.push_str(&format!(",\"warnings\":[{}]", warnings.join(",")));
+    }
+
+    // pairCount = all candidate pairs (mirrors the ungrouped mode, which also
+    // reports the theoretical total when truncated): groups x column pairs.
+    let pair_count_field = if by_idxs.is_empty() {
+        total_pairs_per_set
+    } else {
+        groups_total.saturating_mul(total_pairs_per_set)
+    };
 
     Ok(format!(
-        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"method\":{},\"pairwise\":{},\"minNumeric\":{},\"columns\":[{}],\"pairCount\":{},\"pairs\":[{}],\"truncated\":{}}}",
+        "{{\"ok\":true,\"datasetId\":{},\"rowCount\":{},\"method\":{},\"pairwise\":{},\"minNumeric\":{},\"columns\":[{}],\"pairCount\":{},\"pairs\":[{}],\"truncated\":{}{extra}}}",
         json_string(&id),
         row_count,
         json_string(&method),
         json_string(&pairwise),
         min_numeric,
         cols_json,
-        total_pairs,
+        pair_count_field,
         pairs_json,
         truncated
     ))
@@ -472,8 +592,8 @@ fn crosstab_slice(
             null_row_count += 1;
             continue;
         }
-        let r_key = rv;
-        let c_key = cv;
+        let r_key = rv.category_key();
+        let c_key = cv.category_key();
         *cell_counts.entry((r_key.clone(), c_key.clone())).or_insert(0) += 1;
         *row_marg.entry(r_key.clone()).or_insert(0) += 1;
         *col_marg.entry(c_key.clone()).or_insert(0) += 1;

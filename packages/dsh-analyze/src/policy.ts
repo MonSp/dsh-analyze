@@ -24,6 +24,7 @@ export const ANALYSIS_TOOL_NAMES = [
   'dataset_union',
   'dataset_diff',
   'dataset_pivot',
+  'dataset_verify',
 ] as const
 
 export type AnalysisToolName = (typeof ANALYSIS_TOOL_NAMES)[number]

@@ -17,3 +17,7 @@ parquet = { version = "55", default-features = false, features = ["arrow", "snap
 rust_xlsxwriter = "0.67"
 # CSV GBK/GB18030 decode for ingest --encoding (R-30); WHATWG gb18030-capable.
 encoding_rs = "0.8"
+# xlsx ingest read (R-31); pure Rust, pairs with rust_xlsxwriter on the write side.
+calamine = "0.30"
+# sourceChecksum SHA-256 for ingest provenance (R-33).
+sha2 = "0.10"

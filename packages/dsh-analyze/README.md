@@ -3,7 +3,7 @@
 [English](README.md) | [中文](README.zh.md)
 
 **Local dataset analysis tools for [DSH](https://github.com/deepseek-ai/deepseek-harness).**  
-Ingest a CSV/JSON/JSONL/Parquet once, keep large tables on disk, and let the
+Ingest a CSV/JSON/JSONL/Parquet/XLSX once, keep large tables on disk, and let the
 model work through small JSON tool calls instead of dumping entire files
 into context.
 
@@ -21,7 +21,7 @@ no audit trail               stats_describe  → column stats
 
 | Is | Is not |
 |---|---|
-| Local **file** dataset handles (CSV / JSON / JSONL / Parquet) | A SQL database connector |
+| Local **file** dataset handles (CSV / JSON / JSONL / Parquet / XLSX) | A SQL database connector |
 | Offline Rust CLI + DSH tool plugin | A Python/R scientific stack |
 | Session-workspace sandbox with hard limits | A multi-tenant cloud service |
 
@@ -63,12 +63,13 @@ Runtime is fully offline — no network calls, no database drivers.
 
 | Tool | Purpose |
 |---|---|
-| `dataset_ingest` | Load a workspace CSV/JSON/JSONL/Parquet → `datasetId` + schema summary |
+| `dataset_ingest` | Load a workspace CSV/JSON/JSONL/Parquet/XLSX → `datasetId` + schema summary |
 | `dataset_head` | Up to 20 sample rows |
 | `dataset_schema` | Column names, dtypes, row count |
 | `dataset_list` | All datasets in this workspace store |
 | `dataset_export` | Write full table to CSV/XLSX/Parquet under outputs/ |
 | `dataset_rm` | Permanently remove a dataset |
+| `dataset_verify` | Verify a stored dataset: data file, rowCount, parent chain, source checksum |
 | `stats_describe` | Null counts, min/max/mean/std/quartiles |
 | `transform_agg` | Filter / window / mutate / project / group-by / aggregate (incl. time buckets) |
 | `dataset_values` | Top value distribution for one column (`nunique`, `top`) |
@@ -77,7 +78,7 @@ Runtime is fully offline — no network calls, no database drivers.
 | `dataset_profile` | Quality profile: nulls, nunique, type stability, suspect keys |
 | `dataset_dedup` | Exact or keyed duplicate detection (counts + sample groups) |
 | `dataset_outliers` | IQR / z-score / MAD outliers; optional write of outlier dataset |
-| `dataset_corr` | Pairwise Pearson/Spearman correlations (top pairs by \|r\|, with pValue) |
+| `dataset_corr` | Pairwise Pearson/Spearman correlations (top pairs by \|r\|, with pValue; optional `by` groups) |
 | `dataset_crosstab` | Contingency table (optional third dimension): top categories, matrix, margins, top cells |
 | `dataset_series` | Time-series transforms (lag/lead/diff/pct_change/rolling) → new dataset |
 | `dataset_union` | Append two datasets (strict or intersect columns) → new dataset |
@@ -135,6 +136,22 @@ See [docs/interface.md](docs/interface.md) for the frozen JSON contract.
   `auto` for CSV — Excel GBK exports load directly; `auto` falls back to
   GB18030 with an `encoding-fallback` warning. Decoding is never lossy.
 
+### XLSX ingest, Parquet storage & verify (v0.1.12)
+
+- **`dataset_ingest` `--format xlsx`**: first sheet by default, or `sheet`
+  (exact sheet-name match wins over a numeric index, so names like `2024`
+  stay selectable); multi-sheet workbooks read one sheet + `sheet-skipped`
+  warning; `.xlsm` → exit 4 (save as `.xlsx`).
+- **Storage is Parquet**: new writes land in `{id}.parquet`; legacy
+  `{id}.csv` datasets stay readable; `dataset_rm` removes both.
+- **Provenance**: ingest records `sourceChecksum` (sha256), derived datasets
+  record `parentDatasetIds`; `dataset_verify` checks the data file, rowCount,
+  parent chain, and (with `checkSource`) re-hashes the source file.
+- **`dataset_corr` `by`**: per-group pairwise correlations with `by` keys on
+  each pair (caps: 50 groups / 100 pairs + truncation warnings).
+- **`transform_agg` previews**: always returns up to **20** inline rows
+  (`min(20, rowCount)`) with or without `outLabel`.
+
 ### `transform_agg` extras (v0.1.2)
 
 - **`mutate`**: derived columns with a whitelist expression — identifiers,
@@ -172,7 +189,7 @@ Full tables go through `outLabel` / `dataset_export` and stay on disk.
 
 | | dsh-analyze | SQL connectors | Notebook stacks (Python/R) |
 |---|---|---|---|
-| Input | Local CSV/JSON/JSONL/Parquet | Live database | Anything |
+| Input | Local CSV/JSON/JSONL/Parquet/XLSX | Live database | Anything |
 | Network | Never | Required | Often |
 | Model token cost | Small JSON per step | Query results | Kernel output |
 | Runtime | Single static binary | Drivers + server | Full interpreter |

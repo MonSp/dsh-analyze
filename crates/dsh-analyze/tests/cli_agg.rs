@@ -782,3 +782,174 @@ fn r29_bad_tz_exits_2() {
         );
     }
 }
+
+// ---- v0.1.12 R-36 / R-37: agg inline rows budget ---------------------------
+
+/// Count top-level elements of the `"rows":[…]` array in one JSON line.
+fn rows_len(line: &str) -> usize {
+    let key = "\"rows\":[";
+    let Some(idx) = line.find(key) else {
+        return usize::MAX;
+    };
+    let mut i = idx + key.len();
+    let b = line.as_bytes();
+    if i >= b.len() {
+        return 0;
+    }
+    if b[i] == b']' {
+        return 0;
+    }
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'[' => {
+                if depth == 0 {
+                    count += 1;
+                }
+                depth += 1;
+            }
+            b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
+fn json_str_field(line: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Build a 21-day day-bucket source (> budget 20) and ingest under `ID`.
+fn ingest_21_days(ws: &Path) {
+    let mut body = String::from("ts,v\n");
+    for i in 1..=21 {
+        body.push_str(&format!("2026-01-{i:02}T00:30:00+08:00,{i}\n"));
+    }
+    ingest_csv(ws, "d21.csv", &body, ID);
+}
+
+const DAY_SPEC: &str = r#"{"groupBy":[{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}],"aggs":[{"fn":"count","as":"n"}],"orderBy":[{"column":"ts_day"}]}"#;
+
+fn run_agg_out(ws: &Path, spec: &str, out_label: &str) -> String {
+    let out = bin()
+        .arg("--workspace")
+        .arg(ws)
+        .args(["agg", "--dataset-id", ID, "--spec", spec, "--out", out_label])
+        .output()
+        .expect("spawn dsh-analyze");
+    assert!(
+        out.status.success(),
+        "agg --out failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// R-36-A: 21 buckets, no `--out` → 20-row inline preview, truncated=true,
+/// outDatasetId=null. Never `rowCount=21 && rows=[]`.
+#[test]
+fn r36_over_budget_no_out_returns_20_row_preview() {
+    let ws = temp_workspace();
+    ingest_21_days(&ws);
+    let out = run_agg(&ws, DAY_SPEC);
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"rowCount\":21"), "stdout={line}");
+    assert!(line.contains("\"truncated\":true"), "stdout={line}");
+    assert!(line.contains("\"outDatasetId\":null"), "stdout={line}");
+    let n = rows_len(&line);
+    assert_eq!(n, 20, "expected 20 inline preview rows, got {n}: {line}");
+    assert!(!line.contains("\"rows\":[]"), "must not drop rows: {line}");
+    // first day present in the preview
+    assert!(line.contains(r#"["2026-01-01",1]"#), "stdout={line}");
+    // 21st day is beyond the budget
+    assert!(!line.contains(r#"["2026-01-21",1]"#), "stdout={line}");
+}
+
+/// R-36 regression: ≤20 rows, no `--out` → full rows, truncated=false.
+#[test]
+fn r36_under_budget_no_out_full_rows() {
+    let ws = temp_workspace();
+    ingest_21_days(&ws);
+    // limit to 10 day buckets
+    let spec = format!(
+        r#"{{"groupBy":[{{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}}],"aggs":[{{"fn":"count","as":"n"}}],"orderBy":[{{"column":"ts_day"}}],"limit":10}}"#
+    );
+    let out = run_agg(&ws, &spec);
+    assert!(out.status.success(), "stderr={}", stderr_of(&out));
+    let line = stdout_of(&out);
+    assert!(line.contains("\"rowCount\":10"), "stdout={line}");
+    assert!(line.contains("\"truncated\":false"), "stdout={line}");
+    assert!(line.contains("\"outDatasetId\":null"), "stdout={line}");
+    let n = rows_len(&line);
+    assert_eq!(n, 10, "expected full 10 rows, got {n}: {line}");
+}
+
+/// R-36 regression: `--out` still persists; head can read all 21 rows.
+#[test]
+fn r36_with_out_persists_full_dataset() {
+    let ws = temp_workspace();
+    ingest_21_days(&ws);
+    let line = run_agg_out(&ws, DAY_SPEC, "d21");
+    assert!(line.contains("\"rowCount\":21"), "stdout={line}");
+    assert!(line.contains("\"truncated\":true"), "stdout={line}");
+    let out_id = json_str_field(&line, "outDatasetId").expect("outDatasetId");
+    assert!(out_id.starts_with("ds_"), "got {out_id}");
+    // preview still present (R-37)
+    let n = rows_len(&line);
+    assert_eq!(n, 20, "expected 20 preview rows with --out, got {n}: {line}");
+
+    let head = bin()
+        .arg("--workspace")
+        .arg(&ws)
+        .args(["head", "--dataset-id", &out_id, "--n", "50"])
+        .output()
+        .expect("spawn dsh-analyze");
+    assert!(head.status.success(), "stderr={}", stderr_of(&head));
+    let head_line = stdout_of(&head);
+    assert!(
+        head_line.contains("\"rowCount\":21"),
+        "head must see full 21 rows: {head_line}"
+    );
+}
+
+/// R-37: small result + `--out` → full inline rows AND outDatasetId.
+#[test]
+fn r37_small_result_with_out_returns_inline_rows() {
+    let ws = temp_workspace();
+    ingest_21_days(&ws);
+    let spec = format!(
+        r#"{{"groupBy":[{{"dateColumn":"ts","period":"day","tz":"Asia/Shanghai"}}],"aggs":[{{"fn":"count","as":"n"}}],"orderBy":[{{"column":"ts_day"}}],"limit":3}}"#
+    );
+    let line = run_agg_out(&ws, &spec, "small3");
+    assert!(line.contains("\"rowCount\":3"), "stdout={line}");
+    assert!(line.contains("\"truncated\":false"), "stdout={line}");
+    let out_id = json_str_field(&line, "outDatasetId").expect("outDatasetId");
+    assert!(out_id.starts_with("ds_"), "got {out_id}");
+    let n = rows_len(&line);
+    assert_eq!(n, 3, "expected full 3 rows with --out, got {n}: {line}");
+
+    let head = bin()
+        .arg("--workspace")
+        .arg(&ws)
+        .args(["head", "--dataset-id", &out_id, "--n", "5"])
+        .output()
+        .expect("spawn dsh-analyze");
+    assert!(head.status.success(), "stderr={}", stderr_of(&head));
+    assert!(
+        stdout_of(&head).contains("\"rowCount\":3"),
+        "head must see 3 rows: {}",
+        stdout_of(&head)
+    );
+}
